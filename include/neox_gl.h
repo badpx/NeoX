@@ -8,6 +8,7 @@
  *   neox_gl_device_desc gld;
  *   memset(&gld, 0, sizeof(gld));
  *   gld.struct_size = sizeof(gld);                     // 首字段：结构体版本
+ *   gld.magic = NEOX_GL_DESC_MAGIC;                    // 后端标识（GL）
  *   gld.shared_context = NULL;                         // NULL = 自建离屏上下文
  *   neox_device_desc dd;
  *   memset(&dd, 0, sizeof(dd));
@@ -43,8 +44,11 @@ extern "C" {
 /* ------------------------------------------------------------------ 设备参数
  * 经 neox_device_desc.platform 传入（[borrow]，创建时读取）。 */
 
+#define NEOX_GL_DESC_MAGIC 0x4e58474cu  /* 'NXGL'：NEOX_BACKEND_GPU 参数块后端标识 */
+
 typedef struct neox_gl_device_desc {
     uint32_t struct_size;   /* 必须 = sizeof(neox_gl_device_desc)（版本协商） */
+    uint32_t magic;         /* 必须 = NEOX_GL_DESC_MAGIC（后端区分） */
     void *shared_context;   /* 外部 CGLContextObj：新上下文加入其 share group，
                              * 纹理对象可跨上下文共享。NULL = 自建离屏上下文。 */
 } neox_gl_device_desc;

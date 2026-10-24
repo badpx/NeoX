@@ -585,13 +585,30 @@ static void gl_rt_destroy(nx_gl_rt *rt)
     memset(rt, 0, sizeof(*rt));
 }
 
-/* 获取渲染目标（优先复用空闲同尺寸项）；is_layer 区分层与掩码纹理池 */
+/* 获取渲染目标（优先复用空闲同尺寸项）；is_layer 区分层与掩码纹理池。
+ * 池数组固定容量、init 时一次分配、永不扩容——池项指针被 layers/clips
+ * 跨调用持有（元素内嵌于数组），nx_array_grow 扩容会整体搬迁数组使这些
+ * 指针悬垂（深层嵌套超过初始容量 8 时触发，ASan 实测 heap-use-after-free）。
+ * 超容量显式返回 OUT_OF_MEMORY 而非悬垂。容量按验证后端定位取 1024
+ * （结构体数组 ~64KB；GL 对象按需创建）。 */
+#define NX_GL_RT_POOL_CAP 1024u
+
+static neox_result gl_rt_pool_init(neox_context *ctx, nx_gl_dev *g)
+{
+    g->rts = (nx_gl_rt *)nx_alloc(ctx, NX_GL_RT_POOL_CAP * sizeof(nx_gl_rt), 16);
+    if (!g->rts) return NEOX_ERROR_OUT_OF_MEMORY;
+    memset(g->rts, 0, NX_GL_RT_POOL_CAP * sizeof(nx_gl_rt));
+    g->caprts = NX_GL_RT_POOL_CAP;
+    return NEOX_OK;
+}
+
 static neox_result gl_rt_acquire(neox_context *ctx, nx_gl_dev *g,
                                  uint32_t w, uint32_t h, int is_layer,
                                  nx_gl_rt **out)
 {
     uint32_t i;
     nx_gl_rt *rt;
+    GLenum fmt = is_layer ? GL_RGBA32F : GL_R32F;
     for (i = 0; i < g->nrts; i++) {
         rt = &g->rts[i];
         if (!rt->in_use && rt->is_layer == is_layer &&
@@ -601,41 +618,46 @@ static neox_result gl_rt_acquire(neox_context *ctx, nx_gl_dev *g,
             return NEOX_OK;
         }
     }
-    {
-        nx_gl_rt *nr = (nx_gl_rt *)nx_array_grow(ctx, g->rts, sizeof(nx_gl_rt),
-                                                 &g->caprts, g->nrts + 1);
-        GLenum fmt = is_layer ? GL_RGBA32F : GL_R32F;
-        if (!nr) return NEOX_ERROR_OUT_OF_MEMORY;
-        g->rts = nr;
-        rt = &g->rts[g->nrts];
-        memset(rt, 0, sizeof(*rt));
-        rt->is_layer = is_layer;
-        rt->w = w; rt->h = h;
-        glGenTextures(1, &rt->tex);
-        glBindTexture(GL_TEXTURE_2D, rt->tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, (GLint)fmt, (GLsizei)w, (GLsizei)h, 0,
-                     is_layer ? GL_RGBA : GL_RED,
-                     GL_FLOAT, NULL);
-        glGenFramebuffers(1, &rt->fbo);
-        glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_2D, rt->tex, 0);
-        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE ||
-            glGetError() != GL_NO_ERROR) {
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            gl_rt_destroy(rt);
-            ctx->last_error = "GL framebuffer object incomplete";
-            return NEOX_ERROR_BACKEND;
-        }
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        rt->in_use = 1;
-        g->nrts++;
-        *out = rt;
+    if (g->nrts >= g->caprts) {
+        ctx->last_error = "GL render-target pool exhausted";
+        return NEOX_ERROR_OUT_OF_MEMORY;
     }
+    rt = &g->rts[g->nrts];
+    memset(rt, 0, sizeof(*rt));
+    rt->is_layer = is_layer;
+    rt->w = w; rt->h = h;
+    glGenTextures(1, &rt->tex);
+    glBindTexture(GL_TEXTURE_2D, rt->tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, (GLint)fmt, (GLsizei)w, (GLsizei)h, 0,
+                 is_layer ? GL_RGBA : GL_RED,
+                 GL_FLOAT, NULL);
+    glGenFramebuffers(1, &rt->fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, rt->tex, 0);
+    if (is_layer) {
+        glGenRenderbuffers(1, &rt->srb);
+        glBindRenderbuffer(GL_RENDERBUFFER, rt->srb);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_STENCIL_INDEX8,
+                              (GLsizei)w, (GLsizei)h);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+                                  GL_RENDERBUFFER, rt->srb);
+    }
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE ||
+        glGetError() != GL_NO_ERROR) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        gl_rt_destroy(rt);
+        ctx->last_error = "GL framebuffer object incomplete";
+        return NEOX_ERROR_BACKEND;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    rt->in_use = 1;
+    g->nrts++;
+    *out = rt;
     return NEOX_OK;
 }
 
@@ -778,6 +800,9 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
         if (d->struct_size != (uint32_t)sizeof(neox_gl_device_desc))
             NX_ERR(ctx, "neox_gl_device_desc version mismatch",
                    NEOX_ERROR_INVALID_ARGUMENT);
+        if (d->magic != NEOX_GL_DESC_MAGIC)
+            NX_ERR(ctx, "neox_gl_device_desc magic mismatch",
+                   NEOX_ERROR_INVALID_ARGUMENT);
         gld = *d;
     } else if (plat_size != 0) {
         NX_ERR(ctx, "platform is NULL but platform_size is nonzero",
@@ -849,6 +874,12 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
         NX_ERR(ctx, "GL program setup failed", NEOX_ERROR_BACKEND);
     }
 
+    r = gl_rt_pool_init(ctx, g);
+    if (r != NEOX_OK) {
+        gl_state_destroy(ctx, g);
+        NX_ERR(ctx, "GL render-target pool allocation failed",
+               NEOX_ERROR_OUT_OF_MEMORY);
+    }
     glGenVertexArrays(1, &g->vao);
     glGenBuffers(1, &g->vbo);
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, (GLint *)&major); /* 复用变量读 max tex */
@@ -1810,7 +1841,9 @@ const nx_backend *nx_backend_gl(void)
         gl_device_shutdown,
         gl_begin_target,
         gl_execute,
-        gl_get_caps
+        gl_get_caps,
+        NULL,               /* poll：execute 内 glFinish 同步完成 */
+        NULL                /* block：同步后端 */
     };
     return &vt;
 }

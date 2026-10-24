@@ -348,6 +348,7 @@ int main(void)
         neox_gl_device_desc gld;
         memset(&gld, 0, sizeof(gld));
         gld.struct_size = (uint32_t)sizeof(gld);
+        gld.magic = NEOX_GL_DESC_MAGIC;
         gld.shared_context = NULL;
         memset(&dd, 0, sizeof(dd));
         dd.backend = NEOX_BACKEND_GPU;

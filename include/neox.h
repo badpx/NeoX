@@ -137,8 +137,10 @@ typedef enum neox_backend_kind {
 
 typedef struct neox_device_desc {
     neox_backend_kind backend;
-    /* 后端专属参数块。约定：参数块首字段须为 uint32_t struct_size，
-     * platform_size 为调用方声明的结构体字节数，后端据此做版本协商。 */
+    /* 后端专属参数块。约定：首字段须为 uint32_t struct_size，
+     * 第二字段须为 uint32_t magic 后端标识（GPU kind 下区分实现，
+     * 如 'NXGL'/'NXMT'）；platform_size 为调用方声明的结构体字节数，
+     * 后端据此做版本协商。 */
     const void *platform;        /* [borrow] ；SOFT 可为 NULL */
     size_t platform_size;        /* platform 指向结构体的字节数，无 platform 时为 0 */
 } neox_device_desc;

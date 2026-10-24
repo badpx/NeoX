@@ -378,12 +378,27 @@ typedef struct nx_backend {
     neox_result (*begin_target)(neox_frame *fr, const neox_target_desc *target);
     neox_result (*execute)(neox_device *dev, nx_sub_slot *sub);
     void        (*get_caps)(neox_device *dev, neox_caps *out_caps);
+    /* 异步进度（真异步后端，如 Metal）：登记在 completedHandler 的完成事件
+     * 在本调用线程被收割——推进 submission 状态、释放载荷、返回新完成数。
+     * 同步后端（Soft/GL）为 NULL（其 execute 在返回前已完成）。 */
+    uint32_t    (*poll)(neox_device *dev);
+    /* submission_wait 的进度等待：阻塞至至少一个在途提交完成（避免空转）。
+     * 仅异步后端实现（内部可用 waitUntilCompleted 一类原语）；NULL = 无需等待。 */
+    void        (*block)(neox_device *dev);
 } nx_backend;
 
 const nx_backend *nx_backend_soft(void);
 #ifdef NEOX_ENABLE_GL
 const nx_backend *nx_backend_gl(void);
 #endif
+#ifdef NEOX_ENABLE_METAL
+const nx_backend *nx_backend_mtl(void);
+#endif
+
+/* NEOX_BACKEND_GPU 参数块魔数（第二字段，区分 GL/Metal 实现；定义值与
+ * include/neox_gl.h、include/neox_mtl.h 的公开宏保持一致） */
+#define NX_GPU_DESC_MAGIC_GL  0x4e58474cu  /* 'NXGL' */
+#define NX_GPU_DESC_MAGIC_MTL 0x4e584d54u  /* 'NXMT' */
 
 /* ------------------------------------------------------------------ 小工具（各后端共用） */
 
@@ -473,6 +488,9 @@ void        nx_slot_recycle(neox_device *dev, uint32_t type, uint32_t idx);
 /* 设备槽位表初始化/释放（core.c 实现，后端 init 使用） */
 neox_result nx_device_init_tables(neox_device *dev);
 void        nx_device_release_tables(neox_device *dev);
+
+/* submission 载荷释放（soft.c 实现）：状态推进后由 pump / 异步 poll 调用 */
+void        nx_sub_release_payload(neox_device *dev, nx_sub_slot *sub);
 
 /* ------------------------------------------------------------------ 错误辅助 */
 

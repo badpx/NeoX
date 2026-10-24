@@ -16,6 +16,7 @@
  * =========================================================================*/
 #include "neox.h"
 #include "neox_gl.h"
+#include "neox_mtl.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,7 +49,9 @@ static int g_failures = 0;
 static neox_context *g_ctx;
 static neox_device *g_soft;
 static neox_device *g_gpu;
+static neox_device *g_mtl;
 static int g_gpu_ok;
+static int g_mtl_ok;
 
 /* ------------------------------------------------------------------ 资源（每设备一份） */
 typedef struct t_res {
@@ -207,31 +210,46 @@ static int render_soft(const t_res *r, draw_fn fn, uint32_t w, uint32_t h,
            ? 0 : -1;
 }
 
-static int render_gpu(const t_res *r, draw_fn fn, uint32_t w, uint32_t h,
-                      const neox_color *clear, uint8_t *out)
+/* 后端无关的 GPU 渲染通道（surface 操作经函数指针；真异步后端经
+ * neox_submission_wait 等待完成，不经 pump 假同步） */
+typedef struct gpu_api {
+    neox_device *dev;
+    neox_result (*surface_create)(neox_device *, uint32_t, uint32_t, void **);
+    void (*surface_destroy)(neox_device *, void *);
+    neox_result (*surface_read)(void *, uint8_t *);
+} gpu_api;
+
+static int render_gpu(const gpu_api *api, const t_res *r, draw_fn fn,
+                      uint32_t w, uint32_t h, const neox_color *clear,
+                      uint8_t *out)
 {
-    neox_gl_surface *surf = NULL;
+    void *surf = NULL;
     neox_target_desc td;
     neox_frame *fr;
     neox_submission sub;
     int rc = -1;
-    if (neox_gl_surface_create(g_gpu, w, h, &surf) != NEOX_OK) return -1;
+    if (api->surface_create(api->dev, w, h, &surf) != NEOX_OK) return -1;
     memset(&td, 0, sizeof(td));
     td.kind = NEOX_BACKEND_GPU;
     td.surface = surf;
     td.clear = clear;
-    if (neox_frame_begin(g_gpu, &td, &fr) != NEOX_OK) goto out;
-    fn(g_gpu, fr, r);
+    if (neox_frame_begin(api->dev, &td, &fr) != NEOX_OK) goto out;
+    fn(api->dev, fr, r);
     if (neox_frame_end(fr, &sub) != NEOX_OK) goto out;
-    neox_device_pump(g_gpu);
-    if (neox_submission_get_status(g_gpu, sub) != NEOX_SUBMISSION_COMPLETE)
+    neox_device_pump(api->dev);
+    /* Metal 为真异步：pump 后可能仍在途，经 wait（内部 block 钩子）等待 */
+    if (neox_submission_wait(api->dev, sub) != NEOX_OK) goto out;
+    if (neox_submission_get_status(api->dev, sub) != NEOX_SUBMISSION_COMPLETE)
         goto out;
-    if (neox_gl_surface_read_pixels(surf, out) != NEOX_OK) goto out;
+    if (api->surface_read(surf, out) != NEOX_OK) goto out;
     rc = 0;
 out:
-    neox_gl_surface_destroy(g_gpu, surf);
+    api->surface_destroy(api->dev, surf);
     return rc;
 }
+
+static gpu_api g_gl_api;
+static gpu_api g_mtl_api;
 
 /* ------------------------------------------------------------------ §9 比较 */
 #define CMP_TOL 32   /* §9：边界覆盖率差 ≤ 32/255 */
@@ -416,19 +434,31 @@ static void compare_images(const uint8_t *soft, const uint8_t *gl,
 }
 
 /* ------------------------------------------------------------------ 资源实例（每后端一份） */
-static t_res g_res_soft, g_res_gpu;
+static t_res g_res_soft, g_res_gpu, g_res_mtl;
 
+/* 三后端一致性：Soft↔GL、Soft↔Metal、GL↔Metal 逐对比较（§9） */
 static void check_pair(const char *name, draw_fn fn, uint32_t w, uint32_t h,
                        const neox_color *clear)
 {
-    uint8_t *a = (uint8_t *)malloc((size_t)w * h * 4);
-    uint8_t *b = (uint8_t *)malloc((size_t)w * h * 4);
+    uint8_t *s = (uint8_t *)malloc((size_t)w * h * 4);
+    uint8_t *g = (uint8_t *)malloc((size_t)w * h * 4);
+    uint8_t *m = (uint8_t *)malloc((size_t)w * h * 4);
     cmp_stats st;
-    CHECK(render_soft(&g_res_soft, fn, w, h, clear, a) == 0);
-    CHECK(render_gpu(&g_res_gpu, fn, w, h, clear, b) == 0);
-    compare_images(a, b, w, h, name, &st);
-    free(a);
-    free(b);
+    char label[64];
+    CHECK(render_soft(&g_res_soft, fn, w, h, clear, s) == 0);
+    CHECK(render_gpu(&g_gl_api, &g_res_gpu, fn, w, h, clear, g) == 0);
+    snprintf(label, sizeof(label), "%s soft|gl", name);
+    compare_images(s, g, w, h, label, &st);
+    if (g_mtl_ok) {
+        CHECK(render_gpu(&g_mtl_api, &g_res_mtl, fn, w, h, clear, m) == 0);
+        snprintf(label, sizeof(label), "%s soft|mtl", name);
+        compare_images(s, m, w, h, label, &st);
+        snprintf(label, sizeof(label), "%s gl|mtl", name);
+        compare_images(g, m, w, h, label, &st);
+    }
+    free(s);
+    free(g);
+    free(m);
 }
 
 /* ------------------------------------------------------------------ 场景 */
@@ -618,6 +648,32 @@ static void sc_kitchen(neox_device *dev, neox_frame *fr, const t_res *r)
 
 /* §6.1：CLEAR 抗锯齿擦除与 DST 无变化在半覆盖像素上的跨后端一致性。
  * 非整数矩形制造 0.5 覆盖率边缘，星形制造曲线覆盖率。 */
+
+/* 深层嵌套（12 层组/裁剪，超过 GL 后端纹理池初始容量 8）：修复前池扩容
+ * realloc 使跨调用持有的池项指针悬垂（ASan 下 heap-use-after-free） */
+static void sc_deep_nesting(neox_device *dev, neox_frame *fr, const t_res *r)
+{
+    neox_paint pt;
+    int i;
+    (void)dev;
+    for (i = 0; i < 12; i++) {
+        const neox_path *cp = (i & 1) ? &r->clip_a : &r->clip_b;
+        float op = 1.0f - (float)i * 0.03f;
+        push(fr, (neox_affine){ 1, 0, 0, 1, 1.5f, 1.0f }, op,
+             NEOX_BLEND_SRC_OVER, cp);
+    }
+    pt.color = (neox_color){ 0.85f, 0.25f, 0.22f, 0.9f };
+    push(fr, (neox_affine){ 1, 0, 0, 1, 8, 6 }, 1.0f, NEOX_BLEND_SRC_OVER, NULL);
+    neox_draw_path(fr, r->blob, &pt);
+    pop(fr);
+    pt.color = (neox_color){ 0.15f, 0.3f, 0.9f, 0.8f };
+    push(fr, (neox_affine){ 1, 0, 0, 1, 30, 14 }, 1.0f, NEOX_BLEND_PLUS, NULL);
+    neox_draw_path(fr, r->star_nz, &pt);
+    pop(fr);
+    for (i = 0; i < 12; i++)
+        pop(fr);
+}
+
 static void sc_clear_partial(neox_device *dev, neox_frame *fr, const t_res *r)
 {
     neox_paint pt;
@@ -758,6 +814,7 @@ static void test_device_semantics(void)
                   NEOX_ERROR_INVALID_ARGUMENT);
         memset(&gld2, 0, sizeof(gld2));
         gld2.struct_size = (uint32_t)sizeof(gld2);
+        gld2.magic = NEOX_GL_DESC_MAGIC;
         memset(&dd2, 0, sizeof(dd2));
         dd2.backend = NEOX_BACKEND_GPU;
         dd2.platform = &gld2;
@@ -783,6 +840,10 @@ static void test_device_semantics(void)
     CHECK_RES(neox_draw_path(fr, g_res_gpu.rect, &pt), NEOX_OK);
     CHECK_RES(neox_frame_end(fr, &sub), NEOX_OK);
     neox_device_pump(g_gpu);
+    if (neox_submission_get_status(g_gpu, sub) != NEOX_SUBMISSION_COMPLETE)
+        fprintf(stderr, "DBG gl status=%d err=%s\n",
+                (int)neox_submission_get_status(g_gpu, sub),
+                neox_get_error_detail(g_ctx));
     CHECK(neox_submission_get_status(g_gpu, sub) == NEOX_SUBMISSION_COMPLETE);
     CHECK_RES(neox_submission_get_report(g_gpu, sub, &rep), NEOX_OK);
     CHECK(rep.algorithm == NEOX_ALG_TRIANGLE);
@@ -806,6 +867,72 @@ static void test_device_semantics(void)
         }
     }
     neox_gl_surface_destroy(g_gpu, surf);
+
+    if (!g_mtl_ok) return;
+    /* ---------------- Metal 设备语义 ---------------- */
+    CHECK(neox_device_is_lost(g_mtl) == 0);
+    neox_device_get_caps(g_mtl, &caps);
+    CHECK(caps.features & NEOX_CAP_FLOAT_BLEND);
+    CHECK(caps.max_texture_size >= 16384);
+    /* platform_size 协商错误用例（Metal desc） */
+    {
+        neox_device_desc dd2;
+        neox_mtl_device_desc mtd2;
+        neox_device *dev2 = NULL;
+        memset(&dd2, 0, sizeof(dd2));
+        dd2.backend = NEOX_BACKEND_GPU;
+        dd2.platform_size = 8; /* platform == NULL */
+        CHECK_RES(neox_device_create(g_ctx, &dd2, &dev2),
+                  NEOX_ERROR_INVALID_ARGUMENT);
+        memset(&mtd2, 0, sizeof(mtd2));
+        mtd2.struct_size = (uint32_t)sizeof(mtd2);
+        mtd2.magic = NEOX_MTL_DESC_MAGIC;
+        memset(&dd2, 0, sizeof(dd2));
+        dd2.backend = NEOX_BACKEND_GPU;
+        dd2.platform = &mtd2;
+        dd2.platform_size = 4;
+        CHECK_RES(neox_device_create(g_ctx, &dd2, &dev2),
+                  NEOX_ERROR_INVALID_ARGUMENT);
+        dd2.platform_size = sizeof(mtd2);
+        mtd2.struct_size = (uint32_t)sizeof(mtd2) + 16;
+        CHECK_RES(neox_device_create(g_ctx, &dd2, &dev2),
+                  NEOX_ERROR_INVALID_ARGUMENT);
+        mtd2.struct_size = (uint32_t)sizeof(mtd2) - 4;
+        CHECK_RES(neox_device_create(g_ctx, &dd2, &dev2),
+                  NEOX_ERROR_INVALID_ARGUMENT);
+        mtd2.struct_size = (uint32_t)sizeof(mtd2);
+        mtd2.magic = NEOX_GL_DESC_MAGIC; /* 魔数错配：dispatch 拒绝 */
+        CHECK_RES(neox_device_create(g_ctx, &dd2, &dev2),
+                  NEOX_ERROR_INVALID_ARGUMENT);
+    }
+    /* 真异步契约：pump 不阻塞，提交后至完成前保持 PENDING；
+     * 经 submission_wait（block 钩子）推进至 COMPLETE，resolve 后表面可读 */
+    {
+        neox_mtl_surface *msurf = NULL;
+        neox_submission subm;
+        neox_submission_status st0, st1;
+        CHECK_RES(neox_mtl_surface_create(g_mtl, 8, 8, &msurf), NEOX_OK);
+        memset(&td, 0, sizeof(td));
+        td.kind = NEOX_BACKEND_GPU;
+        td.surface = msurf;
+        td.clear = &CLEAR_GRAY;
+        CHECK_RES(neox_frame_begin(g_mtl, &td, &fr), NEOX_OK);
+        pt.color = (neox_color){ 0.5f, 0.2f, 0.6f, 1.0f };
+        CHECK_RES(neox_draw_path(fr, g_res_mtl.rect, &pt), NEOX_OK);
+        CHECK_RES(neox_frame_end(fr, &subm), NEOX_OK);
+        neox_device_pump(g_mtl); /* 提交，不阻塞 */
+        st0 = neox_submission_get_status(g_mtl, subm);
+        CHECK(st0 == NEOX_SUBMISSION_PENDING ||
+              st0 == NEOX_SUBMISSION_COMPLETE); /* 允许已完成，不允许失败 */
+        CHECK_RES(neox_submission_get_report(g_mtl, subm, &rep), NEOX_OK);
+        CHECK(rep.algorithm == NEOX_ALG_TRIANGLE);
+        CHECK_RES(neox_submission_wait(g_mtl, subm), NEOX_OK);
+        st1 = neox_submission_get_status(g_mtl, subm);
+        CHECK(st1 == NEOX_SUBMISSION_COMPLETE);
+        CHECK_RES(neox_mtl_surface_read_pixels(msurf, tmp), NEOX_OK);
+        CHECK(tmp[3] == 255); /* 清屏色不透明 */
+        neox_mtl_surface_destroy(g_mtl, msurf);
+    }
 }
 
 static void test_blend_matrix(void)
@@ -826,12 +953,15 @@ static void test_blend_matrix(void)
 static void test_scene_equivalence(void)
 {
     uint8_t a[96 * 64 * 4], b[96 * 64 * 4], c[96 * 64 * 4], d[96 * 64 * 4];
-    neox_scene sc_s, sc_g;
-    neox_node grp_s, grp_g;
+    neox_scene sc_s, sc_g, sc_m;
+    neox_node grp_s, grp_g, grp_m;
     cmp_stats st;
+    char label[64];
 
     sc_s = build_kitchen_scene(g_soft, &g_res_soft, &grp_s);
     sc_g = build_kitchen_scene(g_gpu, &g_res_gpu, &grp_g);
+    if (g_mtl_ok) sc_m = build_kitchen_scene(g_mtl, &g_res_mtl, &grp_m);
+    else sc_m = (neox_scene){ 0 };
 
     /* soft：scene → a；立即 → b（§10.2-1 要求同后端逐位一致） */
     {
@@ -855,39 +985,52 @@ static void test_scene_equivalence(void)
         CHECK_RES(neox_frame_end(fr, &sub), NEOX_OK);
         neox_device_pump(g_soft);
     }
-    /* gpu：scene vs 立即 */
+    /* gpu（GL + Metal）：scene → c；立即 → d */
     {
-        neox_gl_surface *surf = NULL;
-        neox_target_desc td;
-        neox_frame *fr;
-        neox_submission sub;
-        CHECK_RES(neox_gl_surface_create(g_gpu, 96, 64, &surf), NEOX_OK);
-        memset(&td, 0, sizeof(td));
-        td.kind = NEOX_BACKEND_GPU;
-        td.surface = surf;
-        td.clear = &CLEAR_GRAY;
-        CHECK_RES(neox_frame_begin(g_gpu, &td, &fr), NEOX_OK);
-        CHECK_RES(neox_scene_render(fr, sc_g, (neox_node){ 0 }), NEOX_OK);
-        CHECK_RES(neox_frame_end(fr, &sub), NEOX_OK);
-        neox_device_pump(g_gpu);
-        CHECK_RES(neox_gl_surface_read_pixels(surf, c), NEOX_OK);
-        CHECK_RES(neox_frame_begin(g_gpu, &td, &fr), NEOX_OK);
-        draw_immediate_kitchen(fr, &g_res_gpu);
-        CHECK_RES(neox_frame_end(fr, &sub), NEOX_OK);
-        neox_device_pump(g_gpu);
-        CHECK_RES(neox_gl_surface_read_pixels(surf, d), NEOX_OK);
-        neox_gl_surface_destroy(g_gpu, surf);
+        const gpu_api *apis[2] = { &g_gl_api, &g_mtl_api };
+        neox_scene *scs[2] = { &sc_g, &sc_m };
+        int ai;
+        for (ai = 0; ai < 2; ai++) {
+            void *surf = NULL;
+            neox_target_desc td;
+            neox_frame *fr;
+            neox_submission sub;
+            if (ai == 1 && !g_mtl_ok) continue;
+            CHECK_RES(apis[ai]->surface_create(apis[ai]->dev, 96, 64, &surf),
+                      NEOX_OK);
+            memset(&td, 0, sizeof(td));
+            td.kind = NEOX_BACKEND_GPU;
+            td.surface = surf;
+            td.clear = &CLEAR_GRAY;
+            CHECK_RES(neox_frame_begin(apis[ai]->dev, &td, &fr), NEOX_OK);
+            CHECK_RES(neox_scene_render(fr, *scs[ai], (neox_node){ 0 }), NEOX_OK);
+            CHECK_RES(neox_frame_end(fr, &sub), NEOX_OK);
+            neox_device_pump(apis[ai]->dev);
+            CHECK_RES(neox_submission_wait(apis[ai]->dev, sub), NEOX_OK);
+            CHECK_RES(apis[ai]->surface_read(surf, c), NEOX_OK);
+            CHECK_RES(neox_frame_begin(apis[ai]->dev, &td, &fr), NEOX_OK);
+            draw_immediate_kitchen(fr, ai == 0 ? &g_res_gpu : &g_res_mtl);
+            CHECK_RES(neox_frame_end(fr, &sub), NEOX_OK);
+            neox_device_pump(apis[ai]->dev);
+            CHECK_RES(neox_submission_wait(apis[ai]->dev, sub), NEOX_OK);
+            CHECK_RES(apis[ai]->surface_read(surf, d), NEOX_OK);
+            apis[ai]->surface_destroy(apis[ai]->dev, surf);
+            /* scene_render 与立即模式共享命令流展开：同后端逐位一致 */
+            CHECK(memcmp(c, d, sizeof(c)) == 0);
+            /* 跨后端：soft 参考 vs 本 GPU */
+            snprintf(label, sizeof(label), "scene-render %s",
+                     ai == 0 ? "gl" : "mtl");
+            compare_images(a, c, 96, 64, label, &st);
+        }
     }
-    /* scene_render 与立即模式共享命令流展开：各后端内逐位一致 */
     CHECK(memcmp(a, b, sizeof(a)) == 0);
-    CHECK(memcmp(c, d, sizeof(c)) == 0);
-    /* 跨后端 §9 容差 */
-    compare_images(a, c, 96, 64, "scene-render", &st);
 
     neox_scene_destroy(g_soft, sc_s);
     neox_scene_destroy(g_gpu, sc_g);
+    if (g_mtl_ok) neox_scene_destroy(g_mtl, sc_m);
     neox_device_pump(g_soft);
     neox_device_pump(g_gpu);
+    if (g_mtl_ok) neox_device_pump(g_mtl);
 }
 
 /* CAP 跨后端回放（CAP 工作于命令流层级，对 GPU 后端天然有效——此处验证） */
@@ -899,6 +1042,7 @@ static void test_cap_across_backends(void)
     size_t size = 0;
     neox_paint pt;
     cmp_stats st;
+    char label[64];
 
     /* Soft 设备录制 */
     CHECK_RES(neox_capture_begin(g_soft, &cap), NEOX_OK);
@@ -927,26 +1071,36 @@ static void test_cap_across_backends(void)
         CHECK_RES(neox_capture_end(cap, &data, &size), NEOX_OK);
         neox_device_pump(g_soft);
     }
-    /* GL 设备回放 → 与 Soft 原帧 §9 容差内一致 */
+    /* GL/Metal 设备回放 → 与 Soft 原帧逐位一致 */
     {
-        neox_gl_surface *surf = NULL;
-        neox_target_desc td;
-        neox_frame *fr;
-        neox_submission sub;
-        CHECK_RES(neox_gl_surface_create(g_gpu, 64, 64, &surf), NEOX_OK);
-        memset(&td, 0, sizeof(td));
-        td.kind = NEOX_BACKEND_GPU;
-        td.surface = surf;
-        td.clear = &CLEAR_GRAY;
-        CHECK_RES(neox_frame_begin(g_gpu, &td, &fr), NEOX_OK);
-        CHECK_RES(neox_capture_replay(fr, data, size), NEOX_OK);
-        CHECK_RES(neox_frame_end(fr, &sub), NEOX_OK);
-        neox_device_pump(g_gpu);
-        CHECK(neox_submission_get_status(g_gpu, sub) == NEOX_SUBMISSION_COMPLETE);
-        CHECK_RES(neox_gl_surface_read_pixels(surf, b), NEOX_OK);
-        neox_gl_surface_destroy(g_gpu, surf);
+        const gpu_api *apis[2] = { &g_gl_api, &g_mtl_api };
+        int ai;
+        for (ai = 0; ai < 2; ai++) {
+            void *surf = NULL;
+            neox_target_desc td;
+            neox_frame *fr;
+            neox_submission sub;
+            if (ai == 1 && !g_mtl_ok) continue;
+            CHECK_RES(apis[ai]->surface_create(apis[ai]->dev, 64, 64, &surf),
+                      NEOX_OK);
+            memset(&td, 0, sizeof(td));
+            td.kind = NEOX_BACKEND_GPU;
+            td.surface = surf;
+            td.clear = &CLEAR_GRAY;
+            CHECK_RES(neox_frame_begin(apis[ai]->dev, &td, &fr), NEOX_OK);
+            CHECK_RES(neox_capture_replay(fr, data, size), NEOX_OK);
+            CHECK_RES(neox_frame_end(fr, &sub), NEOX_OK);
+            neox_device_pump(apis[ai]->dev);
+            CHECK_RES(neox_submission_wait(apis[ai]->dev, sub), NEOX_OK);
+            CHECK(neox_submission_get_status(apis[ai]->dev, sub) ==
+                  NEOX_SUBMISSION_COMPLETE);
+            CHECK_RES(apis[ai]->surface_read(surf, b), NEOX_OK);
+            apis[ai]->surface_destroy(apis[ai]->dev, surf);
+            snprintf(label, sizeof(label), "cap-soft->%s",
+                     ai == 0 ? "gl" : "mtl");
+            compare_images(a, b, 64, 64, label, &st);
+        }
     }
-    compare_images(a, b, 64, 64, "cap-soft->gl", &st);
     neox_capture_free_buffer(g_ctx, data, size);
 }
 
@@ -971,6 +1125,7 @@ int main(void)
         neox_gl_device_desc gld;
         memset(&gld, 0, sizeof(gld));
         gld.struct_size = (uint32_t)sizeof(gld);
+        gld.magic = NEOX_GL_DESC_MAGIC;
         gld.shared_context = NULL;
         memset(&dd, 0, sizeof(dd));
         dd.backend = NEOX_BACKEND_GPU;
@@ -986,9 +1141,47 @@ int main(void)
     }
     g_gpu_ok = 1;
     (void)g_gpu_ok;
+    g_gl_api.dev = g_gpu;
+    g_gl_api.surface_create =
+        (neox_result (*)(neox_device *, uint32_t, uint32_t, void **))
+        neox_gl_surface_create;
+    g_gl_api.surface_destroy =
+        (void (*)(neox_device *, void *)) neox_gl_surface_destroy;
+    g_gl_api.surface_read =
+        (neox_result (*)(void *, uint8_t *)) neox_gl_surface_read_pixels;
+
+    /* Metal 设备（真异步后端；失败仅跳过 Metal 比较，不 SKIP 全部） */
+    {
+        neox_mtl_device_desc mtd;
+        memset(&mtd, 0, sizeof(mtd));
+        mtd.struct_size = (uint32_t)sizeof(mtd);
+        mtd.magic = NEOX_MTL_DESC_MAGIC;
+        mtd.device = NULL;
+        mtd.command_queue = NULL;
+        memset(&dd, 0, sizeof(dd));
+        dd.backend = NEOX_BACKEND_GPU;
+        dd.platform = &mtd;
+        dd.platform_size = sizeof(mtd);
+        if (neox_device_create(g_ctx, &dd, &g_mtl) != NEOX_OK) {
+            printf("SKIP: Metal backend unavailable (%s)\n",
+                   neox_get_error_detail(g_ctx));
+            g_mtl = NULL;
+        } else {
+            g_mtl_ok = 1;
+        }
+    }
+    g_mtl_api.dev = g_mtl;
+    g_mtl_api.surface_create =
+        (neox_result (*)(neox_device *, uint32_t, uint32_t, void **))
+        neox_mtl_surface_create;
+    g_mtl_api.surface_destroy =
+        (void (*)(neox_device *, void *)) neox_mtl_surface_destroy;
+    g_mtl_api.surface_read =
+        (neox_result (*)(void *, uint8_t *)) neox_mtl_surface_read_pixels;
 
     res_create(g_soft, &g_res_soft);
     res_create(g_gpu, &g_res_gpu);
+    if (g_mtl_ok) res_create(g_mtl, &g_res_mtl);
 
     test_device_semantics();
 
@@ -1002,6 +1195,7 @@ int main(void)
     check_pair("tex-mirror", sc_tex_mirror, 96, 64, &CLEAR_GRAY);
     check_pair("glyphs", sc_glyphs, 96, 64, &CLEAR_GRAY);
     check_pair("blend-clear-partial", sc_clear_partial, 96, 64, &CLEAR_GRAY);
+    check_pair("deep-nesting", sc_deep_nesting, 96, 64, &CLEAR_GRAY);
     check_pair("blend-dst-partial", sc_dst_partial, 96, 64, &CLEAR_GRAY);
     check_pair("kitchen-sink", sc_kitchen, 96, 64, &CLEAR_GRAY);
 
@@ -1010,6 +1204,10 @@ int main(void)
 
     res_destroy(g_soft, &g_res_soft);
     res_destroy(g_gpu, &g_res_gpu);
+    if (g_mtl_ok) {
+        res_destroy(g_mtl, &g_res_mtl);
+        neox_device_destroy(g_mtl);
+    }
     neox_device_destroy(g_gpu);
     neox_device_destroy(g_soft);
     neox_context_destroy(g_ctx);

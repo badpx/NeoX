@@ -13,8 +13,10 @@ endif()
 option(NEOX_SANITIZE "Build with -fsanitize=address,undefined" OFF)
 if(APPLE)
   option(NEOX_BACKEND_GL "OpenGL backend (macOS CGL offscreen + GL 4.1 Core)" ON)
+  option(NEOX_BACKEND_METAL "Metal backend (macOS native, Objective-C++)" ON)
 else()
   option(NEOX_BACKEND_GL "OpenGL backend (macOS CGL offscreen + GL 4.1 Core)" OFF)
+  option(NEOX_BACKEND_METAL "Metal backend (macOS native, Objective-C++)" OFF)
 endif()
 
 add_library(neox STATIC src/core.c src/geom.c src/soft.c)
@@ -36,6 +38,20 @@ else()
   set(NEOX_GL_ENABLED 0)
 endif()
 
+# Metal 后端：仅 macOS；唯一 ObjC++ 文件，MRC（C 结构内手动管理 MTL 对象）
+if(NEOX_BACKEND_METAL AND APPLE)
+  enable_language(OBJCXX)
+  target_sources(neox PRIVATE src/metal.mm)
+  target_compile_definitions(neox PRIVATE NEOX_ENABLE_METAL=1)
+  target_link_libraries(neox PRIVATE "-framework Metal" "-framework Foundation"
+                        "-framework QuartzCore")
+  set_source_files_properties(src/metal.mm PROPERTIES
+    COMPILE_OPTIONS "-fno-objc-arc;-Wno-deprecated-declarations")
+  set(NEOX_MTL_ENABLED 1)
+else()
+  set(NEOX_MTL_ENABLED 0)
+endif()
+
 # 示例：输出 BMP 到构建目录（ctest 可顺带验证示例跑通）
 add_executable(ex01_scene examples/ex01_scene.c)
 target_link_libraries(ex01_scene PRIVATE neox m)
@@ -54,7 +70,7 @@ add_test(NAME ex01_smoke COMMAND ex01_scene)
 set_tests_properties(ex01_smoke PROPERTIES
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
-if(NEOX_GL_ENABLED)
+if(NEOX_GL_ENABLED OR NEOX_MTL_ENABLED)
   add_executable(test_gpu_consistency tests/test_gpu_consistency.c)
   target_link_libraries(test_gpu_consistency PRIVATE neox m)
   target_compile_options(test_gpu_consistency PRIVATE -Wall -Wextra)
@@ -72,6 +88,19 @@ if(NEOX_GL_ENABLED)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
   list(APPEND NEOX_TARGETS test_gpu_consistency ex02_gpuscene)
+endif()
+
+if(NEOX_MTL_ENABLED)
+  add_executable(ex03_mtlscene examples/ex03_mtlscene.c)
+  target_link_libraries(ex03_mtlscene PRIVATE neox m)
+  target_compile_options(ex03_mtlscene PRIVATE -Wall -Wextra)
+  set_target_properties(ex03_mtlscene PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+  add_test(NAME ex03_smoke COMMAND ex03_mtlscene)
+  set_tests_properties(ex03_smoke PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+  list(APPEND NEOX_TARGETS ex03_mtlscene)
 endif()
 
 if(NEOX_SANITIZE)

@@ -161,12 +161,30 @@ neox_result neox_device_create(neox_context *ctx, const neox_device_desc *desc,
     if (kind == NEOX_BACKEND_SOFT)
         vt = nx_backend_soft();
     else if (kind == NEOX_BACKEND_GPU) {
+        /* 参数块第二字段为后端魔数（struct_size 之后），区分 GL/Metal 实现；
+         * platform 为 NULL（或魔数为 0 的旧式参数块）时按历史行为默认 GL */
+        const uint8_t *p = desc ? (const uint8_t *)desc->platform : NULL;
+        size_t psz = desc ? desc->platform_size : 0;
+        uint32_t magic = 0;
+        if (p && psz >= 2 * sizeof(uint32_t))
+            magic = ((const uint32_t *)p)[1];
+        if (magic == 0 || magic == NX_GPU_DESC_MAGIC_GL) {
 #ifdef NEOX_ENABLE_GL
-        vt = nx_backend_gl();
+            vt = nx_backend_gl();
 #else
-        NX_ERR(ctx, "GPU backend not available in this build",
-               NEOX_ERROR_UNSUPPORTED);
+            NX_ERR(ctx, "GL backend not available in this build",
+                   NEOX_ERROR_UNSUPPORTED);
 #endif
+        } else if (magic == NX_GPU_DESC_MAGIC_MTL) {
+#ifdef NEOX_ENABLE_METAL
+            vt = nx_backend_mtl();
+#else
+            NX_ERR(ctx, "Metal backend not available in this build",
+                   NEOX_ERROR_UNSUPPORTED);
+#endif
+        } else
+            NX_ERR(ctx, "unknown GPU platform desc magic",
+                   NEOX_ERROR_INVALID_ARGUMENT);
     } else
         NX_ERR(ctx, "unknown backend kind", NEOX_ERROR_INVALID_ARGUMENT);
     dev = (neox_device *)nx_alloc(ctx, sizeof(neox_device), 16);

@@ -910,7 +910,7 @@ neox_result neox_draw_glyphs(neox_frame *frame, neox_texture atlas,
 
 /* ------------------------------------------------------------------ submission 组装与执行 */
 
-static void sub_free_payload(neox_device *dev, nx_sub_slot *s)
+void nx_sub_release_payload(neox_device *dev, nx_sub_slot *s)
 {
     neox_context *ctx = dev->ctx;
     uint32_t i;
@@ -1022,7 +1022,7 @@ neox_result neox_frame_end(neox_frame *frame, neox_submission *out_sub)
 fail:
     /* 原子性：提交失败，目标与本帧资源状态保持调用前一致（§10.1）。
      * frame 保持存活可重试；sub 槽位清空归还。 */
-    sub_free_payload(dev, sub);
+    nx_sub_release_payload(dev, sub);
     sub->in_use = 0;
     /* 归还槽位到空闲链 */
     dev->subs.free_list = (uint32_t *)nx_array_grow(ctx, dev->subs.free_list, 4,
@@ -1336,16 +1336,39 @@ uint32_t neox_device_pump(neox_device *dev)
 {
     uint32_t done = 0, i, out;
     if (!dev) return 0;
-    /* Soft 后端无真异步：pump 即完成全部 pending submission（接口语义同异步模型） */
+    /* 异步后端（Metal）完成进度：completedHandler 只登记事件，状态推进、
+     * 载荷释放与延迟回收全部发生在本调用线程（核心线程模型不变） */
+    if (dev->vt->poll) done += dev->vt->poll(dev);
+    /* 同步后端（poll == NULL，Soft/GL）：execute 返回即由 pump 标记终态。
+     * 异步后端（Metal）：execute 只提交命令缓冲并保持 PENDING；编码期失败
+     * 由 execute 自行置 FAILED（此处收割），成功路径待 poll 在 GPU 完成时
+     * 做 resolve + 状态推进。 */
     for (i = 0; i < dev->pending_count; i++) {
         nx_sub_slot *sub = &((nx_sub_slot *)dev->subs.slots)[dev->pending[i]];
-        neox_result r = dev->vt->execute(dev, sub);
-        sub->status = (r == NEOX_OK) ? NEOX_SUBMISSION_COMPLETE
-                                     : NEOX_SUBMISSION_FAILED;
-        sub_free_payload(dev, sub);
-        done++;
+        neox_result r;
+        if (sub->status != NEOX_SUBMISSION_PENDING) continue; /* 已被 poll 完成 */
+        r = dev->vt->execute(dev, sub);
+        if (dev->vt->poll == NULL) {
+            sub->status = (r == NEOX_OK) ? NEOX_SUBMISSION_COMPLETE
+                                         : NEOX_SUBMISSION_FAILED;
+            nx_sub_release_payload(dev, sub);
+            done++;
+        } else if (sub->status != NEOX_SUBMISSION_PENDING) {
+            nx_sub_release_payload(dev, sub); /* 异步编码期失败（已置 FAILED） */
+            done++;
+        }
+        /* else：真异步在途，保持 PENDING */
     }
-    dev->pending_count = 0;
+    if (dev->vt->poll) done += dev->vt->poll(dev);
+    /* 压缩 pending：仅保留仍在途的提交 */
+    out = 0;
+    for (i = 0; i < dev->pending_count; i++) {
+        uint32_t sidx = dev->pending[i];
+        nx_sub_slot *sub = &((nx_sub_slot *)dev->subs.slots)[sidx];
+        if (sub->status == NEOX_SUBMISSION_PENDING)
+            dev->pending[out++] = sidx;
+    }
+    dev->pending_count = out;
     /* 延迟回收：执行完成后，引用计数归零的槽位才真正回收 */
     out = 0;
     for (i = 0; i < dev->defer_count; i++) {
@@ -1384,9 +1407,12 @@ neox_result neox_submission_wait(neox_device *dev, neox_submission sub)
     r = nx_resolve(dev, sub.id, NX_TYPE_SUB, &idx);
     if (r != NEOX_OK) return r;
     s = &((nx_sub_slot *)dev->subs.slots)[idx];
-    /* 无线程环境：内部为 pump 循环；Soft 一次 pump 即完成 */
-    while (s->status == NEOX_SUBMISSION_PENDING)
+    /* 无线程环境：内部为 pump 循环；异步后端经 block 钩子等待真实进度，
+     * 避免在 PENDING 上空转（Soft 一次 pump 即完成） */
+    while (s->status == NEOX_SUBMISSION_PENDING) {
+        if (dev->vt->block) dev->vt->block(dev);
         neox_device_pump(dev);
+    }
     return NEOX_OK;
 }
 
@@ -1455,7 +1481,9 @@ const nx_backend *nx_backend_soft(void)
         NULL,               /* shutdown：无后端状态 */
         soft_begin_target,
         soft_execute,
-        soft_get_caps
+        soft_get_caps,
+        NULL,               /* poll：同步后端 */
+        NULL                /* block：同步后端 */
     };
     return &vt;
 }

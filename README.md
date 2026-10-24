@@ -16,18 +16,20 @@ NeoX 是一个以**图形语义契约**为中心的跨平台 2D 图形库：矢�
 
 详见 [docs/design-v0.2.md](docs/design-v0.2.md)（方案文档）、[docs/semantics-v0.md](docs/semantics-v0.md)（语义规范）与 [docs/adr/](docs/adr/)（架构决策记录）。
 
-## 当前状态（第一阶段完成）
+## 当前状态
 
 | 组件 | 状态 |
 |---|---|
-| 语义规范 v0（最小子集） | 双后端验证通过，草案冻结 |
+| 语义规范 v0（最小子集） | 三后端验证通过，草案冻结 |
 | Soft 后端（软件光栅） | 完成，参照实现 |
 | GL 后端（OpenGL 4.1/CGL，macOS） | 完成，链路验证定位 |
+| Metal 后端（macOS，真异步） | 完成，首个验证"提交后存活期"契约的后端 |
 | 保留模式场景树 | 完成（脏区追踪为粗粒度，增量执行在第二阶段） |
 | CAP 捕获/回放（最小版） | 完成，含跨后端回放 |
 | NeoX-Text / GLES3 / WebGL2 / WASM | 第二阶段 |
 
-测试规模：443 项断言（255 语义 + 188 跨后端一致性），ASan/UBSan 干净。
+测试规模：679 项断言（255 语义 + 424 跨后端一致性），**三后端两两逐位一致**，
+ASan/UBSan 干净。
 
 ## 构建与测试
 
@@ -38,8 +40,8 @@ ctest --test-dir build --output-on-failure
 ```
 
 - 依赖：C11 编译器 + CMake；无第三方库。
-- macOS 上默认启用 GL 后端（`NEOX_BACKEND_GL`）；其他平台当前自动退回 Soft-only。
-- 示例：`build/ex01_scene`（Soft）与 `build/ex02_gpuscene`（GL）输出 BMP 到 build 目录；`ex02_compare.bmp` 为双后端并排对比图。
+- macOS 上默认启用 GL 与 Metal 后端（`NEOX_BACKEND_GL` / `NEOX_BACKEND_METAL`）；其他平台当前自动退回 Soft-only。
+- 示例：`build/ex01_scene`（Soft）、`build/ex02_gpuscene`（GL）、`build/ex03_mtlscene`（Metal）输出 BMP 到 build 目录；`ex03_compare.bmp` 为三后端并排对比图。
 
 ## 许可证
 

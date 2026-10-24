@@ -22,7 +22,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure (ASan+UBSan)
-        run: cmake -S . -B build-asan -DCMAKE_C_FLAGS="-fsanitize=address,undefined -g"
+        run: >-
+          cmake -S . -B build-asan
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -g"
+          -DCMAKE_OBJCXX_FLAGS="-fsanitize=address,undefined -g"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
       - name: Build
         run: cmake --build build-asan
       - name: Test

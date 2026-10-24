@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build -- -Werror
+      - name: Test (Soft + GL)
+        run: ctest --test-dir build --output-on-failure
+
+  macos-asan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (ASan+UBSan)
+        run: cmake -S . -B build-asan -DCMAKE_C_FLAGS="-fsanitize=address,undefined -g"
+      - name: Build
+        run: cmake --build build-asan
+      - name: Test
+        run: ctest --test-dir build-asan --output-on-failure
+
+  ubuntu-soft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (Soft only)
+        run: cmake -S . -B build -DNEOX_BACKEND_GL=OFF -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

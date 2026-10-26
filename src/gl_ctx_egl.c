@@ -243,9 +243,14 @@ static int ensure_display(void)
 
 static int choose_config(int want_pbuffer, EGLConfig *out)
 {
+    /* eglChooseConfig 未写 EGL_SURFACE_TYPE 时默认要求 WINDOW_BIT。
+     * Mesa surfaceless 的 config 只有 PBUFFER（且带 EGL_OPENGL_BIT），
+     * 默认匹配会得到 0 个。显式要 0：不要求任何 surface 位。渲染目标是
+     * 自有 FBO，配合 EGL_KHR_surfaceless_context 用 EGL_NO_SURFACE。 */
     const EGLint plain[] = {
         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_SURFACE_TYPE, 0,
         EGL_NONE
     };
     const EGLint pbuf[] = {

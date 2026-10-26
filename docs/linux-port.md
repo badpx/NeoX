@@ -84,7 +84,10 @@ macOS 下保持静态链接现状（`gl_load` 不参与编译或为空实现）�
 3. `eglChooseConfig`：OpenGL API（`EGL_OPENGL_API` 经 `eglBindAPI`）、
    **桌面 GL 而非 GLES**——现有 shader 是 GLSL 410；
 4. PBuffer 或 surfaceless 表面（渲染目标是自有 FBO，不需要真实 surface，
-   `EGL_NO_SURFACE` + surfaceless 上下文即可）；
+   `EGL_NO_SURFACE` + surfaceless 上下文即可）。`eglChooseConfig` 必须
+   显式给出 `EGL_SURFACE_TYPE`（0 或 `EGL_PBUFFER_BIT`）：缺省是
+   `EGL_WINDOW_BIT`，Mesa surfaceless 的 config 只有 pbuffer，否则选不到
+   桌面 GL config；
 5. 上下文属性：4.1 Core Profile（`EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT`）。
 
 依赖库：`libEGL.so.1` + Mesa 驱动。**运行期 dlopen，不做链接期硬依赖**
@@ -134,7 +137,8 @@ SKIP。另有 `gpu_consistency_nodual`（`NEOX_GL_FORCE_NO_DUAL=1`）。
    可能存在 1-ulp 级差异，经 CPU resolve 的 ties-to-even 量化后**可能**在
    个别像素翻转。**预期仍逐位一致；若失败**，按规范 §9 的容差条款验收
    （内部精确 + 边界 ≤32/255）并记录实测偏差，不要为了追平 macOS 修改
-   共享几何代码。
+   共享几何代码。本机 llvmpipe 25.2.8 实测 `boundary_maxdiff=0`（见 §7），
+   未改共享几何。
 2. **dual-source blending**：llvmpipe 支持 `ARB_blend_func_extended`，但
    实现必须走"探测 + ping-pong 回退"双路径（Metal 后端 ADR 0005 已有同款
    模式与强制回退开关，照抄）。
@@ -152,7 +156,7 @@ SKIP。另有 `gpu_consistency_nodual`（`NEOX_GL_FORCE_NO_DUAL=1`）。
 - [x] W3 `gl_ctx_egl.c`（surfaceless → device → default，PBuffer 回退）
 - [x] W4 砍掉：EGL 三条路径足够，失败即 `NEOX_ERROR_BACKEND`
 - [x] W5 CMake 接线 + `${CMAKE_DL_LIBS}`
-- [ ] W6 本机 `ctest` 全绿（Soft↔GL 一致性非 SKIP 通过）——见 PR 自测记录
+- [x] W6 本机 `ctest` 全绿（Soft↔GL 逐位一致，含 `NEOX_GL_FORCE_NO_DUAL`）
 - [x] W6 CI `ubuntu-gl` job 已加入（绿灯以 GitHub Actions 为准）
 - [x] ADR 0004 已补 Linux 落地记录。issue #1 不在本变更中关闭。
 
@@ -166,3 +170,13 @@ SKIP。另有 `gpu_consistency_nodual`（`NEOX_GL_FORCE_NO_DUAL=1`）。
 - 不包含系统 GL/EGL 头，类型与常量在 `gl_api.h` / `gl_ctx_egl.c` 就地定义，
   因此 CI 运行时包不必带 `-dev` 头。
 - 文本测试增加 Linux 字体候选。跨平台不与 macOS 黄金图比较。
+
+本机验收（Clang 18，`-Wall -Wextra -Werror`，无显示器）：
+
+- 上下文：`egl-surfaceless`，`llvmpipe (LLVM 20.1.2, 256 bits)`，
+  Mesa 25.2.8，GL 4.5 Core。`GL_MAX_DUAL_SOURCE_DRAW_BUFFERS` 探测成功。
+- `ctest` 7/7 通过（`NEOX_REQUIRE_GL=1`）。`test_gpu_consistency` 27 个
+  场景 `interior_mismatch=0`、`boundary_maxdiff=0`（196 checks）。
+  `NEOX_GL_FORCE_NO_DUAL=1` 同样 27/27 逐位一致。
+- 文字集成 95 checks 通过（Metal 未编译，少一次 Metal 比较）。示例
+  `ex01` / `ex02` / `ex04` 写出 BMP。未使用 Xvfb。

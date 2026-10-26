@@ -296,6 +296,46 @@ out:
 static gpu_api g_gl_api;
 static gpu_api g_mtl_api;
 
+/* 表面句柄在两个后端上是不同的具体类型。函数指针必须和被调函数的类型
+ * 一致：把 neox_gl_surface ** 收成 void ** 再间接调用会触发
+ * -fsanitize=function（Clang UBSan）。适配只发生在这些直接调用里。 */
+#if NEOX_ENABLE_GL
+static neox_result gl_surface_create(neox_device *dev, uint32_t w, uint32_t h,
+                                     void **out)
+{
+    neox_gl_surface *surface = NULL;
+    neox_result r = neox_gl_surface_create(dev, w, h, &surface);
+    if (out) *out = surface;
+    return r;
+}
+static void gl_surface_destroy(neox_device *dev, void *surface)
+{
+    neox_gl_surface_destroy(dev, surface);
+}
+static neox_result gl_surface_read(void *surface, uint8_t *pixels)
+{
+    return neox_gl_surface_read_pixels(surface, pixels);
+}
+#endif
+#if NEOX_ENABLE_METAL
+static neox_result mtl_surface_create(neox_device *dev, uint32_t w, uint32_t h,
+                                      void **out)
+{
+    neox_mtl_surface *surface = NULL;
+    neox_result r = neox_mtl_surface_create(dev, w, h, &surface);
+    if (out) *out = surface;
+    return r;
+}
+static void mtl_surface_destroy(neox_device *dev, void *surface)
+{
+    neox_mtl_surface_destroy(dev, surface);
+}
+static neox_result mtl_surface_read(void *surface, uint8_t *pixels)
+{
+    return neox_mtl_surface_read_pixels(surface, pixels);
+}
+#endif
+
 /* ------------------------------------------------------------------ §9 比较 */
 #define CMP_TOL 32   /* §9：边界覆盖率差 ≤ 32/255 */
 
@@ -1347,13 +1387,9 @@ int main(void)
         } else g_gpu_ok = 1;
     }
     g_gl_api.dev = g_gpu;
-    g_gl_api.surface_create =
-        (neox_result (*)(neox_device *, uint32_t, uint32_t, void **))
-        neox_gl_surface_create;
-    g_gl_api.surface_destroy =
-        (void (*)(neox_device *, void *)) neox_gl_surface_destroy;
-    g_gl_api.surface_read =
-        (neox_result (*)(void *, uint8_t *)) neox_gl_surface_read_pixels;
+    g_gl_api.surface_create = gl_surface_create;
+    g_gl_api.surface_destroy = gl_surface_destroy;
+    g_gl_api.surface_read = gl_surface_read;
 
 #endif
 #if NEOX_ENABLE_METAL
@@ -1378,13 +1414,9 @@ int main(void)
         }
     }
     g_mtl_api.dev = g_mtl;
-    g_mtl_api.surface_create =
-        (neox_result (*)(neox_device *, uint32_t, uint32_t, void **))
-        neox_mtl_surface_create;
-    g_mtl_api.surface_destroy =
-        (void (*)(neox_device *, void *)) neox_mtl_surface_destroy;
-    g_mtl_api.surface_read =
-        (neox_result (*)(void *, uint8_t *)) neox_mtl_surface_read_pixels;
+    g_mtl_api.surface_create = mtl_surface_create;
+    g_mtl_api.surface_destroy = mtl_surface_destroy;
+    g_mtl_api.surface_read = mtl_surface_read;
 #endif
 
     const char *require_gl = getenv("NEOX_REQUIRE_GL");

@@ -1,5 +1,5 @@
 /* 窗口呈现：Soft 与 GL 上屏后读回，检查朝向、缩放、resize 和关闭。
- * 没有 DISPLAY / WAYLAND_DISPLAY 时跳过（返回 0），除非 NEOX_REQUIRE_PRESENT。 */
+ * 没有 DISPLAY / WAYLAND_DISPLAY 时跳过（返回 77），除非 NEOX_REQUIRE_PRESENT。 */
 #include "neox.h"
 #include "neox_present.h"
 
@@ -121,6 +121,8 @@ static int draw_bars(neox_window *win, neox_device *dev)
                 (int)neox_submission_get_status(dev, sub));
         return 0;
     }
+    neox_submission_release(dev,sub);
+    if (neox_window_request_readback(win) != NEOX_OK) return 0;
     if (neox_window_present(win) != NEOX_OK) {
         fprintf(stderr, "present: %s\n", neox_window_last_error());
         return 0;
@@ -200,6 +202,17 @@ static void run_backend(neox_context *ctx, neox_backend_kind kind, const char *t
     }
     expect(draw_bars(win, dev), "draw/present");
     check_orientation(win, tag);
+    if (kind==NEOX_BACKEND_GPU) {
+        /* A regular present must not silently capture or expose an old snapshot. */
+        expect(neox_window_present(win)==NEOX_OK,"ordinary present");
+        uint8_t *pixels=malloc((size_t)px_w*px_h*4);
+        expect(pixels!=NULL,"snapshot check allocation");
+        if(pixels) {
+            expect(neox_window_read_pixels(win,pixels)==NEOX_ERROR_UNSUPPORTED,
+                   "ordinary present invalidates explicit snapshot");
+            free(pixels);
+        }
+    }
     expect(neox_window_resize(win, w + 20, h + 10) == NEOX_OK, "resize");
     neox_window_metrics(win, &pt_w, &pt_h, &got, &px_w, &px_h);
     expect(pt_w == w + 20 && pt_h == h + 10, "resized points");
@@ -248,6 +261,7 @@ static int offscreen_still_works(neox_context *ctx)
     if (neox_frame_begin(dev, &td, &fr) != NEOX_OK) return 0;
     if (neox_frame_end(fr, &sub) != NEOX_OK) return 0;
     if (neox_submission_wait(dev, sub) != NEOX_OK) return 0;
+    neox_submission_release(dev,sub);
     if (neox_gl_surface_read_pixels(surf, px) != NEOX_OK) return 0;
     neox_gl_surface_destroy(dev, surf);
     neox_device_destroy(dev);
@@ -265,7 +279,7 @@ int main(void)
             return 1;
         }
         printf("present: skipped (no DISPLAY or WAYLAND_DISPLAY)\n");
-        return 0;
+        return 77;
     }
     memset(&cd, 0, sizeof cd);
     if (neox_context_create(&cd, &ctx) != NEOX_OK) return 1;

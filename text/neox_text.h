@@ -12,9 +12,10 @@
  *     （nx_text_context 的 flags），默认关闭；
  *   - 双向文本（Bidi）；富文本样式；字体回退链（fallback）。
  *
- * 内存：全部持久内存经注入分配器（nx_text_context_create 的 alloc 参数；
- * 为 NULL 时转发 neox_context 的分配器——同仓库内部耦合，见 docs/dependencies
- * 与提交报告）。stb 光栅化瞬态分配走系统分配器并立即释放（文档化）。
+ * 内存：持久对象和 stb 光栅化临时分配均计入 core_ctx 的 memory_budget。
+ * alloc 可覆盖实际分配器，但不会绕过共享预算；为 NULL 时使用核心分配器。
+ * tctx 及其对象必须先于 core_ctx 销毁；共享同一 core_ctx 的内存操作需串行化。
+ * 自定义字体后端自身的分配由调用方管理，不在本模块的自动预算范围。
  *
  * 失败语义：与核心一致——失败返回非 OK，状态不留半完成；last_error 为
  * 静态描述串。
@@ -32,7 +33,7 @@ extern "C" {
 
 typedef struct nx_text_context nx_text_context;
 
-/* [own] 创建文本上下文。alloc 为 NULL 时转发 core_ctx 的分配器。 */
+/* [own] 创建文本上下文。alloc 为 NULL 时使用核心分配器；均共享核心预算。 */
 neox_result nx_text_context_create(neox_context *core_ctx,
                                    const neox_allocator *alloc, /* [borrow] */
                                    nx_text_context **out_ctx);
@@ -54,10 +55,13 @@ neox_result nx_font_load_file(nx_text_context *tctx, const char *path,
 /* [own] 从内存加载（data 在 [borrow]；模块内部拷贝，调用方可立即释放） */
 neox_result nx_font_load_memory(nx_text_context *tctx, const void *data,
                                 size_t size, int ttc_index, nx_font **out_font);
-/* [own] 显式销毁（亦可随文本上下文级联销毁） */
+/* [own] 显式销毁（亦可随文本上下文级联销毁）。先销毁借用此字体的 layout。
+ * 图集不借用字体对象：已缓存像素仍可存活，新字体不会因地址复用误命中。 */
 void        nx_font_destroy(nx_font *font);
 
-/* 度量（size_px 像素字号；descent <= 0；line_gap 可为 0 或负） */
+/* 度量（size_px 像素字号；descent <= 0；line_gap 可为 0 或负）。
+ * size_px 须有限且非负；结果超出有限 float 时返回 0，并设置 text last_error。
+ * NULL font 返回 0。 */
 float nx_font_ascent(nx_font *font, float size_px);
 float nx_font_descent(nx_font *font, float size_px);
 float nx_font_line_gap(nx_font *font, float size_px);
@@ -69,6 +73,7 @@ float nx_font_line_gap(nx_font *font, float size_px);
 typedef struct nx_font_backend {
     void *user;
     float (*glyph_advance)(void *user, uint32_t glyph_index, float size_px);
+    /* Optional; NULL means zero kerning. Advances/kerning/metrics must be finite. */
     float (*glyph_kerning)(void *user, uint32_t g1, uint32_t g2, float size_px);
     neox_result (*glyph_rasterize)(void *user, uint32_t glyph_index,
                                    float size_px, uint8_t **out_bmp,
@@ -85,6 +90,8 @@ typedef struct nx_font_backend {
                                        float dist_range, uint8_t **out_bmp,
                                        int32_t *out_w, int32_t *out_h,
                                        float *out_bear_x, float *out_bear_y);
+    /* Any non-NULL bitmap returned by rasterize (including on failure) is
+     * released exactly once. Dimensions must be nonnegative; bearings finite. */
     void (*glyph_free_bitmap)(void *user, uint8_t *bmp);
     void (*destroy)(void *user);
     float ascent, descent, line_gap; /* size_px = 1 时的归一化度量 */
@@ -115,7 +122,7 @@ typedef struct nx_layout {
     float line_height;
     uint32_t line_count;
     float size_px;
-    nx_font *font;                   /* [borrow] 由调用方持有 */
+    nx_font *font;                   /* [borrow] 字体必须比此布局存活更久 */
     /* —— 内部字段（实现使用，调用方勿依赖，v0 后为不透明化预留） —— */
     uint32_t glyph_cap;
     struct nx_line_info *line;       /* 行表：范围 + 自然宽度（对齐前） */
@@ -125,7 +132,10 @@ typedef struct nx_layout {
 
 /* [own] 简化排版：UTF-8 解码（非法序列替换为 U+FFFD）→ cmap → 字距 →
  * LTR 贪心断行（CJK 逐字可断、拉丁按词；'\n' 强制断行）→ 对齐。
- * max_width <= 0 表示不换行。 */
+ * size_px/max_width 须有限，size_px > 0；max_width <= 0 表示不换行。
+ * 度量/字距或累计坐标无法表示为有限 float 时返回 INVALID_ARGUMENT，
+ * 分配失败返回 OUT_OF_MEMORY；失败不返回部分 layout。
+ * font 必须属于 tctx；布局须先于字体和 tctx 销毁。 */
 neox_result nx_text_layout(nx_text_context *tctx, nx_font *font, float size_px,
                            const char *utf8, float max_width,
                            nx_text_align align, nx_layout **out_layout);
@@ -136,12 +146,14 @@ neox_result nx_text_measure(const nx_layout *layout, float out_bbox[4]);
 
 /* ------------------------------------------------------------------ 动态图集
  * 一张图集 neox_texture（创建时建立，可经 nx_atlas_texture 取得用于其他
- * 核心绘制）。shelf/row 装箱；缓存键 (font, glyph, size 量化 0.25px)。
+ * 核心绘制）。shelf/row 装箱；缓存键 (不复用的字体 ID, glyph, size 量化 0.25px)。
  * 未命中即光栅化写入并记脏矩形，nx_atlas_flush 经 neox_texture_update
  * 增量上传。容量满返回 NEOX_ERROR_OUT_OF_MEMORY（v0 不做 LRU 驱逐，
- * 结构保留）。
+ * 结构保留）。销毁字体不会回收图集空间；空间随图集销毁释放。
+ * 字体和图集须属于同一文本上下文；图集设备须属于该上下文的 core_ctx，
+ * 绘制帧须来自图集的设备。图集须先于设备销毁。
  *
- * 图集模式创建时固定（COVERAGE/SDF → A8 纹理，MSDF → RGBA8_LINEAR）；
+ * 图集模式创建时固定（COVERAGE/SDF → A8 纹理，MSDF → RGBA8_DATA）；
  * 缓存天然按图集隔离，即同名字形在不同模式图集中各自光栅化。SDF/MSDF
  * 位图已含 dist_range 边距（编码见 nx_font_backend.glyph_rasterize_sdf）。 */
 
@@ -150,7 +162,10 @@ typedef struct nx_atlas_rect { uint16_t x, y, w, h; } nx_atlas_rect;
 
 neox_result nx_atlas_create(nx_text_context *tctx, neox_device *dev,
                             uint32_t width, uint32_t height, nx_atlas **out);
-/* dist_range_px <= 0 取默认 4。MSDF 需要字体后端支持
+/* Built-in MSDF generation is experimental (simple edge coloring, fixed curve
+ * subdivision, bitmap-derived sign; no pseudo-distance/error correction).
+ * It is not guaranteed to improve on SDF. Offline assets can use the core glyph API.
+ * dist_range_px == 0 取默认 4；负数、非有限值或超出 16384 被拒绝。MSDF 需要字体后端支持
  * glyph_rasterize_sdf，否则 nx_atlas_glyph 返回 NEOX_ERROR_UNSUPPORTED */
 neox_result nx_atlas_create_ex(nx_text_context *tctx, neox_device *dev,
                                uint32_t width, uint32_t height,
@@ -161,7 +176,10 @@ neox_texture nx_atlas_texture(const nx_atlas *atlas);
 neox_atlas_mode nx_atlas_get_mode(const nx_atlas *atlas);
 float       nx_atlas_get_dist_range(const nx_atlas *atlas);
 
-/* 取字形图集矩形（未命中即光栅化装箱；容量满返回 OUT_OF_MEMORY） */
+/* 取字形图集矩形（未命中即光栅化装箱；容量满返回 OUT_OF_MEMORY）。
+ * 内置字体后端在生成位图前检查 glyph_index、缩放后尺寸及距离场边距；
+ * 装不下的字形不会先分配巨型位图。stb SDF 编码系数无法表示为有限 float
+ * 时返回 UNSUPPORTED；MSDF 使用 double 编码系数。失败不插入该字形缓存。 */
 neox_result nx_atlas_glyph(nx_atlas *atlas, nx_font *font, uint32_t glyph_index,
                            float size_px, nx_atlas_rect *out_rect);
 /* 脏矩形经 neox_texture_update 增量上传（nx_text_draw 内部已调用；

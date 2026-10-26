@@ -10,11 +10,16 @@
  *   - 动态图集：shelf/row 装箱 + 开放寻址缓存 + 脏矩形增量上传
  *   - 绘制桥：layout → neox_glyph[] → neox_draw_glyphs
  *
- * 内存：持久内存全部经注入分配器；stb 光栅化瞬态分配（STBTT_malloc 默认
- * 系统 malloc）在 rasterize 内立即 FreeBitmap 释放（文档化，见
- * docs/dependencies.md）。
+ * 内存：持久与 stb 临时分配均经注入分配器，并计入所属核心 context 预算。
  * =========================================================================*/
 #include "neox_text.h"
+#include "module.h"
+#include <float.h>
+
+static void *tx_stb_alloc(size_t size,void *user);
+static void tx_stb_free(void *ptr,void *user);
+#define STBTT_malloc(size,user) tx_stb_alloc((size),(user))
+#define STBTT_free(ptr,user) tx_stb_free((ptr),(user))
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -42,9 +47,13 @@ static void *tx_array_grow(nx_text_context *t, void *arr, size_t elem,
                            uint32_t *cap, uint32_t need)
 {
     if (need <= *cap) return arr;
-    uint32_t ncap = *cap ? *cap * 2 : 16;
+    uint32_t ncap = *cap ? *cap : 16;
     void *np;
-    while (ncap < need) ncap *= 2;
+    while (ncap < need) {
+        if(ncap>UINT32_MAX/2){ncap=need;break;}
+        ncap*=2;
+    }
+    if(elem && ncap>SIZE_MAX/elem)return NULL;
     np = tx_alloc(t, elem * (size_t)ncap, 16);
     if (!np) return NULL;
     if (arr) {
@@ -57,6 +66,11 @@ static void *tx_array_grow(nx_text_context *t, void *arr, size_t elem,
 
 #define TX_ERR(t, msg, code) do { (t)->last_error = (msg); return (code); } while (0)
 
+static int tx_float_range(double x)
+{
+    return isfinite(x) && fabs(x) <= FLT_MAX;
+}
+
 /* ------------------------------------------------------------------ 上下文 */
 
 struct nx_text_context {
@@ -64,31 +78,42 @@ struct nx_text_context {
     neox_allocator al;        /* 归一化：调用方注入或转发 core 的分配器 */
     const char *last_error;
     uint32_t flags;
+    int stb_failed; /* allocation failures from void-returning stb routines */
+    uint64_t font_sequence; /* context-local identities, never reused */
     nx_font *fonts;           /* 级联销毁链表 */
     nx_atlas *atlases;
 };
 
-/* 系统默认分配器（core 未注入分配器时模块侧转发 malloc/free，语义不变） */
-static void *tx_sys_alloc(void *user, size_t size, size_t align)
-{
-    (void)user; (void)align;
-    return malloc(size ? size : 1);
-}
-static void tx_sys_free(void *user, void *ptr, size_t size, size_t align)
-{
-    (void)user; (void)size; (void)align;
-    free(ptr);
-}
-static const neox_allocator TX_SYS_ALLOC = { NULL, tx_sys_alloc, tx_sys_free };
-
 static void *tx_alloc(nx_text_context *t, size_t size, size_t align)
 {
-    return t->al.alloc(t->al.user, size, align);
+    return nx_alloc_using(t->core,&t->al,size,align);
 }
 
 static void tx_free(nx_text_context *t, void *p, size_t size, size_t align)
 {
-    if (p) t->al.free(t->al.user, p, size, align);
+    nx_free_using(t->core,&t->al,p,size,align);
+}
+
+/* stb free callbacks lack allocation sizes. Store size and owner in an aligned
+ * prefix; a NULL free userdata remains safe without a global allocator. */
+typedef struct tx_stb_header { nx_text_context *owner; size_t bytes; } tx_stb_header;
+#define TX_STB_PREFIX ((sizeof(tx_stb_header)+15u)&~(size_t)15u)
+static void *tx_stb_alloc(size_t size,void *user)
+{
+    nx_text_context *t=user;
+    if(!t)return NULL;
+    if(size>SIZE_MAX-TX_STB_PREFIX){t->stb_failed=1;return NULL;}
+    size_t bytes=TX_STB_PREFIX+size;
+    tx_stb_header *h=tx_alloc(t,bytes,16);
+    if(!h){t->stb_failed=1;return NULL;}
+    h->owner=t;h->bytes=bytes;
+    return (uint8_t *)h+TX_STB_PREFIX;
+}
+static void tx_stb_free(void *ptr,void *user)
+{
+    (void)user;if(!ptr)return;
+    tx_stb_header *h=(tx_stb_header *)((uint8_t *)ptr-TX_STB_PREFIX);
+    tx_free(h->owner,h,h->bytes,16);
 }
 
 neox_result nx_text_context_create(neox_context *core_ctx,
@@ -98,17 +123,11 @@ neox_result nx_text_context_create(neox_context *core_ctx,
     nx_text_context *t;
     if (!core_ctx || !out_ctx) return NEOX_ERROR_INVALID_ARGUMENT;
     *out_ctx = NULL;
-    /* 分配器归一化：调用方注入 > core 注入 > 系统默认（公开 API 查询，无内部耦合） */
-    {
-        const neox_allocator *al = alloc ? alloc
-                                         : neox_context_get_allocator(core_ctx);
-        if (!al) al = &TX_SYS_ALLOC;
-        t = (nx_text_context *)al->alloc(al->user, sizeof(*t), 16);
-        if (!t) return NEOX_ERROR_OUT_OF_MEMORY;
-        memset(t, 0, sizeof(*t));
-        t->core = core_ctx;
-        t->al = *al;
-    }
+    const neox_allocator *al=alloc ? alloc : nx_context_allocator(core_ctx);
+    if(!al->alloc || !al->free)return NEOX_ERROR_INVALID_ARGUMENT;
+    t=nx_alloc_using(core_ctx,al,sizeof(*t),16);
+    if(!t)return NEOX_ERROR_OUT_OF_MEMORY;
+    memset(t,0,sizeof(*t));t->core=core_ctx;t->al=*al;
     *out_ctx = t;
     return NEOX_OK;
 }
@@ -118,10 +137,7 @@ void nx_text_context_destroy(nx_text_context *t)
     if (!t) return;
     while (t->fonts) nx_font_destroy(t->fonts);
     while (t->atlases) nx_atlas_destroy(t->atlases);
-    {
-        neox_allocator al = t->al;
-        al.free(al.user, t, sizeof(*t), 16);
-    }
+    tx_free(t,t,sizeof(*t),16);
 }
 
 const char *nx_text_last_error(nx_text_context *t)
@@ -168,7 +184,7 @@ static int nx_utf8_next(const char **pp, const char *end, uint32_t *out_cp)
             *pp = p + 2;
             return 1;
         }
-    } else if (b >= 0xE0 && b <= 0xEF) {
+    } else if (b >= 0xE0 && b <= 0xEF && end-p >= 3) {
         int ok1, ok2;
         uint32_t c1 = nx_utf8_cont(p + 1, end, &ok1);
         uint32_t c2 = nx_utf8_cont(p + 2, end, &ok2);
@@ -183,7 +199,7 @@ static int nx_utf8_next(const char **pp, const char *end, uint32_t *out_cp)
                 return 1;
             }
         }
-    } else if (b >= 0xF0 && b <= 0xF4) {
+    } else if (b >= 0xF0 && b <= 0xF4 && end-p >= 4) {
         int ok1, ok2, ok3;
         uint32_t c1 = nx_utf8_cont(p + 1, end, &ok1);
         uint32_t c2 = nx_utf8_cont(p + 2, end, &ok2);
@@ -209,6 +225,7 @@ static int nx_utf8_next(const char **pp, const char *end, uint32_t *out_cp)
 
 struct nx_font {
     nx_text_context *tctx;
+    uint64_t id;
     nx_font *next;                /* tctx 级联链 */
     /* stb 实例（自定义后端时为 NULL） */
     uint8_t *data;                /* [own] 字体文件拷贝 */
@@ -218,6 +235,19 @@ struct nx_font {
     nx_font_backend be;
     int is_custom;
 };
+
+static neox_result font_alloc(nx_text_context *t, nx_font **out)
+{
+    if (t->font_sequence == UINT64_MAX)
+        TX_ERR(t, "font identity space exhausted", NEOX_ERROR_UNSUPPORTED);
+    nx_font *f = tx_alloc(t, sizeof(*f), 16);
+    if (!f) TX_ERR(t, "font allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
+    memset(f, 0, sizeof(*f));
+    f->tctx = t;
+    f->id = ++t->font_sequence;
+    *out = f;
+    return NEOX_OK;
+}
 
 static void font_unlink(nx_font *f)
 {
@@ -269,9 +299,14 @@ static neox_result stb_rasterize(void *user, uint32_t glyph, float size_px,
     nx_font *f = (nx_font *)user;
     float scale = stbtt_ScaleForPixelHeight(&f->stb, size_px);
     int w = 0, h = 0, ox = 0, oy = 0;
+    f->tctx->stb_failed=0;
     unsigned char *bmp = stbtt_GetGlyphBitmap(&f->stb, scale, scale,
                                               (int)glyph, &w, &h, &ox, &oy);
-    *out_bmp = bmp;               /* 可能为 NULL（空字形） */
+    if(f->tctx->stb_failed) {
+        tx_stb_free(bmp,f->tctx);*out_bmp=NULL;
+        return NEOX_ERROR_OUT_OF_MEMORY;
+    }
+    *out_bmp = bmp;               /* NULL only for an empty glyph */
     *out_w = w; *out_h = h;
     *out_bx = (float)ox;
     *out_by = (float)oy;
@@ -313,15 +348,21 @@ static float nx_msdf_seg_dist2(float px, float py,
     return dx * dx + dy * dy;
 }
 
-static int nx_msdf_push_seg(nx_msdf_seg **segs, int *n, int *cap,
+static int nx_msdf_push_seg(void *userdata,nx_msdf_seg **segs, int *n, int *cap,
                             float x0, float y0, float x1, float y1, int color)
 {
     if (*n == *cap) {
+        size_t bytes;
+        if (*cap > INT32_MAX/2) {
+            ((nx_text_context *)userdata)->stb_failed=1; return 0;
+        }
         int nc = *cap ? *cap * 2 : 64;
-        nx_msdf_seg *ns = (nx_msdf_seg *)STBTT_malloc(
-            (size_t)nc * sizeof(nx_msdf_seg), NULL);
+        if (!nx_size_mul((size_t)nc, sizeof(nx_msdf_seg), &bytes)) {
+            ((nx_text_context *)userdata)->stb_failed=1; return 0;
+        }
+        nx_msdf_seg *ns = (nx_msdf_seg *)STBTT_malloc(bytes, userdata);
         if (!ns) return 0;
-        memcpy(ns, *segs, (size_t)*n * sizeof(nx_msdf_seg));
+        if(*n)memcpy(ns, *segs, (size_t)*n * sizeof(nx_msdf_seg));
         if (*segs) STBTT_free(*segs, NULL);
         *segs = ns;
         *cap = nc;
@@ -335,7 +376,7 @@ static int nx_msdf_push_seg(nx_msdf_seg **segs, int *n, int *cap,
 
 /* stb 轮廓 → 着色线段表（像素空间，y 向下）。拐角方向差 > 60° 换色，
  * 逐轮廓从 R 起循环 R→G→B；轮廓闭合边补上。失败返回 NULL。 */
-static nx_msdf_seg *nx_msdf_build_segs(int nv,
+static nx_msdf_seg *nx_msdf_build_segs(void *userdata,int nv,
                                        stbtt_vertex *verts, float scale,
                                        int *out_n)
 {
@@ -350,7 +391,7 @@ static nx_msdf_seg *nx_msdf_build_segs(int nv,
         stbtt_vertex *v = &verts[i];
         if (v->type == STBTT_vmove) {
             if (open)   /* 闭合上一轮廓 */
-                if (!nx_msdf_push_seg(&segs, &n, &cap, cx, cy, sx, sy, color))
+                if (!nx_msdf_push_seg(userdata,&segs, &n, &cap, cx, cy, sx, sy, color))
                     goto oom;
             sx = cx = NX_PX(v->x);
             sy = cy = NX_PY(v->y);
@@ -378,7 +419,7 @@ static nx_msdf_seg *nx_msdf_build_segs(int nv,
                 }
             }
             if (v->type == STBTT_vline) {
-                if (!nx_msdf_push_seg(&segs, &n, &cap, cx, cy, ex, ey, c))
+                if (!nx_msdf_push_seg(userdata,&segs, &n, &cap, cx, cy, ex, ey, c))
                     goto oom;
             } else if (v->type == STBTT_vcurve) {
                 float mx = NX_PX(v->cx), my = NX_PY(v->cy);
@@ -389,7 +430,7 @@ static nx_msdf_seg *nx_msdf_build_segs(int nv,
                     float it = 1.0f - t;
                     float qx = it * it * cx + 2.0f * it * t * mx + t * t * ex;
                     float qy = it * it * cy + 2.0f * it * t * my + t * t * ey;
-                    if (!nx_msdf_push_seg(&segs, &n, &cap, px2, py2, qx, qy, c))
+                    if (!nx_msdf_push_seg(userdata,&segs, &n, &cap, px2, py2, qx, qy, c))
                         goto oom;
                     px2 = qx; py2 = qy;
                 }
@@ -408,7 +449,7 @@ static nx_msdf_seg *nx_msdf_build_segs(int nv,
                     float q123x = it * q12x + t * q23x, q123y = it * q12y + t * q23y;
                     float qx = it * q012x + t * q123x;
                     float qy = it * q012y + t * q123y;
-                    if (!nx_msdf_push_seg(&segs, &n, &cap, px2, py2, qx, qy, c))
+                    if (!nx_msdf_push_seg(userdata,&segs, &n, &cap, px2, py2, qx, qy, c))
                         goto oom;
                     px2 = qx; py2 = qy;
                 }
@@ -418,7 +459,7 @@ static nx_msdf_seg *nx_msdf_build_segs(int nv,
         }
     }
     if (open)
-        if (!nx_msdf_push_seg(&segs, &n, &cap, cx, cy, sx, sy, color))
+        if (!nx_msdf_push_seg(userdata,&segs, &n, &cap, cx, cy, sx, sy, color))
             goto oom;
     #undef NX_PX
     #undef NX_PY
@@ -439,7 +480,7 @@ static uint8_t *nx_msdf_glyph(stbtt_fontinfo *stb, int glyph, float scale,
     stbtt_vertex *verts = NULL;
     nx_msdf_seg *segs = NULL;
     uint8_t *cov = NULL, *out = NULL;
-    float pds = -255.0f / dr;
+    double pds = -255.0 / (double)dr;
 
     stbtt_GetGlyphBitmapBox(stb, glyph, scale, scale, &ix0, &iy0, &ix1, &iy1);
     if (ix0 == ix1 || iy0 == iy1) return NULL;   /* 空字形 */
@@ -453,13 +494,19 @@ static uint8_t *nx_msdf_glyph(stbtt_fontinfo *stb, int glyph, float scale,
     H = (iy1 - iy0) + pad * 2;
     cw = ix1 - ix0;
     ch = iy1 - iy0;
-    segs = nx_msdf_build_segs(nv, verts, scale, &nseg);
+    segs = nx_msdf_build_segs(stb->userdata,nv, verts, scale, &nseg);
     STBTT_free(verts, stb->userdata);
     if (!segs || nseg == 0) goto done;
-    cov = (uint8_t *)STBTT_malloc((size_t)cw * ch, stb->userdata);
+    size_t cov_bytes, out_bytes, out_pixels;
+    if (!nx_size_mul((size_t)cw, (size_t)ch, &cov_bytes) ||
+        !nx_size_mul((size_t)W, (size_t)H, &out_pixels) ||
+        !nx_size_mul(out_pixels, 4, &out_bytes)) {
+        ((nx_text_context *)stb->userdata)->stb_failed=1; goto done;
+    }
+    cov = (uint8_t *)STBTT_malloc(cov_bytes, stb->userdata);
     if (!cov) goto done;
     stbtt_MakeGlyphBitmap(stb, cov, cw, ch, cw, scale, scale, glyph);
-    out = (uint8_t *)STBTT_malloc((size_t)W * H * 4, stb->userdata);
+    out = (uint8_t *)STBTT_malloc(out_bytes, stb->userdata);
     if (!out) goto done;
     for (y = 0; y < H; y++) {
         for (x = 0; x < W; x++) {
@@ -481,7 +528,8 @@ static uint8_t *nx_msdf_glyph(stbtt_fontinfo *stb, int glyph, float scale,
                 uint8_t *q = out + ((size_t)y * W + x) * 4;
                 int ch2;
                 for (ch2 = 0; ch2 < 3; ch2++) {
-                    float d, v;
+                    float d;
+                    double v;
                     if (best[ch2] > 1e29f) best[ch2] = best_all; /* 该色无边 */
                     d = inside ? sqrtf(best[ch2]) : -sqrtf(best[ch2]);
                     v = 128.0f + pds * d;
@@ -516,6 +564,7 @@ static neox_result stb_rasterize_sdf(void *user, uint32_t glyph, float size_px,
     int pad = (int)ceilf(dist_range) + 1;
     int w = 0, h = 0, ox = 0, oy = 0;
     unsigned char *bmp;
+    f->tctx->stb_failed=0;
     if (mode == NEOX_ATLAS_SDF) {
         bmp = stbtt_GetGlyphSDF(&f->stb, scale, (int)glyph, pad, 128,
                                 -255.0f / dist_range, &w, &h, &ox, &oy);
@@ -523,7 +572,11 @@ static neox_result stb_rasterize_sdf(void *user, uint32_t glyph, float size_px,
         bmp = nx_msdf_glyph(&f->stb, (int)glyph, scale, dist_range,
                             &w, &h, &ox, &oy);
     }
-    *out_bmp = bmp;               /* 可能为 NULL（空字形） */
+    if(f->tctx->stb_failed) {
+        tx_stb_free(bmp,f->tctx);*out_bmp=NULL;
+        return NEOX_ERROR_OUT_OF_MEMORY;
+    }
+    *out_bmp = bmp;               /* NULL only for an empty glyph */
     *out_w = w; *out_h = h;
     *out_bx = (float)ox;
     *out_by = (float)oy;
@@ -541,12 +594,12 @@ static neox_result font_load(nx_text_context *t, const void *data, size_t size,
 {
     nx_font *f;
     int offset;
-    if (!data || size == 0)
-        TX_ERR(t, "empty font data", NEOX_ERROR_INVALID_ARGUMENT);
-    f = (nx_font *)tx_alloc(t, sizeof(*f), 16);
-    if (!f) TX_ERR(t, "font allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
-    memset(f, 0, sizeof(*f));
-    f->tctx = t;
+    if (!data || size < 12 || ttc_index < 0)
+        TX_ERR(t, "invalid font header or TTC index", NEOX_ERROR_INVALID_ARGUMENT);
+    if (size > INT32_MAX)
+        TX_ERR(t, "font exceeds parser offset range", NEOX_ERROR_UNSUPPORTED);
+    neox_result result = font_alloc(t, &f);
+    if (result != NEOX_OK) return result;
     f->data = (uint8_t *)tx_alloc(t, size, 16);
     if (!f->data) {
         tx_free(t, f, sizeof(*f), 16);
@@ -561,6 +614,7 @@ static neox_result font_load(nx_text_context *t, const void *data, size_t size,
         TX_ERR(t, "not a valid TrueType font (or bad TTC index)",
                NEOX_ERROR_INVALID_ARGUMENT);
     }
+    f->stb.userdata=t;
     f->be.user = f;
     f->be.glyph_advance = stb_advance;
     f->be.glyph_kerning = stb_kerning;
@@ -570,6 +624,10 @@ static neox_result font_load(nx_text_context *t, const void *data, size_t size,
     {
         int a, d, g;
         stbtt_GetFontVMetrics(&f->stb, &a, &d, &g);
+        if (a <= d || f->stb.numGlyphs <= 0) {
+            font_free(f);
+            TX_ERR(t, "font has invalid vertical metrics or glyph count", NEOX_ERROR_INVALID_ARGUMENT);
+        }
         /* 归一化到 size_px = 1（ScaleForPixelHeight(1) ≈ 1/units_per_em） */
         {
             float s1 = stbtt_ScaleForPixelHeight(&f->stb, 1.0f);
@@ -608,6 +666,10 @@ neox_result nx_font_load_file(nx_text_context *t, const char *path,
         fclose(fp);
         TX_ERR(t, "font file seek failed", NEOX_ERROR_INVALID_ARGUMENT);
     }
+    if ((uintmax_t)len > INT32_MAX) {
+        fclose(fp);
+        TX_ERR(t, "font exceeds parser offset range", NEOX_ERROR_UNSUPPORTED);
+    }
     buf = (uint8_t *)tx_alloc(t, (size_t)len, 16);
     if (!buf) {
         fclose(fp);
@@ -628,14 +690,13 @@ neox_result nx_font_create_custom(nx_text_context *t,
                                   const nx_font_backend *backend, nx_font **out)
 {
     nx_font *f;
+    if (out) *out = NULL;
     if (!t || !backend || !backend->glyph_advance || !backend->glyph_rasterize ||
-        !backend->glyph_free_bitmap || !out)
+        !backend->glyph_free_bitmap || !out || !isfinite(backend->ascent) ||
+        !isfinite(backend->descent) || !isfinite(backend->line_gap))
         return NEOX_ERROR_INVALID_ARGUMENT;
-    *out = NULL;
-    f = (nx_font *)tx_alloc(t, sizeof(*f), 16);
-    if (!f) TX_ERR(t, "font allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
-    memset(f, 0, sizeof(*f));
-    f->tctx = t;
+    neox_result result = font_alloc(t, &f);
+    if (result != NEOX_OK) return result;
     f->is_custom = 1;
     f->be = *backend;
     f->next = t->fonts;
@@ -644,9 +705,19 @@ neox_result nx_font_create_custom(nx_text_context *t,
     return NEOX_OK;
 }
 
-float nx_font_ascent(nx_font *f, float size_px)  { return f ? f->be.ascent * size_px : 0.0f; }
-float nx_font_descent(nx_font *f, float size_px) { return f ? f->be.descent * size_px : 0.0f; }
-float nx_font_line_gap(nx_font *f, float size_px){ return f ? f->be.line_gap * size_px : 0.0f; }
+static float font_metric(nx_font *f, float value, float size)
+{
+    if (!f) return 0.0f;
+    double result=(double)value*size;
+    if (!isfinite(size) || size<0 || !tx_float_range(result)) {
+        f->tctx->last_error="font metric exceeds finite float range";
+        return 0.0f;
+    }
+    return (float)result;
+}
+float nx_font_ascent(nx_font *f,float size) {return font_metric(f,f?f->be.ascent:0,size);}
+float nx_font_descent(nx_font *f,float size) {return font_metric(f,f?f->be.descent:0,size);}
+float nx_font_line_gap(nx_font *f,float size) {return font_metric(f,f?f->be.line_gap:0,size);}
 
 /* ------------------------------------------------------------------ 排版 */
 
@@ -678,11 +749,12 @@ void nx_layout_destroy(nx_layout *lo)
 neox_result nx_text_measure(const nx_layout *lo, float out_bbox[4])
 {
     if (!lo || !out_bbox) return NEOX_ERROR_INVALID_ARGUMENT;
-    out_bbox[0] = 0.0f;
-    out_bbox[1] = -lo->ascent;
-    out_bbox[2] = lo->width;
-    out_bbox[3] = (float)(lo->line_count ? lo->line_count - 1 : 0) *
-                  lo->line_height - lo->descent;
+    double bottom = (double)(lo->line_count ? lo->line_count-1 : 0) *
+                    lo->line_height - lo->descent;
+    if (!isfinite(lo->ascent) || !isfinite(lo->width) || !tx_float_range(bottom))
+        return NEOX_ERROR_INVALID_ARGUMENT;
+    out_bbox[0] = 0.0f; out_bbox[1] = -lo->ascent;
+    out_bbox[2] = lo->width; out_bbox[3] = (float)bottom;
     return NEOX_OK;
 }
 
@@ -694,23 +766,24 @@ typedef struct nx_token {
     int hard_break;    /* '\n'：强制断行占位（count=0） */
 } nx_token;
 
-static neox_result layout_add_line(nx_layout *lo)
+static neox_result layout_finish_line(nx_layout *lo, uint32_t g0, double width)
 {
-    nx_line_info *nl;
-    if (lo->line_count < lo->line_cap) return NEOX_OK;
-    nl = (nx_line_info *)tx_array_grow(lo->tctx, lo->line, sizeof(nx_line_info),
-                                       &lo->line_cap, lo->line_count + 1);
+    if (!tx_float_range(width)) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (lo->line_count == UINT32_MAX) return NEOX_ERROR_OUT_OF_MEMORY;
+    nx_line_info *nl = tx_array_grow(lo->tctx, lo->line, sizeof(*nl),
+                                    &lo->line_cap, lo->line_count+1);
     if (!nl) return NEOX_ERROR_OUT_OF_MEMORY;
     lo->line = nl;
+    lo->line[lo->line_count].start = g0;
+    lo->line[lo->line_count].count = lo->glyph_count - g0;
+    lo->line[lo->line_count].width = (float)width;
+    lo->line_count++;
     return NEOX_OK;
 }
 
-static void layout_finish_line(nx_layout *lo, uint32_t g0, float w)
+static float font_kerning(nx_font *font, uint32_t left, uint32_t right, float size)
 {
-    lo->line[lo->line_count].start = g0;
-    lo->line[lo->line_count].count = lo->glyph_count - g0;
-    lo->line[lo->line_count].width = w;
-    lo->line_count++;
+    return font->be.glyph_kerning ? font->be.glyph_kerning(font->be.user,left,right,size) : 0.0f;
 }
 
 neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
@@ -724,12 +797,20 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
     neox_result r = NEOX_ERROR_OUT_OF_MEMORY;
     const char *p, *end;
     nx_token *tok = NULL;
+    uint8_t *cls = NULL;
     uint32_t ntok = 0, tokcap = 0;
 
     if (!t || !font || !utf8 || !out_layout) return NEOX_ERROR_INVALID_ARGUMENT;
     *out_layout = NULL;
-    if (!(size_px > 0.0f)) TX_ERR(t, "size_px must be positive",
-                                  NEOX_ERROR_INVALID_ARGUMENT);
+    if (font->tctx != t)
+        TX_ERR(t, "font belongs to another text context", NEOX_ERROR_OWNERSHIP_VIOLATION);
+    t->last_error = NULL;
+    if (!isfinite(size_px) || size_px <= 0.0f || !isfinite(max_width) ||
+        (unsigned)align > NX_ALIGN_RIGHT)
+        TX_ERR(t, "invalid layout size, width or alignment", NEOX_ERROR_INVALID_ARGUMENT);
+    size_t text_size = strlen(utf8);
+    if (text_size >= UINT32_MAX || text_size > PTRDIFF_MAX)
+        TX_ERR(t, "text exceeds layout count range", NEOX_ERROR_INVALID_ARGUMENT);
 
     lo = (nx_layout *)tx_alloc(t, sizeof(*lo), 16);
     if (!lo) TX_ERR(t, "layout allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
@@ -737,43 +818,49 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
     lo->tctx = t;
     lo->font = font;
     lo->size_px = size_px;
-    lo->ascent = font->be.ascent * size_px;
-    lo->descent = font->be.descent * size_px;
-    lo->line_gap = font->be.line_gap * size_px;
-    lo->line_height = lo->ascent - lo->descent + lo->line_gap;
+    double ascent = (double)font->be.ascent * size_px;
+    double descent = (double)font->be.descent * size_px;
+    double gap = (double)font->be.line_gap * size_px;
+    double line_height = ascent - descent + gap;
+    if (!tx_float_range(ascent) || !tx_float_range(descent) ||
+        !tx_float_range(gap) || !tx_float_range(line_height)) goto invalid;
+    lo->ascent = (float)ascent; lo->descent = (float)descent;
+    lo->line_gap = (float)gap; lo->line_height = (float)line_height;
 
     /* 1) UTF-8 解码 + cmap + 逐字形前进宽 */
     p = utf8;
-    end = utf8 + strlen(utf8);
+    end = utf8 + text_size;
     while (nx_utf8_next(&p, end, &i /* 复用为码点临时 */)) {
         uint32_t cp = i, gi, *ng;
         float *na;
+        if (n == UINT32_MAX) goto oom;
         if (n == cap_idx) {
             ng = (uint32_t *)tx_array_grow(t, gidx, 4, &cap_idx, n + 1);
-            if (!ng) goto fail;
+            if (!ng) goto oom;
             gidx = ng;
         }
         if (n == cap_adv) {
             na = (float *)tx_array_grow(t, gadv, 4, &cap_adv, n + 1);
-            if (!na) goto fail;
+            if (!na) goto oom;
             gadv = na;
         }
         gi = font_glyph_index(font, cp);
         gidx[n] = gi;
         gadv[n] = font->be.glyph_advance(font->be.user, gi, size_px);
+        if (!isfinite(gadv[n])) goto invalid;
         n++;
     }
 
     /* 2) 分词：CJK 单字成词；空白独立成词；其余连续成词（类别数组法） */
     {
         /* 码点类别数组（1=空白 2=CJK 3=词字符 4=换行） */
-        uint8_t *cls = (uint8_t *)tx_alloc(t, n ? n : 1, 16);
-        float pen;
+        cls = (uint8_t *)tx_alloc(t, n ? n : 1, 16);
+        double pen;
         uint32_t line_g0 = 0;
-        float line_w = 0.0f;
+        double line_w = 0.0;
         uint32_t tok_i;
 
-        if (!cls) goto fail;
+        if (!cls) goto oom;
         p = utf8;
         {
             uint32_t k = 0;
@@ -806,31 +893,31 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
                 tk.width = gadv[i];
                 i += 1;
             } else {                     /* 拉丁词：连续词字符 + 词内字距 */
-                float w = 0.0f;
+                double w = 0.0;
                 tk.glyph0 = i;
                 while (i < n && cls[i] == 3) {
                     w += gadv[i];
                     if (i + 1 < n && cls[i + 1] == 3) {
-                        w += font->be.glyph_kerning(font->be.user, gidx[i],
-                                                    gidx[i + 1], size_px);
+                        float kern = font_kerning(font,gidx[i],gidx[i+1],size_px);
+                        if (!isfinite(kern)) goto invalid;
+                        w += kern;
                     }
                     i++;
                 }
                 tk.count = i - tk.glyph0;
-                tk.width = w;
+                if (!tx_float_range(w)) goto invalid;
+                tk.width = (float)w;
             }
             {
+                if (ntok == UINT32_MAX) goto oom;
                 nx_token *nt = (nx_token *)tx_array_grow(t, tok, sizeof(nx_token),
                                                          &tokcap, ntok + 1);
-                if (!nt) {
-                    tx_free(t, cls, n ? n : 1, 16);
-                    goto fail;
-                }
+                if (!nt) goto oom;
                 tok = nt;
                 tok[ntok++] = tk;
             }
         }
-        tx_free(t, cls, n ? n : 1, 16);
+        tx_free(t, cls, n ? n : 1, 16); cls = NULL;
 
         /* 3) 贪心断行 + 放置 */
         pen = 0.0f;
@@ -839,9 +926,8 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
         for (tok_i = 0; tok_i < ntok; tok_i++) {
             nx_token *tk = &tok[tok_i];
             if (tk->hard_break) {
-                r = layout_add_line(lo);
+                r = layout_finish_line(lo, line_g0, line_w);
                 if (r != NEOX_OK) goto fail;
-                layout_finish_line(lo, line_g0, line_w);
                 pen = 0.0f;
                 line_w = 0.0f;
                 line_g0 = lo->glyph_count;
@@ -853,9 +939,8 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
             /* 贪心换行：本行已有内容且放不下 */
             if (max_width > 0.0f && lo->glyph_count > line_g0 &&
                 pen + tk->width > max_width) {
-                r = layout_add_line(lo);
+                r = layout_finish_line(lo, line_g0, line_w);
                 if (r != NEOX_OK) goto fail;
-                layout_finish_line(lo, line_g0, line_w);
                 pen = 0.0f;
                 line_w = 0.0f;
                 line_g0 = lo->glyph_count;
@@ -865,35 +950,38 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
             /* 放置词内字形 */
             {
                 uint32_t k;
-                float adv = pen;
+                double adv = pen;
                 for (k = 0; k < tk->count; k++) {
                     uint32_t gi = tk->glyph0 + k;
                     nx_laid_glyph lg;
+                    if (lo->glyph_count == UINT32_MAX) goto oom;
                     if (lo->glyph_count == lo->glyph_cap) {
                         nx_laid_glyph *ngl = (nx_laid_glyph *)tx_array_grow(
                             t, lo->glyphs, sizeof(nx_laid_glyph),
                             &lo->glyph_cap, lo->glyph_count + 1);
-                        if (!ngl) goto fail;
+                        if (!ngl) goto oom;
                         lo->glyphs = ngl;
                     }
                     lg.glyph_index = gidx[gi];
-                    lg.x = adv;
+                    if (!tx_float_range(adv)) goto invalid;
+                    lg.x = (float)adv;
                     lg.y = 0.0f;   /* y 在行定稿后统一设置 */
                     lo->glyphs[lo->glyph_count++] = lg;
                     adv += gadv[gi];
                     if (k + 1 < tk->count) {
-                        adv += font->be.glyph_kerning(font->be.user, gidx[gi],
-                                                      gidx[gi + 1], size_px);
+                        float kern = font_kerning(font,gidx[gi],gidx[gi+1],size_px);
+                        if (!isfinite(kern)) goto invalid;
+                        adv += kern;
                     }
                 }
+                if (!tx_float_range(adv)) goto invalid;
                 pen = adv;
                 line_w += tk->width;
             }
         }
         /* 收尾行 */
-        r = layout_add_line(lo);
+        r = layout_finish_line(lo, line_g0, line_w);
         if (r != NEOX_OK) goto fail;
-        layout_finish_line(lo, line_g0, line_w);
 
         /* 4) 对齐 + 基线 y + 包围盒 */
         {
@@ -901,36 +989,50 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
             for (i = 0; i < lo->line_count; i++) {
                 uint32_t g0 = lo->line[i].start;
                 uint32_t cnt = lo->line[i].count;
-                float off = 0.0f;
-                float ybase = (float)i * lo->line_height;
+                double off = 0.0;
+                double ybase = (double)i * lo->line_height;
+                if (!tx_float_range(ybase)) goto invalid;
                 uint32_t k;
                 if (align == NX_ALIGN_CENTER && max_width > 0.0f)
-                    off = (max_width - lo->line[i].width) * 0.5f;
+                    off = ((double)max_width - lo->line[i].width) * 0.5;
                 else if (align == NX_ALIGN_RIGHT && max_width > 0.0f)
-                    off = max_width - lo->line[i].width;
+                    off = (double)max_width - lo->line[i].width;
                 for (k = 0; k < cnt; k++) {
-                    lo->glyphs[g0 + k].x += off;
-                    lo->glyphs[g0 + k].y = ybase;
+                    double x = lo->glyphs[g0+k].x + off;
+                    if (!tx_float_range(x)) goto invalid;
+                    lo->glyphs[g0+k].x = (float)x;
+                    lo->glyphs[g0+k].y = (float)ybase;
                 }
                 if (lo->line[i].width > box_w) box_w = lo->line[i].width;
             }
             lo->width = box_w;
-            lo->height = (float)(lo->line_count ? lo->line_count - 1 : 0) *
-                         lo->line_height + lo->ascent - lo->descent;
+            double bottom = (double)(lo->line_count ? lo->line_count-1 : 0) *
+                            lo->line_height - lo->descent;
+            double height = bottom + lo->ascent;
+            if (!tx_float_range(bottom) || !tx_float_range(height)) goto invalid;
+            lo->height = (float)height;
         }
     }
 
     r = NEOX_OK;
     *out_layout = lo;
     lo = NULL;
-
+    goto fail;
+invalid:
+    r = NEOX_ERROR_INVALID_ARGUMENT;
+    t->last_error = "layout metrics or positions exceed finite float range";
+    goto fail;
+oom:
+    r = NEOX_ERROR_OUT_OF_MEMORY;
 fail:
+    if (cls) tx_free(t, cls, n ? n : 1, 16);
     if (tok) tx_free(t, tok, (size_t)tokcap * sizeof(nx_token), 16);
     if (gidx) tx_free(t, gidx, (size_t)cap_idx * 4, 16);
     if (gadv) tx_free(t, gadv, (size_t)cap_adv * 4, 16);
     if (lo) nx_layout_destroy(lo);
     if (r != NEOX_OK && !t->last_error)
-        t->last_error = "layout failed (out of memory)";
+        t->last_error = r == NEOX_ERROR_OUT_OF_MEMORY ? "layout allocation failed" :
+                        "layout metrics or positions exceed finite float range";
     return r;
 }
 
@@ -938,7 +1040,7 @@ fail:
 
 typedef struct nx_atlas_entry {
     int in_use;
-    nx_font *font;
+    uint64_t font_id;       /* no borrowed pointer to a possibly destroyed font */
     uint32_t glyph;
     uint32_t size_q;        /* size_px × 4（0.25px 量化） */
     nx_atlas_rect rect;
@@ -957,7 +1059,7 @@ struct nx_atlas {
     nx_text_context *tctx;
     nx_atlas *next;             /* tctx 级联链 */
     neox_device *dev;
-    neox_texture tex;           /* 图集纹理（COVERAGE/SDF → A8；MSDF → RGBA8_LINEAR） */
+    neox_texture tex;           /* 图集纹理（COVERAGE/SDF → A8；MSDF → RGBA8_DATA） */
     neox_atlas_mode mode;       /* 创建时固定；缓存天然按图集（模式）隔离 */
     float dist_range;           /* 距离场编码范围（图集像素；COVERAGE 下无意义） */
     uint32_t bpp;               /* 纹理/镜像每像素字节（1 或 4） */
@@ -974,9 +1076,9 @@ struct nx_atlas {
     uint32_t dx0, dy0, dx1, dy1;
 };
 
-static uint32_t atlas_hash(nx_font *font, uint32_t glyph, uint32_t size_q)
+static uint32_t atlas_hash(uint64_t font_id, uint32_t glyph, uint32_t size_q)
 {
-    uint32_t h = (uint32_t)(uintptr_t)font;
+    uint32_t h = (uint32_t)font_id ^ (uint32_t)(font_id >> 32);
     h = h * 1664525u + glyph;
     h = h * 1664525u + size_q;
     h ^= h >> 16;
@@ -1006,11 +1108,14 @@ neox_result nx_atlas_create_ex(nx_text_context *t, neox_device *dev,
 {
     nx_atlas *a;
     neox_texture_desc td;
-    uint8_t *zero;
+
     if (!t || !dev || !out || width == 0 || height == 0 ||
-        mode > NEOX_ATLAS_MSDF)
+        (unsigned)mode > NEOX_ATLAS_MSDF || width > 16384 || height > 16384)
         return NEOX_ERROR_INVALID_ARGUMENT;
-    if (dist_range_px < 0.0f)
+    *out = NULL;
+    if (nx_device_context(dev) != t->core)
+        TX_ERR(t, "atlas device belongs to another core context", NEOX_ERROR_OWNERSHIP_VIOLATION);
+    if (!isfinite(dist_range_px) || dist_range_px < 0.0f || dist_range_px > 16384.0f)
         TX_ERR(t, "dist_range_px must be >= 0", NEOX_ERROR_INVALID_ARGUMENT);
     if (dist_range_px == 0.0f) dist_range_px = 4.0f;   /* 契约缺省 */
     *out = NULL;
@@ -1030,7 +1135,7 @@ neox_result nx_atlas_create_ex(nx_text_context *t, neox_device *dev,
         TX_ERR(t, "atlas shadow buffer allocation failed",
                NEOX_ERROR_OUT_OF_MEMORY);
     }
-    memset(a->shadow, 0, (size_t)width * height * a->bpp);
+    memset(a->shadow,mode==NEOX_ATLAS_COVERAGE ? 0 : 255,(size_t)width*height*a->bpp);
     a->cache = (nx_atlas_entry *)tx_alloc(t, NX_ATLAS_CACHE_CAP * sizeof(nx_atlas_entry), 16);
     if (!a->cache) {
         tx_free(t, a->shadow, (size_t)width * height * a->bpp, 16);
@@ -1038,31 +1143,21 @@ neox_result nx_atlas_create_ex(nx_text_context *t, neox_device *dev,
         TX_ERR(t, "atlas cache allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
     }
     memset(a->cache, 0, NX_ATLAS_CACHE_CAP * sizeof(nx_atlas_entry));
-    /* 图集纹理：初始全零（MSDF 含 alpha=0；绘制端忽略 alpha 仅用于核心预乘） */
-    zero = (uint8_t *)tx_alloc(t, (size_t)width * height * a->bpp, 16);
-    if (!zero) {
-        tx_free(t, a->cache, NX_ATLAS_CACHE_CAP * sizeof(nx_atlas_entry), 16);
-        tx_free(t, a->shadow, (size_t)width * height * a->bpp, 16);
-        tx_free(t, a, sizeof(*a), 16);
-        TX_ERR(t, "atlas texture staging allocation failed",
-               NEOX_ERROR_OUT_OF_MEMORY);
-    }
-    memset(zero, 0, (size_t)width * height * a->bpp);
+    /* Outside distance is 255; coverage background is zero. */
     memset(&td, 0, sizeof(td));
     td.width = width;
     td.height = height;
-    td.format = (mode == NEOX_ATLAS_MSDF) ? NEOX_FORMAT_RGBA8_LINEAR
+    td.format = (mode == NEOX_ATLAS_MSDF) ? NEOX_FORMAT_RGBA8_DATA
                                           : NEOX_FORMAT_A8;
-    td.pixels = zero;
+    td.pixels = a->shadow;
     td.row_stride = (size_t)width * a->bpp;
-    if (neox_texture_create(dev, &td, &a->tex) != NEOX_OK) {
-        tx_free(t, zero, (size_t)width * height * a->bpp, 16);
+    neox_result created=neox_texture_create(dev,&td,&a->tex);
+    if (created != NEOX_OK) {
         tx_free(t, a->cache, NX_ATLAS_CACHE_CAP * sizeof(nx_atlas_entry), 16);
         tx_free(t, a->shadow, (size_t)width * height * a->bpp, 16);
         tx_free(t, a, sizeof(*a), 16);
-        TX_ERR(t, "atlas texture creation failed", NEOX_ERROR_BACKEND);
+        TX_ERR(t, "atlas texture creation failed", created);
     }
-    tx_free(t, zero, (size_t)width * height * a->bpp, 16);
     a->next = t->atlases;
     t->atlases = a;
     *out = a;
@@ -1108,7 +1203,9 @@ void nx_atlas_stats(const nx_atlas *a, uint64_t *out_hits, uint64_t *out_misses)
 /* shelf/row 装箱：优先现有 shelf 同行追加，否则开新 shelf；容量满返回 0 */
 static int atlas_pack(nx_atlas *a, uint32_t w, uint32_t h, nx_atlas_rect *out)
 {
-    uint32_t i, need = w + NX_ATLAS_PAD;
+    uint32_t i, need;
+    if (w > a->w || h > a->h || w > UINT16_MAX || h > UINT16_MAX) return 0;
+    need = w + NX_ATLAS_PAD;
     for (i = 0; i < a->nshelves; i++) {
         nx_shelf *s = &a->shelves[i];
         if (s->h >= h && s->cursor_x + need <= a->w) {
@@ -1172,20 +1269,56 @@ neox_result nx_atlas_flush(nx_atlas *a)
     return r;
 }
 
+/* stb converts scaled boxes to int and multiplies bitmap dimensions as int.
+ * Preflight before those operations or any bitmap allocation. Atlas dimensions
+ * cap the final area (including padding) to <= 16384^2, within signed int and
+ * 32-bit size_t, including RGBA. Custom backends own their allocation policy. */
+static neox_result atlas_check_stb(nx_atlas *a, nx_font *font, uint32_t glyph, float size)
+{
+    if (font->is_custom) return NEOX_OK;
+    float scale = stbtt_ScaleForPixelHeight(&font->stb,size);
+    if (!isfinite(scale) || scale < 0.0f) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (scale == 0.0f) return NEOX_OK;
+    int x0=0,y0=0,x1=0,y1=0;
+    if (!stbtt_GetGlyphBox(&font->stb,(int)glyph,&x0,&y0,&x1,&y1)) return NEOX_OK;
+    if (y0 == INT32_MIN || y1 == INT32_MIN) return NEOX_ERROR_INVALID_ARGUMENT;
+    /* Match stb's float multiplication, but do floor/ceil before integer casts. */
+    double left=floor((float)x0*scale), top=floor(-(float)y1*scale);
+    double right=ceil((float)x1*scale), bottom=ceil(-(float)y0*scale);
+    double pad=a->mode==NEOX_ATLAS_COVERAGE ? 0 : ceil(a->dist_range)+1;
+    if (!isfinite(left) || !isfinite(top) || !isfinite(right) || !isfinite(bottom) ||
+        left-pad < INT32_MIN || top-pad < INT32_MIN ||
+        right+pad > INT32_MAX || bottom+pad > INT32_MAX || right<left || bottom<top)
+        return NEOX_ERROR_INVALID_ARGUMENT;
+    if (left==right || top==bottom) return NEOX_OK;
+    if (right-left+2*pad > a->w || bottom-top+2*pad > a->h)
+        return NEOX_ERROR_OUT_OF_MEMORY;
+    /* stb's SDF encoding coefficient is float; MSDF uses double locally. */
+    if (a->mode==NEOX_ATLAS_SDF && !tx_float_range(255.0/(double)a->dist_range))
+        return NEOX_ERROR_UNSUPPORTED;
+    return NEOX_OK;
+}
+
 /* 内部取字形（含 bearing），供绘制桥使用 */
 static neox_result atlas_lookup(nx_atlas *a, nx_font *font, uint32_t glyph,
                                 float size_px, nx_atlas_rect *out_rect,
                                 float *out_bx, float *out_by)
 {
+    if (!a || !font || !out_rect || !isfinite(size_px) || size_px <= 0 || size_px > 16384.0f)
+        return NEOX_ERROR_INVALID_ARGUMENT;
+    if (font->tctx != a->tctx)
+        TX_ERR(a->tctx, "font belongs to another text context", NEOX_ERROR_OWNERSHIP_VIOLATION);
+    if (!font->is_custom && glyph >= (uint32_t)font->stb.numGlyphs)
+        TX_ERR(a->tctx, "glyph index exceeds font glyph count", NEOX_ERROR_INVALID_ARGUMENT);
     uint32_t size_q = (uint32_t)(size_px * 4.0f + 0.5f);
-    uint32_t slot = atlas_hash(font, glyph, size_q);
+    uint32_t slot = atlas_hash(font->id, glyph, size_q);
     uint32_t probe;
     nx_atlas_entry *e;
 
     for (probe = 0; probe < NX_ATLAS_CACHE_CAP; probe++) {
         e = &a->cache[(slot + probe) & (NX_ATLAS_CACHE_CAP - 1u)];
         if (!e->in_use) break;
-        if (e->font == font && e->glyph == glyph && e->size_q == size_q) {
+        if (e->font_id == font->id && e->glyph == glyph && e->size_q == size_q) {
             a->hits++;
             e->last_use = ++a->tick;
             *out_rect = e->rect;
@@ -1194,6 +1327,7 @@ static neox_result atlas_lookup(nx_atlas *a, nx_font *font, uint32_t glyph,
             return NEOX_OK;
         }
     }
+    if(probe==NX_ATLAS_CACHE_CAP)TX_ERR(a->tctx,"atlas cache table exhausted",NEOX_ERROR_OUT_OF_MEMORY);
     /* 未命中：光栅化（按图集模式）+ 装箱（量化后的字号，保证缓存键与位图一致） */
     {
         float size_qf = (float)size_q * 0.25f;
@@ -1201,7 +1335,11 @@ static neox_result atlas_lookup(nx_atlas *a, nx_font *font, uint32_t glyph,
         int32_t bw = 0, bh = 0;
         float bx = 0.0f, by = 0.0f;
         nx_atlas_rect rc;
-        neox_result r;
+        neox_result r = atlas_check_stb(a,font,glyph,size_qf);
+        if (r != NEOX_OK) {
+            a->tctx->last_error = "glyph dimensions or encoding exceed supported range";
+            return r;
+        }
         if (a->mode == NEOX_ATLAS_COVERAGE) {
             r = font->be.glyph_rasterize(font->be.user, glyph, size_qf,
                                          &bmp, &bw, &bh, &bx, &by);
@@ -1216,9 +1354,15 @@ static neox_result atlas_lookup(nx_atlas *a, nx_font *font, uint32_t glyph,
                                              &bmp, &bw, &bh, &bx, &by);
         }
         if (r != NEOX_OK) {
+            if (bmp) font->be.glyph_free_bitmap(font->be.user,bmp);
             a->tctx->last_error = "glyph rasterization failed";
             return r;
         }
+        if (bw < 0 || bh < 0 || !isfinite(bx) || !isfinite(by)) {
+            if (bmp) font->be.glyph_free_bitmap(font->be.user,bmp);
+            TX_ERR(a->tctx,"font backend returned invalid bitmap metrics",NEOX_ERROR_INVALID_ARGUMENT);
+        }
+        if (bw > 0 && bh > 0 && !bmp)TX_ERR(a->tctx,"font backend returned no pixels",NEOX_ERROR_OUT_OF_MEMORY);
         if (bw <= 0 || bh <= 0) {           /* 空字形（如空格）：零矩形缓存 */
             memset(&rc, 0, sizeof(rc));
         } else {
@@ -1241,7 +1385,7 @@ static neox_result atlas_lookup(nx_atlas *a, nx_font *font, uint32_t glyph,
             e = &a->cache[(slot + probe) & (NX_ATLAS_CACHE_CAP - 1u)];
             if (!e->in_use) {
                 e->in_use = 1;
-                e->font = font;
+                e->font_id = font->id;
                 e->glyph = glyph;
                 e->size_q = size_q;
                 e->rect = rc;
@@ -1254,7 +1398,7 @@ static neox_result atlas_lookup(nx_atlas *a, nx_font *font, uint32_t glyph,
                 *out_by = by;
                 return NEOX_OK;
             }
-            if (e->font == font && e->glyph == glyph && e->size_q == size_q) {
+            if (e->font_id == font->id && e->glyph == glyph && e->size_q == size_q) {
                 /* 并发同键（单线程下不发生）；视为命中 */
                 a->hits++;
                 *out_rect = e->rect;
@@ -1290,10 +1434,13 @@ static neox_result text_draw_impl(neox_frame *frame, nx_atlas *a,
     float bx, by;
     if (!frame || !a || !layout || !paint || !style)
         return NEOX_ERROR_INVALID_ARGUMENT;
+    if (nx_frame_device(frame) != a->dev || layout->tctx != a->tctx)
+        TX_ERR(a->tctx, "frame, atlas and layout ownership mismatch", NEOX_ERROR_OWNERSHIP_VIOLATION);
     if (layout->glyph_count == 0) return NEOX_OK;
-    arr = (neox_glyph *)tx_alloc(a->tctx,
-                                 (size_t)layout->glyph_count * sizeof(neox_glyph),
-                                 16);
+    size_t arr_bytes;
+    if (!layout->glyphs || !nx_size_mul(layout->glyph_count,sizeof(neox_glyph),&arr_bytes))
+        return NEOX_ERROR_INVALID_ARGUMENT;
+    arr = (neox_glyph *)tx_alloc(a->tctx,arr_bytes,16);
     if (!arr) {
         a->tctx->last_error = "glyph array allocation failed";
         return NEOX_ERROR_OUT_OF_MEMORY;
@@ -1306,14 +1453,17 @@ static neox_result text_draw_impl(neox_frame *frame, nx_atlas *a,
         r = atlas_lookup(a, layout->font, lg->glyph_index, layout->size_px,
                          &rc, &bx, &by);
         if (r != NEOX_OK) {
-            tx_free(a->tctx, arr,
-                    (size_t)layout->glyph_count * sizeof(neox_glyph), 16);
+            tx_free(a->tctx, arr, arr_bytes, 16);
             return r;
         }
         /* 位图左上角 = 基线原点 + bearing（bear_y <= 0 在基线上方）；
          * SDF/MSDF 位图含边距，bear 已外扩，同一放置公式成立 */
-        arr[i].x = lg->x + bx;
-        arr[i].y = lg->y + by;
+        double x=(double)lg->x+bx,y=(double)lg->y+by;
+        if (!tx_float_range(x) || !tx_float_range(y)) {
+            r=NEOX_ERROR_INVALID_ARGUMENT; goto draw_done;
+        }
+        arr[i].x = (float)x;
+        arr[i].y = (float)y;
         arr[i].sx = rc.x;
         arr[i].sy = rc.y;
         arr[i].sw = rc.w;
@@ -1323,7 +1473,8 @@ static neox_result text_draw_impl(neox_frame *frame, nx_atlas *a,
     if (r == NEOX_OK)
         r = neox_draw_glyphs_ex(frame, a->tex, arr, layout->glyph_count,
                                 paint, style);
-    tx_free(a->tctx, arr, (size_t)layout->glyph_count * sizeof(neox_glyph), 16);
+draw_done:
+    tx_free(a->tctx, arr, arr_bytes, 16);
     return r;
 }
 

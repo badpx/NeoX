@@ -1,205 +1,173 @@
-# NeoX Phase 1 — 核心运行时 + Soft/GL 后端 / 测试 / 示例
 cmake_minimum_required(VERSION 3.16)
-project(neox C)
+project(NeoX VERSION 0.1.0 LANGUAGES C)
+include(GNUInstallDirs)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
-
-if(NOT CMAKE_BUILD_TYPE)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-
-option(NEOX_SANITIZE "Build with -fsanitize=address,undefined" OFF)
-if(APPLE)
-  option(NEOX_BACKEND_GL "OpenGL backend (macOS CGL offscreen + GL 4.1 Core)" ON)
-  option(NEOX_BACKEND_METAL "Metal backend (macOS native, Objective-C++)" ON)
-elseif(UNIX)
-  option(NEOX_BACKEND_GL "OpenGL backend (Linux EGL surfaceless + GL 4.1 Core)" ON)
-  option(NEOX_BACKEND_METAL "Metal backend (macOS native, Objective-C++)" OFF)
-else()
-  option(NEOX_BACKEND_GL "OpenGL backend" OFF)
-  option(NEOX_BACKEND_METAL "Metal backend (macOS native, Objective-C++)" OFF)
+# A subdirectory consumer gets libraries by default; top-level development
+# retains the existing tests/examples defaults. Explicit options always win.
+set(NEOX_TOP_LEVEL OFF)
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+  set(NEOX_TOP_LEVEL ON)
 endif()
+option(NEOX_BUILD_TESTS "Build NeoX tests" ${NEOX_TOP_LEVEL})
+option(NEOX_BUILD_EXAMPLES "Build NeoX examples" ${NEOX_TOP_LEVEL})
+option(NEOX_WITH_SCENE "Build retained scene frontend" ON)
+option(NEOX_WITH_CAPTURE "Build command capture and replay" ON)
+option(NEOX_WITH_TEXT "Build optional text module" ON)
+option(NEOX_SINGLE_THREADED "Serialize device creation; no C11 atomics required" OFF)
+option(NEOX_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+option(NEOX_SANITIZE "Build with address/undefined sanitizers" OFF)
+if(APPLE)
+  option(NEOX_BACKEND_GL "Build OpenGL backend" ON)
+  option(NEOX_BACKEND_METAL "Build Metal backend" ON)
+else()
+  option(NEOX_BACKEND_GL "Build OpenGL backend" ${UNIX})
+  option(NEOX_BACKEND_METAL "Build Metal backend" OFF)
+endif()
+set(NEOX_LINUX OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(NEOX_LINUX ON)
+endif()
+option(NEOX_PRESENT "Build Linux window presentation module" ${NEOX_LINUX})
 
-add_library(neox STATIC src/core.c src/geom.c src/soft.c)
-target_include_directories(neox PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_options(neox PRIVATE -Wall -Wextra)
+function(neox_build_options target)
+  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(${target} PRIVATE -Wall -Wextra)
+    if(NEOX_WARNINGS_AS_ERRORS)
+      target_compile_options(${target} PRIVATE -Werror)
+    endif()
+    if(NEOX_SANITIZE)
+      target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+      # Static libraries need sanitizer runtime flags propagated to consumers.
+      target_link_options(${target} PUBLIC -fsanitize=address,undefined)
+    endif()
+  elseif(MSVC)
+    target_compile_options(${target} PRIVATE /W4)
+    if(NEOX_WARNINGS_AS_ERRORS)
+      target_compile_options(${target} PRIVATE /WX)
+    endif()
+    if(NEOX_SANITIZE)
+      message(FATAL_ERROR "NEOX_SANITIZE currently requires GCC or Clang")
+    endif()
+  endif()
+endfunction()
 
-set(NEOX_TARGETS neox test_semantics ex01_scene)
+add_library(neox STATIC src/core.c src/resources.c src/runtime.c src/recording.c src/execution.c src/geom.c src/soft.c)
+add_library(NeoX::core ALIAS neox)
+set_target_properties(neox PROPERTIES EXPORT_NAME core)
+target_compile_features(neox PUBLIC c_std_11)
+target_include_directories(neox PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+if(UNIX)
+  target_link_libraries(neox PRIVATE m)
+endif()
+if(NEOX_WITH_SCENE)
+  target_sources(neox PRIVATE src/scene.c)
+endif()
+if(NEOX_WITH_CAPTURE)
+  target_sources(neox PRIVATE src/capture.c)
+endif()
+if(NEOX_SINGLE_THREADED)
+  target_compile_definitions(neox PRIVATE NEOX_SINGLE_THREADED=1)
+endif()
+neox_build_options(neox)
+set(NEOX_INSTALL_TARGETS neox)
 
-# GPU 后端：gl.c 是平台无关的 GL 4.1 Core 执行器。上下文与入口按平台
-# 选编译单元（docs/linux-port.md）：macOS = CGL + 框架静态链接；
-# Linux = EGL surfaceless + 运行期 dlopen。定位仍是链路验证。
+set(NEOX_ENABLE_GL 0)
 if(NEOX_BACKEND_GL)
   if(APPLE)
     target_sources(neox PRIVATE src/gl.c src/gl_ctx_cgl.c)
-    target_compile_definitions(neox PUBLIC NEOX_ENABLE_GL=1)
     target_link_libraries(neox PRIVATE "-framework OpenGL")
-    set_source_files_properties(src/gl.c src/gl_ctx_cgl.c PROPERTIES
-      COMPILE_OPTIONS "-Wno-deprecated-declarations")
-    set(NEOX_GL_ENABLED 1)
-  elseif(UNIX)
+    set_source_files_properties(src/gl.c src/gl_ctx_cgl.c PROPERTIES COMPILE_OPTIONS "-Wno-deprecated-declarations")
+  elseif(NEOX_LINUX)
     target_sources(neox PRIVATE src/gl.c src/gl_ctx_egl.c src/gl_load.c)
-    target_compile_definitions(neox PUBLIC NEOX_ENABLE_GL=1)
     target_link_libraries(neox PRIVATE ${CMAKE_DL_LIBS})
-    set(NEOX_GL_ENABLED 1)
   else()
     message(FATAL_ERROR "NEOX_BACKEND_GL is not implemented on this platform")
   endif()
-else()
-  set(NEOX_GL_ENABLED 0)
+  set(NEOX_ENABLE_GL 1)
 endif()
-
-# Metal 后端：仅 macOS；唯一 ObjC++ 文件，MRC（C 结构内手动管理 MTL 对象）
-if(NEOX_BACKEND_METAL AND APPLE)
+set(NEOX_ENABLE_METAL 0)
+if(NEOX_BACKEND_METAL)
+  if(NOT APPLE)
+    message(FATAL_ERROR "NEOX_BACKEND_METAL is implemented on Apple platforms only")
+  endif()
   enable_language(OBJCXX)
   target_sources(neox PRIVATE src/metal.mm)
-  target_compile_definitions(neox PUBLIC NEOX_ENABLE_METAL=1)
-  target_link_libraries(neox PRIVATE "-framework Metal" "-framework Foundation"
-                        "-framework QuartzCore")
-  set_source_files_properties(src/metal.mm PROPERTIES
-    COMPILE_OPTIONS "-fno-objc-arc;-Wno-deprecated-declarations")
-  set(NEOX_MTL_ENABLED 1)
-else()
-  set(NEOX_MTL_ENABLED 0)
+  target_link_libraries(neox PRIVATE "-framework Metal" "-framework Foundation" "-framework QuartzCore")
+  set_source_files_properties(src/metal.mm PROPERTIES COMPILE_OPTIONS "-fno-objc-arc;-Wno-deprecated-declarations")
+  set(NEOX_ENABLE_METAL 1)
 endif()
 
-# 窗口呈现是平台胶水，不是 GL 执行器。Linux 上 X11 与 Wayland 都编进来，
-# 运行期 dlopen，不把 libX11 / libwayland 写进链接行。
-if(UNIX AND NOT APPLE)
-  option(NEOX_PRESENT "Linux window presentation (Wayland, X11 fallback)" ON)
-else()
-  option(NEOX_PRESENT "Linux window presentation (Wayland, X11 fallback)" OFF)
-endif()
-if(NEOX_PRESENT AND (NOT UNIX OR APPLE))
-  message(FATAL_ERROR "NEOX_PRESENT is implemented for Linux only")
-endif()
-if(NEOX_PRESENT)
-  target_sources(neox PRIVATE src/present.c src/present_x11.c src/present_wl.c)
-  target_compile_definitions(neox PUBLIC NEOX_ENABLE_PRESENT=1)
-  target_link_libraries(neox PRIVATE ${CMAKE_DL_LIBS})
-endif()
-
-# 示例：输出 BMP 到构建目录（ctest 可顺带验证示例跑通）
-add_executable(ex01_scene examples/ex01_scene.c)
-target_link_libraries(ex01_scene PRIVATE neox m)
-target_compile_options(ex01_scene PRIVATE -Wall -Wextra)
-set_target_properties(ex01_scene PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-
-enable_testing()
-add_executable(test_semantics tests/test_semantics.c)
-target_link_libraries(test_semantics PRIVATE neox m)
-target_compile_options(test_semantics PRIVATE -Wall -Wextra)
-add_test(NAME semantics COMMAND test_semantics)
-
-# 示例作为冒烟测试：跑通并产出 BMP
-add_test(NAME ex01_smoke COMMAND ex01_scene)
-set_tests_properties(ex01_smoke PROPERTIES
-  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-if(NEOX_GL_ENABLED)
-  add_executable(test_gpu_consistency tests/test_gpu_consistency.c)
-  target_link_libraries(test_gpu_consistency PRIVATE neox m)
-  target_compile_options(test_gpu_consistency PRIVATE -Wall -Wextra)
-  set_target_properties(test_gpu_consistency PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-  add_test(NAME gpu_consistency COMMAND test_gpu_consistency)
-  # 关掉 dual-source，强制 ping-pong 回退（与 Metal 的 NEOX_MTL_FORCE_NO_DUAL 同款）
-  add_test(NAME gpu_consistency_nodual COMMAND test_gpu_consistency)
-  set_tests_properties(gpu_consistency_nodual PROPERTIES
-    ENVIRONMENT "NEOX_GL_FORCE_NO_DUAL=1")
-
-  add_executable(ex02_gpuscene examples/ex02_gpuscene.c)
-  target_link_libraries(ex02_gpuscene PRIVATE neox m)
-  target_compile_options(ex02_gpuscene PRIVATE -Wall -Wextra)
-  set_target_properties(ex02_gpuscene PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-  add_test(NAME ex02_smoke COMMAND ex02_gpuscene)
-  set_tests_properties(ex02_smoke PROPERTIES
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-  list(APPEND NEOX_TARGETS test_gpu_consistency ex02_gpuscene)
-endif()
-
-if(NEOX_MTL_ENABLED)
-  add_executable(ex03_mtlscene examples/ex03_mtlscene.c)
-  target_link_libraries(ex03_mtlscene PRIVATE neox m)
-  target_compile_options(ex03_mtlscene PRIVATE -Wall -Wextra)
-  set_target_properties(ex03_mtlscene PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-  add_test(NAME ex03_smoke COMMAND ex03_mtlscene)
-  set_tests_properties(ex03_smoke PROPERTIES
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-  list(APPEND NEOX_TARGETS ex03_mtlscene)
-endif()
-
-# NeoX-Text 模块（字体加载/排版/动态 A8 图集；stb_truetype 单头文件 vendor）
-option(NEOX_WITH_TEXT "NeoX-Text module (font loading, layout, A8 atlas)" ON)
 if(NEOX_WITH_TEXT)
   add_library(neox_text STATIC text/text.c)
-  target_include_directories(neox_text PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/text
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-                                     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+  add_library(NeoX::text ALIAS neox_text)
+  set_target_properties(neox_text PROPERTIES EXPORT_NAME text)
+  target_include_directories(neox_text PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/text> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE src third_party/stb)
   target_link_libraries(neox_text PUBLIC neox)
-  target_compile_options(neox_text PRIVATE -Wall -Wextra)
-
-  enable_testing()
-  add_executable(test_text tests/test_text.c)
-  target_link_libraries(test_text PRIVATE neox_text m)
-  target_compile_options(test_text PRIVATE -Wall -Wextra)
-  set_target_properties(test_text PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-  add_test(NAME text COMMAND test_text)
-
-  add_executable(ex04_text examples/ex04_text.c)
-  target_link_libraries(ex04_text PRIVATE neox_text m)
-  target_compile_options(ex04_text PRIVATE -Wall -Wextra)
-  set_target_properties(ex04_text PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-  add_test(NAME ex04_smoke COMMAND ex04_text)
-  set_tests_properties(ex04_smoke PROPERTIES
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-  # SDF/MSDF 距离场文字演示（Soft 单后端；三模式分区 + 2.5x 缩放演示）
-  add_executable(ex06_sdftext examples/ex06_sdftext.c)
-  target_link_libraries(ex06_sdftext PRIVATE neox_text m)
-  target_compile_options(ex06_sdftext PRIVATE -Wall -Wextra)
-  set_target_properties(ex06_sdftext PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-  add_test(NAME ex06_smoke COMMAND ex06_sdftext)
-  set_tests_properties(ex06_smoke PROPERTIES
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-  list(APPEND NEOX_TARGETS neox_text test_text ex04_text ex06_sdftext)
+  neox_build_options(neox_text)
+  list(APPEND NEOX_INSTALL_TARGETS neox_text)
 endif()
-
 if(NEOX_PRESENT)
-  add_executable(test_present tests/test_present.c)
-  target_link_libraries(test_present PRIVATE neox m)
-  target_compile_options(test_present PRIVATE -Wall -Wextra)
-  set_target_properties(test_present PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-  add_test(NAME present COMMAND test_present)
-
-  add_executable(ex05_window examples/ex05_window.c)
-  target_link_libraries(ex05_window PRIVATE neox m)
-  target_compile_options(ex05_window PRIVATE -Wall -Wextra)
-  set_target_properties(ex05_window PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-  add_test(NAME ex05_smoke COMMAND ex05_window)
-  set_tests_properties(ex06_smoke PROPERTIES
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    ENVIRONMENT "NEOX_PRESENT_FRAMES=2")
-
-  list(APPEND NEOX_TARGETS test_present ex05_window)
+  if(NOT NEOX_LINUX)
+    message(FATAL_ERROR "NEOX_PRESENT is implemented for Linux only")
+  endif()
+  add_library(neox_present STATIC src/present.c src/present_x11.c src/present_wl.c)
+  add_library(NeoX::present ALIAS neox_present)
+  set_target_properties(neox_present PROPERTIES EXPORT_NAME present)
+  target_link_libraries(neox_present PUBLIC neox PRIVATE ${CMAKE_DL_LIBS})
+  neox_build_options(neox_present)
+  list(APPEND NEOX_INSTALL_TARGETS neox_present)
 endif()
 
-if(NEOX_SANITIZE)
-  foreach(t ${NEOX_TARGETS})
-    target_compile_options(${t} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
-    target_link_options(${t} PRIVATE -fsanitize=address,undefined)
+set(NEOX_ENABLE_SCENE ${NEOX_WITH_SCENE})
+set(NEOX_ENABLE_CAPTURE ${NEOX_WITH_CAPTURE})
+set(NEOX_ENABLE_TEXT ${NEOX_WITH_TEXT})
+set(NEOX_ENABLE_PRESENT ${NEOX_PRESENT})
+configure_file(cmake/neox_config.h.in include/neox_config.h)
+include(CMakePackageConfigHelpers)
+install(TARGETS ${NEOX_INSTALL_TARGETS} EXPORT NeoXTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES include/neox.h ${CMAKE_CURRENT_BINARY_DIR}/include/neox_config.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+if(NEOX_ENABLE_GL)
+  install(FILES include/neox_gl.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif()
+if(NEOX_ENABLE_METAL)
+  install(FILES include/neox_mtl.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif()
+if(NEOX_WITH_TEXT)
+  install(FILES text/neox_text.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif()
+if(NEOX_PRESENT)
+  install(FILES include/neox_present.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif()
+set(NEOX_PACKAGE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/NeoX)
+configure_package_config_file(cmake/NeoXConfig.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/NeoXConfig.cmake
+  INSTALL_DESTINATION ${NEOX_PACKAGE_DIR})
+write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/NeoXConfigVersion.cmake
+  VERSION ${PROJECT_VERSION} COMPATIBILITY SameMinorVersion)
+install(EXPORT NeoXTargets NAMESPACE NeoX:: DESTINATION ${NEOX_PACKAGE_DIR})
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/NeoXConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/NeoXConfigVersion.cmake
+  DESTINATION ${NEOX_PACKAGE_DIR})
+
+if(NEOX_BUILD_TESTS)
+  enable_testing()
+  include(cmake/NeoXTests.cmake)
+endif()
+if(NEOX_BUILD_EXAMPLES)
+  include(cmake/NeoXExamples.cmake)
+endif()
+if(NEOX_BUILD_TESTS AND NEOX_SANITIZE)
+  get_property(NEOX_TESTS DIRECTORY PROPERTY TESTS)
+  foreach(t ${NEOX_TESTS})
+    set_property(TEST ${t} APPEND PROPERTY ENVIRONMENT "UBSAN_OPTIONS=halt_on_error=1")
   endforeach()
 endif()

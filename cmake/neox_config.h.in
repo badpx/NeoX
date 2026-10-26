@@ -1,0 +1,10 @@
+/* Generated for this library build; installed alongside neox.h. */
+#ifndef NEOX_CONFIG_H
+#define NEOX_CONFIG_H
+#cmakedefine01 NEOX_ENABLE_SCENE
+#cmakedefine01 NEOX_ENABLE_CAPTURE
+#cmakedefine01 NEOX_ENABLE_TEXT
+#cmakedefine NEOX_ENABLE_PRESENT 1
+#cmakedefine NEOX_ENABLE_GL 1
+#cmakedefine NEOX_ENABLE_METAL 1
+#endif

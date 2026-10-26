@@ -93,6 +93,7 @@ struct nx_gl_ctx {
     EGLConfig win_cfg;
     int native;         /* 1：独立于进程级 surfaceless display */
     int can_window;
+    int lost;
     const char *kind;
 };
 
@@ -145,6 +146,18 @@ static void set_err_egl(const char *prefix)
     snprintf(g_errbuf, sizeof g_errbuf, "%s (egl 0x%x)", prefix, (unsigned)code);
     g_err = g_errbuf;
 }
+
+/* Consume EGL's thread-local error before cleanup calls can replace it. */
+static int ctx_error(nx_gl_ctx *ctx, const char *message)
+{
+    EGLint code = p_getError ? p_getError() : 0;
+    if (ctx && code == 0x300E) ctx->lost = 1; /* EGL_CONTEXT_LOST */
+    snprintf(g_errbuf, sizeof g_errbuf, "%s (egl 0x%x)", message, (unsigned)code);
+    g_err = g_errbuf;
+    return 0;
+}
+
+int nx_gl_ctx_is_lost(const nx_gl_ctx *ctx) { return ctx && ctx->lost; }
 
 static int ext_has(const char *ext, const char *name)
 {
@@ -488,7 +501,8 @@ int nx_gl_ctx_make_current(nx_gl_ctx *ctx)
     EGLSurface s;
     if (!ctx || ctx->ctx == EGL_NO_CONTEXT || ctx->dpy == EGL_NO_DISPLAY) return 0;
     s = ctx->surface;
-    return p_makeCurrent(ctx->dpy, s, s, ctx->ctx) == EGL_TRUE;
+    if (p_makeCurrent(ctx->dpy, s, s, ctx->ctx) == EGL_TRUE) return 1;
+    return ctx_error(ctx, "EGL: could not make context current");
 }
 
 int nx_gl_ctx_can_window(const nx_gl_ctx *ctx)
@@ -506,17 +520,19 @@ void *nx_gl_ctx_window_surface(nx_gl_ctx *ctx, void *native_window, int vsync)
     }
     s = p_createWindow(ctx->dpy, ctx->win_cfg, native_window, attr);
     if (s == EGL_NO_SURFACE) {
-        set_err_egl("EGL: window surface failed");
+        ctx_error(ctx, "EGL: window surface failed");
         return NULL;
     }
     if (!p_makeCurrent(ctx->dpy, s, s, ctx->ctx)) {
+        ctx_error(ctx, "EGL: could not make window surface current");
         p_destroySurface(ctx->dpy, s);
-        set_err_egl("EGL: could not make window surface current");
         return NULL;
     }
     /* 交换间隔失败（Xvfb、部分驱动）不让窗口表面作废。 */
-    if (p_swapInterval)
-        (void)p_swapInterval(ctx->dpy, vsync ? 1 : 0);
+    if (p_swapInterval && !p_swapInterval(ctx->dpy, vsync ? 1 : 0)) {
+        ctx_error(ctx, "EGL: swap interval failed");
+        if (ctx->lost) { p_destroySurface(ctx->dpy, s); return NULL; }
+    }
     return s;
 }
 
@@ -530,14 +546,16 @@ void nx_gl_ctx_window_destroy(nx_gl_ctx *ctx, void *egl_surface)
 int nx_gl_ctx_window_make_current(nx_gl_ctx *ctx, void *egl_surface)
 {
     if (!ctx || !egl_surface) return 0;
-    return p_makeCurrent(ctx->dpy, (EGLSurface)egl_surface,
-                         (EGLSurface)egl_surface, ctx->ctx) == EGL_TRUE;
+    if (p_makeCurrent(ctx->dpy, (EGLSurface)egl_surface,
+                     (EGLSurface)egl_surface, ctx->ctx) == EGL_TRUE) return 1;
+    return ctx_error(ctx, "EGL: could not make window current");
 }
 
-void nx_gl_ctx_window_swap(nx_gl_ctx *ctx, void *egl_surface)
+int nx_gl_ctx_window_swap(nx_gl_ctx *ctx, void *egl_surface)
 {
-    if (!ctx || !egl_surface || !p_swapBuffers) return;
-    (void)p_swapBuffers(ctx->dpy, (EGLSurface)egl_surface);
+    if (!ctx || !egl_surface || !p_swapBuffers) return 0;
+    if (p_swapBuffers(ctx->dpy, (EGLSurface)egl_surface) == EGL_TRUE) return 1;
+    return ctx_error(ctx, "EGL: swap buffers failed");
 }
 
 int nx_gl_ctx_native_visual(const nx_gl_ctx *ctx, unsigned long *out_id)

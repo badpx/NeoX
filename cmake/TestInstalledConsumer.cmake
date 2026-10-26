@@ -1,0 +1,22 @@
+# Deliberately build the consumer from a copied directory and a relocated prefix.
+# No target from the producer or private include directory is available to it.
+set(root "${NEOX_BUILD_DIR}/consumer-check")
+file(REMOVE_RECURSE "${root}")
+function(run)
+  execute_process(COMMAND ${ARGV} RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+  if(NOT result EQUAL 0)
+    message(FATAL_ERROR "Command failed: ${ARGV}\n${output}\n${error}")
+  endif()
+endfunction()
+run("${CMAKE_COMMAND}" --install "${NEOX_BUILD_DIR}" --prefix "${root}/original" --config "${NEOX_CONFIG}")
+file(RENAME "${root}/original" "${root}/relocated")
+file(COPY "${NEOX_SOURCE_DIR}/tests/consumer/" DESTINATION "${root}/source")
+set(package_hint)
+if(NOT NEOX_PACKAGE_DIR MATCHES "^(lib|lib64)/cmake/NeoX$")
+  list(APPEND package_hint "-DNeoX_DIR=${root}/relocated/${NEOX_PACKAGE_DIR}")
+endif()
+run("${CMAKE_COMMAND}" -S "${root}/source" -B "${root}/build"
+  ${package_hint} "-DCMAKE_PREFIX_PATH=${root}/relocated" "-DCMAKE_BUILD_TYPE=${NEOX_CONFIG}")
+run("${CMAKE_COMMAND}" --build "${root}/build" --config "${NEOX_CONFIG}")
+run("${CMAKE_CTEST_COMMAND}" --test-dir "${root}/build" -C "${NEOX_CONFIG}" --output-on-failure)
+message(STATUS "Relocated installed consumer passed")

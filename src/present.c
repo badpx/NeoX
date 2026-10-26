@@ -6,6 +6,7 @@
  * 事件队列在这里，平台文件只负责把系统事件推进来。
  * =========================================================================*/
 #include "present_internal.h"
+#include "internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,16 +28,33 @@ void nx_win_set_error(const char *msg)
 
 const char *neox_window_last_error(void) { return g_err; }
 
-void nx_win_recompute(neox_window *w)
+int nx_win_rgba_size(uint32_t width, uint32_t height, size_t *bytes)
 {
-    float s = w->scale;
+    size_t row;
+    return width && height && width <= INT32_MAX && height <= INT32_MAX &&
+           nx_size_mul(width, 4u, &row) && nx_size_mul(row, height, bytes);
+}
+
+neox_result nx_win_set_geometry(neox_window *w, uint32_t width, uint32_t height, float scale)
+{
     double px, py;
-    if (s < 0.5f) s = 1.0f;
-    w->scale = s;
-    px = (double)w->pt_w * (double)s + 0.5;
-    py = (double)w->pt_h * (double)s + 0.5;
-    w->px_w = px < 1.0 ? 1u : (uint32_t)px;
-    w->px_h = py < 1.0 ? 1u : (uint32_t)py;
+    size_t bytes;
+    if (!w || !width || !height || width > INT32_MAX || height > INT32_MAX ||
+        !isfinite(scale) || scale <= 0.0f) goto invalid;
+    /* Preserve the existing minimum effective scale policy. */
+    if (scale < 0.5f) scale = 1.0f;
+    px = floor((double)width * scale + 0.5);
+    py = floor((double)height * scale + 0.5);
+    if (px < 1.0) px = 1.0;
+    if (py < 1.0) py = 1.0;
+    if (px > INT32_MAX || py > INT32_MAX ||
+        !nx_win_rgba_size((uint32_t)px, (uint32_t)py, &bytes)) goto invalid;
+    w->pt_w = width; w->pt_h = height; w->scale = scale;
+    w->px_w = (uint32_t)px; w->px_h = (uint32_t)py;
+    return NEOX_OK;
+invalid:
+    nx_win_set_error("window geometry is non-finite or exceeds supported dimensions");
+    return NEOX_ERROR_INVALID_ARGUMENT;
 }
 
 void nx_win_push_event(neox_window *w, const neox_window_event *ev)
@@ -87,7 +105,7 @@ neox_result neox_window_create(const neox_present_desc *desc, neox_window **out)
         nx_win_set_error("neox_present_desc version mismatch");
         return NEOX_ERROR_INVALID_ARGUMENT;
     }
-    if (desc->width == 0 || desc->height == 0 || desc->scale < 0.0f) {
+    if (desc->width == 0 || desc->height == 0 || (!isfinite(desc->scale) || desc->scale < 0.0f)) {
         nx_win_set_error("window size must be non-zero");
         return NEOX_ERROR_INVALID_ARGUMENT;
     }
@@ -103,7 +121,8 @@ neox_result neox_window_create(const neox_present_desc *desc, neox_window **out)
     w->scale_locked = desc->scale > 0.0f;
     w->scale = w->scale_locked ? desc->scale : 1.0f;
     w->vsync = desc->vsync ? 1 : 0;
-    nx_win_recompute(w);
+    r = nx_win_set_geometry(w, w->pt_w, w->pt_h, w->scale);
+    if (r != NEOX_OK) { free(w); return r; }
 
     if (backend_forced(&forced)) {
         if (strcmp(forced, "wayland") == 0) try_wl = 1;
@@ -136,13 +155,17 @@ neox_result neox_window_create(const neox_present_desc *desc, neox_window **out)
         snprintf(saved, sizeof saved, "%s", g_err ? g_err : "wayland failed");
         if (w->vt->close) w->vt->close(w);
         w->plat = NULL;
+        /* Failed Wayland setup may have selected an integer output scale. */
+        r = nx_win_set_geometry(w, desc->width, desc->height,
+                               desc->scale > 0.0f ? desc->scale : 1.0f);
+        if (r != NEOX_OK) { free(w); return r; }
         w->vt = nx_present_x11_vt();
         r = w->vt->open(w);
         if (r != NEOX_OK) {
             char xerr[384];
             snprintf(xerr, sizeof xerr, "%s", g_err ? g_err : "x11 failed");
             if (w->vt->close) w->vt->close(w);
-            snprintf(g_errbuf, sizeof g_errbuf, "wayland: %s; x11: %s", saved, xerr);
+            snprintf(g_errbuf, sizeof g_errbuf, "wayland: %.180s; x11: %.180s", saved, xerr);
             g_err = g_errbuf;
             free(w);
             return r;
@@ -162,20 +185,23 @@ neox_result neox_window_create(const neox_present_desc *desc, neox_window **out)
     return NEOX_OK;
 }
 
+/* The context owns the device. The window may request destruction, and this
+ * callback removes its borrow regardless of which owner initiated teardown. */
+static void window_device_detached(void *owner)
+{
+    neox_window *win = owner;
+    win->dev = NULL; win->ctx = NULL; win->is_gl = 0;
+    win->soft_w = win->soft_h = 0;
+#if NEOX_ENABLE_GL
+    win->gl_surf = NULL; win->gl_native = NULL; win->gl_w = win->gl_h = 0;
+#endif
+}
+
 void neox_window_destroy(neox_window *win)
 {
-    neox_device *dev;
     if (!win) return;
-    dev = win->dev;
-    win->dev = NULL;
-#if NEOX_ENABLE_GL
-    if (win->gl_surf && dev) {
-        neox_gl_surface_destroy(dev, win->gl_surf);
-        win->gl_surf = NULL;
-    }
-#endif
-    /* 本地 display 还连着，先拆设备（含 eglTerminate），再让平台断开连接。 */
-    if (dev) neox_device_destroy(dev);
+    /* Device teardown drains submissions and destroys EGL before display close. */
+    if (win->dev) neox_device_destroy(win->dev);
     if (win->vt && win->vt->close) win->vt->close(win);
     free(win->soft_px);
     free(win);
@@ -220,13 +246,19 @@ int neox_window_poll(neox_window *win, neox_window_event *out)
 
 neox_result neox_window_resize(neox_window *win, uint32_t points_w, uint32_t points_h)
 {
-    if (!win || points_w == 0 || points_h == 0) return NEOX_ERROR_INVALID_ARGUMENT;
-    win->pt_w = points_w;
-    win->pt_h = points_h;
-    nx_win_recompute(win);
-    if (win->vt && win->vt->resize)
-        return win->vt->resize(win, points_w, points_h);
-    return NEOX_OK;
+    neox_result r;
+    uint32_t old_w, old_h, old_px_w, old_px_h;
+    if (!win) return NEOX_ERROR_INVALID_ARGUMENT;
+    old_w = win->pt_w; old_h = win->pt_h;
+    old_px_w = win->px_w; old_px_h = win->px_h;
+    r = nx_win_set_geometry(win, points_w, points_h, win->scale);
+    if (r != NEOX_OK) return r;
+    r = win->vt && win->vt->resize ? win->vt->resize(win, points_w, points_h) : NEOX_OK;
+    if (r != NEOX_OK) {
+        win->pt_w = old_w; win->pt_h = old_h;
+        win->px_w = old_px_w; win->px_h = old_px_h;
+    }
+    return r;
 }
 
 void neox_window_request_close(neox_window *win)
@@ -243,6 +275,10 @@ neox_result neox_window_create_device(neox_window *win, neox_context *ctx,
     neox_result r;
     if (out_dev) *out_dev = NULL;
     if (!win || !ctx || !out_dev) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (win->dev) {
+        nx_win_set_error("window already has a device");
+        return NEOX_ERROR_INVALID_ARGUMENT;
+    }
     memset(&dd, 0, sizeof dd);
 
     if (backend == NEOX_BACKEND_SOFT) {
@@ -251,6 +287,7 @@ neox_result neox_window_create_device(neox_window *win, neox_context *ctx,
         if (r != NEOX_OK) return r;
         win->ctx = ctx;
         win->dev = *out_dev;
+        win->dev->owner = win; win->dev->owner_detach = window_device_detached;
         win->is_gl = 0;
         return NEOX_OK;
     }
@@ -286,6 +323,7 @@ neox_result neox_window_create_device(neox_window *win, neox_context *ctx,
         }
         win->ctx = ctx;
         win->dev = *out_dev;
+        win->dev->owner = win; win->dev->owner_detach = window_device_detached;
         win->is_gl = 1;
         return NEOX_OK;
     }
@@ -299,14 +337,22 @@ neox_result neox_window_create_device(neox_window *win, neox_context *ctx,
 neox_result neox_window_acquire_target(neox_window *win, neox_device *dev,
                                        neox_target_desc *out_target)
 {
-    if (!win || !dev || !out_target) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (!win || !dev || !win->dev || !out_target) return NEOX_ERROR_INVALID_ARGUMENT;
     if (win->dev && dev != win->dev) {
         nx_win_set_error("target device is not the window device");
         return NEOX_ERROR_INVALID_ARGUMENT;
     }
 
     if (!win->is_gl) {
-        size_t n = (size_t)win->px_w * (size_t)win->px_h * 4u;
+        size_t n;
+        /* Reacquisition clears/reallocates borrowed target storage. Even an
+         * unchanged size must not overwrite an active or queued frame. */
+        if (dev->active_frame || dev->pending_count) {
+            nx_win_set_error("complete or cancel window frames before acquiring a target");
+            return NEOX_ERROR_INVALID_ARGUMENT;
+        }
+        if (!nx_win_rgba_size(win->px_w, win->px_h, &n))
+            return NEOX_ERROR_INVALID_ARGUMENT;
         if (win->soft_bytes < n) {
             uint8_t *p = (uint8_t *)realloc(win->soft_px, n);
             if (!p) {
@@ -317,6 +363,7 @@ neox_result neox_window_acquire_target(neox_window *win, neox_device *dev,
             win->soft_bytes = n;
         }
         memset(win->soft_px, 0, n);
+        win->soft_w = win->px_w; win->soft_h = win->px_h;
         out_target->kind = NEOX_BACKEND_SOFT;
         out_target->soft.pixels = win->soft_px;
         out_target->soft.stride = (size_t)win->px_w * 4u;
@@ -382,13 +429,20 @@ neox_result neox_window_acquire_target(neox_window *win, neox_device *dev,
 #endif
 }
 
+static int soft_target_current(const neox_window *win)
+{
+    size_t bytes;
+    return win->soft_px && win->soft_w == win->px_w && win->soft_h == win->px_h &&
+           nx_win_rgba_size(win->px_w, win->px_h, &bytes) && bytes <= win->soft_bytes;
+}
+
 neox_result neox_window_present(neox_window *win)
 {
-    if (!win) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (!win || !win->dev) return NEOX_ERROR_INVALID_ARGUMENT;
     if (win->is_gl) {
 #if NEOX_ENABLE_GL
-        if (!win->gl_surf) {
-            nx_win_set_error("acquire_target before present");
+        if (!win->gl_surf || win->gl_w != win->px_w || win->gl_h != win->px_h) {
+            nx_win_set_error("acquire_target before present and after size changes");
             return NEOX_ERROR_INVALID_ARGUMENT;
         }
         return neox_gl_surface_present(win->gl_surf);
@@ -396,19 +450,43 @@ neox_result neox_window_present(neox_window *win)
         return NEOX_ERROR_UNSUPPORTED;
 #endif
     }
+    if (!soft_target_current(win)) {
+        nx_win_set_error("acquire_target after window size changes");
+        return NEOX_ERROR_INVALID_ARGUMENT;
+    }
     if (!win->vt || !win->vt->present_soft) return NEOX_ERROR_UNSUPPORTED;
     return win->vt->present_soft(win);
 }
 
+neox_result neox_window_request_readback(neox_window *win)
+{
+    if (!win || !win->dev) return NEOX_ERROR_INVALID_ARGUMENT;
+#if NEOX_ENABLE_GL
+    if (win->is_gl) {
+        if (!win->gl_surf || win->gl_w != win->px_w || win->gl_h != win->px_h)
+            return NEOX_ERROR_INVALID_ARGUMENT;
+        return neox_gl_surface_request_readback(win->gl_surf);
+    }
+#endif
+    return NEOX_OK;
+}
+
 neox_result neox_window_read_pixels(neox_window *win, uint8_t *out_pixels)
 {
-    if (!win || !out_pixels) return NEOX_ERROR_INVALID_ARGUMENT;
-    if (win->vt && win->vt->read_screen && win->vt->read_screen(win, out_pixels) == 0)
-        return NEOX_OK;
+    if (!win || !win->dev || !out_pixels) return NEOX_ERROR_INVALID_ARGUMENT;
 #if NEOX_ENABLE_GL
-    if (win->is_gl && win->gl_surf)
+    if (win->is_gl) {
+        if (!win->gl_surf || win->gl_w != win->px_w || win->gl_h != win->px_h)
+            return NEOX_ERROR_INVALID_ARGUMENT;
         return neox_gl_surface_read_presented(win->gl_surf, out_pixels);
+    }
 #endif
+    if (!win->is_gl && !soft_target_current(win)) {
+        nx_win_set_error("acquire_target after window size changes");
+        return NEOX_ERROR_INVALID_ARGUMENT;
+    }
+    if (!win->is_gl && win->vt && win->vt->read_screen && win->vt->read_screen(win,out_pixels)==0)
+        return NEOX_OK;
     if (!win->is_gl && win->soft_px) {
         memcpy(out_pixels, win->soft_px, (size_t)win->px_w * (size_t)win->px_h * 4u);
         return NEOX_OK;

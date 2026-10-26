@@ -39,9 +39,9 @@
  *     像素中心（floor(frag/SS)+0.5），与 Soft 的像素中心采样对齐。
  *     负宽高目标矩形镜像由 tu/tv ∈ [0,1] 反转自然产生（§8）。
  *
- * 设备语义：pump 即执行 pending submission（录制阶段不触碰 GL；执行末
+ * 设备语义：frame_begin 可建立 GPU 目标快照；绘制命令只录制。pump 执行提交，
  * glFlush + glGetError 检查，同步点用 glFinish——最小实现允许阻塞）。
- * neox_device_is_lost 恒 false。执行期仅在最后 resolve 步骤写表面，
+ * 观察到 GL/EGL context loss 后设备进入终态。执行期仅在最后 resolve 步骤写表面，
  * 之前任何 GL 错误 → submission FAILED 且表面保持调用前状态（§10.1）。
  *
  * 坐标约定：设备坐标（左上原点，y 向下）直接作为 GL window 坐标使用
@@ -52,7 +52,7 @@
  *   - 混合单元与 CPU 的 float 表达式求值顺序（FMA 收缩）可能有 1 ulp 差，
  *     仅当结果恰落在 sRGB 量化 ties 边界时表现为 1 LSB（测试场景未发现）。
  * =========================================================================*/
-#include "internal.h"
+#include "execution.h"
 
 #include <stdio.h>
 #include "neox_gl.h"
@@ -134,16 +134,16 @@ static const char *NX_GLSL_FS_TEX =
     "    float tu = (l.x - u_dst.x) / u_dst[2];\n"
     "    float tv = (l.y - u_dst.y) / u_dst[3];\n"
     /* 像素中心二值包含（与参照后端一致：中心在目标矩形外则该像素不变） */
-    "    if (tu < 0.0 || tu > 1.0 || tv < 0.0 || tv > 1.0) discard;\n"
+    "    if (!(tu >= 0.0 && tu <= 1.0 && tv >= 0.0 && tv <= 1.0)) discard;\n"
     "    float u = u_src.x + tu * u_src[2];\n"
     "    float v = u_src.y + tv * u_src[3];\n"
     "    vec4 c;\n"
     "    if (u_linear == 0) {\n"
-    "        int i = clamp(int(floor(u)), 0, u_tex_size.x - 1);\n"
-    "        int j = clamp(int(floor(v)), 0, u_tex_size.y - 1);\n"
+    "        int i = int(floor(clamp(u, 0.0, float(u_tex_size.x - 1))));\n"
+    "        int j = int(floor(clamp(v, 0.0, float(u_tex_size.y - 1))));\n"
     "        c = texelFetch(u_tex, ivec2(i, j), 0);\n"
     "    } else {\n"
-    "        float x = u - 0.5, y = v - 0.5;\n"
+    "        float x = clamp(u - 0.5, 0.0, float(u_tex_size.x - 1)), y = clamp(v - 0.5, 0.0, float(u_tex_size.y - 1));\n"
     "        float fx = x - floor(x), fy = y - floor(y);\n"
     "        int i0 = clamp(int(floor(x)), 0, u_tex_size.x - 1);\n"
     "        int i1 = clamp(int(floor(x)) + 1, 0, u_tex_size.x - 1);\n"
@@ -194,7 +194,7 @@ static const char *NX_GLSL_FS_GLYPH =
     "uniform vec4 u_color;\n"            /* 预乘线性 paint */
     "uniform mat3 u_inv;\n"
     "uniform vec4 u_glyph;\n"            /* x,y,w,h（局部坐标） */
-    "uniform vec4 u_atlas_rect;\n"       /* sx,sy,sw,sh */
+    "uniform vec4 u_atlas_rect;\n"       /* sx,sy,local-to-texel scale x/y */
     "uniform float u_ss;\n"
     "uniform int u_mode;\n"
     NX_GLSL_SDF_COMMON
@@ -209,10 +209,10 @@ static const char *NX_GLSL_FS_GLYPH =
     "    vec2 devc = floor(gl_FragCoord.xy / u_ss) + 0.5;\n"
     "    vec3 l = u_inv * vec3(devc, 1.0);\n"
     /* 像素中心二值包含（与参照后端一致） */
-    "    if (l.x < u_glyph.x || l.x > u_glyph.x + u_glyph.z ||\n"
-    "        l.y < u_glyph.y || l.y > u_glyph.y + u_glyph.w) discard;\n"
-    "    float u = u_atlas_rect.x + (l.x - u_glyph.x);\n"
-    "    float v = u_atlas_rect.y + (l.y - u_glyph.y);\n"
+    "    if (!(l.x >= u_glyph.x && l.x <= u_glyph.x + u_glyph.z &&\n"
+    "        l.y >= u_glyph.y && l.y <= u_glyph.y + u_glyph.w)) discard;\n"
+    "    float u = u_atlas_rect.x + (l.x - u_glyph.x) * u_atlas_rect.z;\n"
+    "    float v = u_atlas_rect.y + (l.y - u_glyph.y) * u_atlas_rect.w;\n"
     "    float x = u - 0.5, y = v - 0.5;\n"
     "    float fx = x - floor(x), fy = y - floor(y);\n"
     "    ivec2 sz = textureSize(u_atlas, 0);\n"
@@ -303,12 +303,13 @@ static const char *NX_GLSL_FS_PLUSGLYPH =
     "out vec4 o_color;\n"
     "void main(void)\n"
     "{\n"
+    "    vec4 dst = texelFetch(u_layer, ivec2(gl_FragCoord.xy / u_ss), 0);\n"
     "    vec2 devc = floor(gl_FragCoord.xy / u_ss) + 0.5;\n"
     "    vec3 l = u_inv * vec3(devc, 1.0);\n"
-    "    if (l.x < u_glyph.x || l.x > u_glyph.x + u_glyph.z ||\n"
-    "        l.y < u_glyph.y || l.y > u_glyph.y + u_glyph.w) discard;\n"
-    "    float u = u_atlas_rect.x + (l.x - u_glyph.x);\n"
-    "    float v = u_atlas_rect.y + (l.y - u_glyph.y);\n"
+    "    if (!(l.x >= u_glyph.x && l.x <= u_glyph.x + u_glyph.z &&\n"
+    "        l.y >= u_glyph.y && l.y <= u_glyph.y + u_glyph.w)) { o_color = dst; return; }\n"
+    "    float u = u_atlas_rect.x + (l.x - u_glyph.x) * u_atlas_rect.z;\n"
+    "    float v = u_atlas_rect.y + (l.y - u_glyph.y) * u_atlas_rect.w;\n"
     "    float x = u - 0.5, y = v - 0.5;\n"
     "    float fx = x - floor(x), fy = y - floor(y);\n"
     "    ivec2 sz = textureSize(u_atlas, 0);\n"
@@ -327,7 +328,6 @@ static const char *NX_GLSL_FS_PLUSGLYPH =
     "    if (u_atlas_mode == 1) cov = nx_recon_cov(pm.a);\n"
     "    else if (u_atlas_mode == 2) cov = nx_recon_cov(nx_median3(pm.r, pm.g, pm.b));\n"
     "    else cov = pm.a;\n"
-    "    vec4 dst = texelFetch(u_layer, ivec2(gl_FragCoord.xy / u_ss), 0);\n"
     "    if (cov <= 0.0) { o_color = dst; return; }\n"
     "    vec4 sc = u_color * cov;\n"
     "    o_color = min(sc + cov * dst, vec4(cov)) + (1.0 - cov) * dst;\n"
@@ -376,12 +376,12 @@ static const char *NX_GLSL_FS_MANUALGLYPH =
     "    vec4 dst = texelFetch(u_layer, dp, 0);\n"
     "    vec2 devc = floor(gl_FragCoord.xy / u_ss) + 0.5;\n"
     "    vec3 l = u_inv * vec3(devc, 1.0);\n"
-    "    if (l.x < u_glyph.x || l.x > u_glyph.x + u_glyph.z ||\n"
-    "        l.y < u_glyph.y || l.y > u_glyph.y + u_glyph.w) {\n"
+    "    if (!(l.x >= u_glyph.x && l.x <= u_glyph.x + u_glyph.z &&\n"
+    "        l.y >= u_glyph.y && l.y <= u_glyph.y + u_glyph.w)) {\n"
     "        o_color = dst; return;\n"
     "    }\n"
-    "    float u = u_atlas_rect.x + (l.x - u_glyph.x);\n"
-    "    float v = u_atlas_rect.y + (l.y - u_glyph.y);\n"
+    "    float u = u_atlas_rect.x + (l.x - u_glyph.x) * u_atlas_rect.z;\n"
+    "    float v = u_atlas_rect.y + (l.y - u_glyph.y) * u_atlas_rect.w;\n"
     "    float x = u - 0.5, y = v - 0.5;\n"
     "    float fx = x - floor(x), fy = y - floor(y);\n"
     "    ivec2 sz = textureSize(u_atlas, 0);\n"
@@ -432,18 +432,18 @@ static const char *NX_GLSL_FS_MANUALTEX =
     "    vec3 l = u_inv * vec3(devc, 1.0);\n"
     "    float tu = (l.x - u_dst.x) / u_dst[2];\n"
     "    float tv = (l.y - u_dst.y) / u_dst[3];\n"
-    "    if (tu < 0.0 || tu > 1.0 || tv < 0.0 || tv > 1.0) {\n"
+    "    if (!(tu >= 0.0 && tu <= 1.0 && tv >= 0.0 && tv <= 1.0)) {\n"
     "        o_color = dst; return;\n"
     "    }\n"
     "    float u = u_src.x + tu * u_src[2];\n"
     "    float v = u_src.y + tv * u_src[3];\n"
     "    vec4 c;\n"
     "    if (u_linear == 0) {\n"
-    "        int i = clamp(int(floor(u)), 0, u_tex_size.x - 1);\n"
-    "        int j = clamp(int(floor(v)), 0, u_tex_size.y - 1);\n"
+    "        int i = int(floor(clamp(u, 0.0, float(u_tex_size.x - 1))));\n"
+    "        int j = int(floor(clamp(v, 0.0, float(u_tex_size.y - 1))));\n"
     "        c = texelFetch(u_tex, ivec2(i, j), 0);\n"
     "    } else {\n"
-    "        float x = u - 0.5, y = v - 0.5;\n"
+    "        float x = clamp(u - 0.5, 0.0, float(u_tex_size.x - 1)), y = clamp(v - 0.5, 0.0, float(u_tex_size.y - 1));\n"
     "        float fx = x - floor(x), fy = y - floor(y);\n"
     "        int i0 = clamp(int(floor(x)), 0, u_tex_size.x - 1);\n"
     "        int i1 = clamp(int(floor(x)) + 1, 0, u_tex_size.x - 1);\n"
@@ -493,6 +493,23 @@ static const char *NX_GLSL_FS_BLIT =
     "    o_color = texelFetch(u_tex, dp, 0);\n"
     "}\n";
 
+/* GPU output conversion uses the same color space and unpremultiply rule.
+ * Explicit roundEven avoids relying on framebuffer conversion tie behavior. */
+static const char *NX_GLSL_FS_ENCODE =
+    "#version 410 core\n"
+    "uniform sampler2D u_tex; out vec4 o_color;\n"
+    "float enc(float v) { return v<=0.0031308 ? v*12.92 : 1.055*pow(v,1.0/2.4)-0.055; }\n"
+    "void main() { vec4 p=texelFetch(u_tex,ivec2(gl_FragCoord.xy),0);\n"
+    "if(p.a<=0.0) { o_color=vec4(0); return; }\n"
+    "vec3 c=clamp(p.rgb/p.a,0.0,1.0);\n"
+    "o_color=roundEven(vec4(enc(c.r),enc(c.g),enc(c.b),p.a)*255.0)/255.0; }\n";
+static const char *NX_GLSL_FS_DECODE =
+    "#version 410 core\n"
+    "uniform sampler2D u_tex; out vec4 o_color;\n"
+    "float dec(float v) { return v<=0.04045 ? v/12.92 : pow((v+0.055)/1.055,2.4); }\n"
+    "void main() { vec4 p=texelFetch(u_tex,ivec2(gl_FragCoord.xy),0);\n"
+    "o_color=vec4(vec3(dec(p.r),dec(p.g),dec(p.b))*p.a,p.a); }\n";
+
 /* ------------------------------------------------------------------ 后端状态 */
 
 typedef struct nx_gl_prog {
@@ -512,7 +529,9 @@ typedef struct nx_gl_rt {       /* 渲染目标池项（层 / 裁剪掩码纹理
 
 typedef struct nx_gl_texent {   /* 纹理槽 → GL 纹理（惰性上传） */
     GLuint id;
-    uint32_t version;
+    uint64_t version;
+    uint32_t generation;
+    uint64_t bytes;
 } nx_gl_texent;
 
 struct neox_gl_surface {
@@ -522,16 +541,20 @@ struct neox_gl_surface {
     void *win_egl;              /* EGLSurface；离屏为 NULL */
     void *native_window;
     int vsync;
-    uint8_t *presented;         /* 最近一次 present 的窗口读回，左上原点 */
+    uint8_t *presented;         /* lazily allocated explicit snapshot, reused */
+    int capture_next, presented_valid;
 };
 
 typedef struct nx_gl_dev {
+    neox_device *dev;
     nx_gl_ctx *ctx;             /* 平台上下文；shared_context 只加入共享组 */
     int gl_ready;               /* 入口已解析，销毁时可以发 GL 调用 */
     int dual_ok;                /* GL_MAX_DUAL_SOURCE_DRAW_BUFFERS >= 1 且探测链接成功 */
     GLuint vao, vbo;
     nx_gl_prog p_fill, p_tex, p_glyph, p_comp, p_blit, p_clamp, p_plusfill, p_plusglyph;
-    nx_gl_prog p_manualfill, p_manualglyph, p_manualtex, p_present;
+    nx_gl_prog p_manualfill, p_manualglyph, p_manualtex, p_present, p_encode, p_decode;
+    neox_gl_output_mode output_mode;
+    neox_gl_stats stats;
     nx_gl_rt *rts;              /* 层池（is_layer=1）与裁剪纹理池（is_layer=0） */
     uint32_t nrts, caprts;
     nx_gl_texent *texs;         /* 并行于 textures 槽位表 */
@@ -552,7 +575,25 @@ typedef struct nx_gl_dev {
 
 static int gl_make_current(nx_gl_dev *g)
 {
-    return g->ctx && nx_gl_ctx_make_current(g->ctx);
+    int ok = g->ctx && nx_gl_ctx_make_current(g->ctx);
+    if (nx_gl_ctx_is_lost(g->ctx)) nx_device_mark_lost(g->dev, "EGL context lost");
+    return ok;
+}
+
+/* Observe errors even when a caller only probes a capability or clears sticky
+ * errors: GL_CONTEXT_LOST must never disappear as an ignored diagnostic. */
+static GLenum gl_error(nx_gl_dev *g)
+{
+    GLenum error = glGetError();
+    if (error == 0x0507u) nx_device_mark_lost(g->dev, "GL context lost");
+    return error;
+}
+
+static neox_result gl_failure(nx_gl_dev *g)
+{
+    if (!g) return NEOX_ERROR_BACKEND;
+    if (nx_gl_ctx_is_lost(g->ctx)) nx_device_mark_lost(g->dev, "EGL context lost");
+    return nx_device_check_live(g->dev) == NEOX_OK ? NEOX_ERROR_BACKEND : NEOX_ERROR_DEVICE_LOST;
 }
 
 /* SRC/SRC_IN/SRC_OUT/DST_ATOP 的 dst 因子要用 SRC1，单源混合表达不了。 */
@@ -649,10 +690,11 @@ static void gl_use(const nx_gl_prog *p, float sx, float sy)
 }
 
 /* 上传顶点（设备坐标 ×2 分量）并绘制三角形 */
-static void gl_draw(const nx_gl_dev *g, const float *v, int nverts)
+static void gl_draw(nx_gl_dev *g, const float *v, int nverts)
 {
     glBindVertexArray(g->vao);
     glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
+    g->stats.vertex_upload_bytes += (uint64_t)nverts*2*sizeof(float);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nverts * 2 * (GLsizei)sizeof(float),
                  v, GL_STREAM_DRAW);
     glEnableVertexAttribArray(0);
@@ -661,7 +703,7 @@ static void gl_draw(const nx_gl_dev *g, const float *v, int nverts)
 }
 
 /* 全屏三角形（设备坐标 [0,w]×[0,h]，放大 2 倍保证覆盖） */
-static void gl_draw_full(const nx_gl_dev *g, const nx_gl_prog *p,
+static void gl_draw_full(nx_gl_dev *g, const nx_gl_prog *p,
                          float w, float h, float sx, float sy)
 {
     float v[6] = { 0.0f, 0.0f,  2.0f * w, 0.0f,  0.0f, 2.0f * h };
@@ -674,18 +716,18 @@ static void gl_draw_full(const nx_gl_dev *g, const nx_gl_prog *p,
  * （无边缘 AA，§8/测试 ⑤⑥ 的精确字节断言即此语义）。GL 侧将几何外扩，
  * 使被保留像素的全部超采样子像素都产生 fragment，再由 shader 按像素中心
  * 判定丢弃——与参照后端逐位一致。d 取 0.6 > 子像素中心最大偏移 √(2)·3/8。 */
-static void gl_inflate_quad(const float xc[4], const float yc[4], float d,
+static int gl_inflate_quad(const float xc[4], const float yc[4], float d,
                             float ox[4], float oy[4])
 {
-    float cx = (xc[0] + xc[1] + xc[2] + xc[3]) * 0.25f;
-    float cy = (yc[0] + yc[1] + yc[2] + yc[3]) * 0.25f;
-    float A[4], B[4], C[4];
+    double cx = ((double)xc[0] + xc[1] + xc[2] + xc[3]) * 0.25f;
+    double cy = ((double)yc[0] + yc[1] + yc[2] + yc[3]) * 0.25f;
+    double A[4], B[4], C[4];
     int i;
     for (i = 0; i < 4; i++) {
         int i2 = (i + 1) & 3;
-        float dx = xc[i2] - xc[i], dy = yc[i2] - yc[i];
-        float len = sqrtf(dx * dx + dy * dy);
-        float nx, ny;
+        double dx = (double)xc[i2] - xc[i], dy = (double)yc[i2] - yc[i];
+        double len = sqrt(dx * dx + dy * dy);
+        double nx, ny;
         if (len == 0.0f) { A[i] = 0.0f; B[i] = 0.0f; C[i] = 0.0f; continue; }
         nx = -dy / len;
         ny = dx / len;
@@ -695,11 +737,14 @@ static void gl_inflate_quad(const float xc[4], const float yc[4], float d,
     }
     for (i = 0; i < 4; i++) {
         int i0 = (i + 3) & 3;
-        float det = A[i0] * B[i] - A[i] * B[i0];
+        double det = A[i0] * B[i] - A[i] * B[i0];
         if (det == 0.0f) { ox[i] = xc[i]; oy[i] = yc[i]; continue; }
-        ox[i] = (C[i0] * B[i] - C[i] * B[i0]) / det;
-        oy[i] = (A[i0] * C[i] - A[i] * C[i0]) / det;
+        double x = (C[i0] * B[i] - C[i] * B[i0]) / det;
+        double y = (A[i0] * C[i] - A[i] * C[i0]) / det;
+        if (!isfinite(x) || !isfinite(y) || fabs(x) > FLT_MAX || fabs(y) > FLT_MAX) return 0;
+        ox[i] = (float)x; oy[i] = (float)y;
     }
+    return 1;
 }
 
 /* Porter-Duff 混合 → glBlendFuncSeparate 因子表（方程均 ADD，颜色与
@@ -868,8 +913,9 @@ static neox_result gl_rt_acquire(neox_context *ctx, nx_gl_dev *g,
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
                                   GL_RENDERBUFFER, rt->srb);
     }
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE ||
-        glGetError() != GL_NO_ERROR) {
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    GLenum error = gl_error(g);
+    if (status != GL_FRAMEBUFFER_COMPLETE || error != GL_NO_ERROR) {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         gl_rt_destroy(rt);
         ctx->last_error = "GL framebuffer object incomplete";
@@ -887,7 +933,7 @@ static void gl_rt_release(nx_gl_rt *rt) { rt->in_use = 0; }
 /* ------------------------------------------------------------------ 纹理上传 */
 
 static neox_result gl_tex_ensure(neox_context *ctx, nx_gl_dev *g,
-                                 neox_device *dev, uint32_t idx)
+                                 neox_device *dev, uint32_t idx, const nx_tex_data *data)
 {
     const nx_tex_slot *s = &((nx_tex_slot *)dev->textures.slots)[idx];
     nx_gl_texent *e;
@@ -901,19 +947,36 @@ static neox_result gl_tex_ensure(neox_context *ctx, nx_gl_dev *g,
         g->ntexs = idx + 1;
     }
     e = &g->texs[idx];
-    if (e->id && e->version == s->version) return NEOX_OK;
+    if (e->id && e->generation == s->gen && e->version == data->version) return NEOX_OK;
     if (!e->id) glGenTextures(1, &e->id);
     glBindTexture(GL_TEXTURE_2D, e->id);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    /* 槽位 px 已是内部统一表示（预乘线性 float，§5），RGBA32F 原样上传；
-     * A8 的覆盖率在 .a 通道（glyph shader 采样 .a） */
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, (GLsizei)s->width,
-                 (GLsizei)s->height, 0, GL_RGBA, GL_FLOAT, s->px);
-    e->version = s->version;
+    float *row=NULL;
+    if(!data->linear) {
+        row=nx_alloc(ctx,(size_t)s->width*16,16);
+        if(!row)return NEOX_ERROR_OUT_OF_MEMORY;
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT,4);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,(GLsizei)s->width,(GLsizei)s->height,
+                 0,GL_RGBA,GL_FLOAT,data->linear ? data->pixels : NULL);
+    if(row) {
+        for(uint32_t y=0;y<s->height;y++) {
+            nx_texture_expand_row(s,data,y,row);
+            glTexSubImage2D(GL_TEXTURE_2D,0,0,(GLint)y,(GLsizei)s->width,1,GL_RGBA,GL_FLOAT,row);
+        }
+        nx_free(ctx,row,(size_t)s->width*16,16);
+    }
+    if(gl_error(g)!=GL_NO_ERROR) {
+        e->version=0;
+        NX_ERR(ctx,"GL texture upload failed",NEOX_ERROR_BACKEND);
+    }
+    e->bytes=(uint64_t)s->width*s->height*16;
+    g->stats.pixel_upload_bytes+=e->bytes;
+    e->version = data->version;
+    e->generation = s->gen;
     return NEOX_OK;
 }
 
@@ -935,6 +998,8 @@ static void gl_state_destroy(neox_context *ctx, nx_gl_dev *g)
         gl_prog_free(&g->p_comp);
         gl_prog_free(&g->p_blit);
         gl_prog_free(&g->p_present);
+        gl_prog_free(&g->p_encode);
+        gl_prog_free(&g->p_decode);
         if (g->vao) glDeleteVertexArrays(1, &g->vao);
         if (g->vbo) glDeleteBuffers(1, &g->vbo);
         if (g->snap_tex) glDeleteTextures(1, &g->snap_tex);
@@ -964,7 +1029,7 @@ static void gl_state_destroy(neox_context *ctx, nx_gl_dev *g)
 }
 
 /* 探测 RGBA32F + 模板附件可渲染（本后端正确性前提；Core Profile 规定可混合） */
-static int gl_probe_float_fbo(void)
+static int gl_probe_float_fbo(nx_gl_dev *g)
 {
     GLuint tex, srb, fbo;
     GLint ok;
@@ -978,8 +1043,9 @@ static int gl_probe_float_fbo(void)
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, srb);
-    ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE &&
-         glGetError() == GL_NO_ERROR;
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    GLenum error = gl_error(g);
+    ok = status == GL_FRAMEBUFFER_COMPLETE && error == GL_NO_ERROR;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDeleteFramebuffers(1, &fbo);
     glDeleteRenderbuffers(1, &srb);
@@ -989,7 +1055,7 @@ static int gl_probe_float_fbo(void)
 
 /* 链接一个写出 index=1 的最小程序。查询值不够：有的驱动报了 dual-source
  * 上限，着色器仍链不上。失败不是设备错误，只是关掉 dual 路径。 */
-static int gl_probe_dual(void)
+static int gl_probe_dual(nx_gl_dev *g)
 {
     const char *vs_src =
         "#version 410 core\n"
@@ -1002,9 +1068,9 @@ static int gl_probe_dual(void)
     const char *vss = vs_src, *fss = fs_src;
     GLint n = 0, ok = GL_FALSE;
     GLuint vs, fs, p;
-    glGetError();
+    gl_error(g);
     glGetIntegerv(GL_MAX_DUAL_SOURCE_DRAW_BUFFERS, &n);
-    if (glGetError() != GL_NO_ERROR || n < 1) return 0;
+    if (gl_error(g) != GL_NO_ERROR || n < 1) return 0;
     vs = glCreateShader(GL_VERTEX_SHADER);
     glShaderSource(vs, 1, &vss, NULL);
     glCompileShader(vs);
@@ -1019,7 +1085,7 @@ static int gl_probe_dual(void)
     glDeleteShader(vs);
     glDeleteShader(fs);
     glDeleteProgram(p);
-    glGetError();
+    gl_error(g);
     return ok == GL_TRUE;
 }
 
@@ -1072,6 +1138,12 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
     if (!g) NX_ERR(ctx, "GL backend state allocation failed",
                    NEOX_ERROR_OUT_OF_MEMORY);
     memset(g, 0, sizeof(*g));
+    g->dev = dev;
+    if ((unsigned)gld.output_mode > NEOX_GL_OUTPUT_GPU) {
+        nx_free(ctx,g,sizeof(*g),16);
+        NX_ERR(ctx,"invalid GL output mode",NEOX_ERROR_INVALID_ARGUMENT);
+    }
+    g->output_mode = gld.output_mode;
     g->ctx = nx_gl_ctx_create(platform ? &gld : NULL);
     if (!g->ctx) {
         const char *e = nx_gl_ctx_last_error();
@@ -1095,12 +1167,12 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
         gl_state_destroy(ctx, g);
         NX_ERR(ctx, "OpenGL 4.1 Core not available", NEOX_ERROR_BACKEND);
     }
-    if (!gl_probe_float_fbo()) {
+    if (!gl_probe_float_fbo(g)) {
         gl_state_destroy(ctx, g);
         NX_ERR(ctx, "GL_RGBA32F framebuffer not renderable",
                NEOX_ERROR_BACKEND);
     }
-    g->dual_ok = gl_probe_dual();
+    g->dual_ok = gl_probe_dual(g);
     if (getenv("NEOX_GL_FORCE_NO_DUAL")) g->dual_ok = 0;
     if (getenv("NEOX_GL_LOG")) {
         const GLubyte *rend = glGetString(GL_RENDERER);
@@ -1143,11 +1215,13 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
     NX_BUILD(g->p_comp, NX_GLSL_FS_COMP, "comp");
     NX_BUILD(g->p_present, NX_GLSL_FS_PRESENT, "present");
     NX_BUILD(g->p_blit, NX_GLSL_FS_BLIT, "blit");
+    NX_BUILD(g->p_encode, NX_GLSL_FS_ENCODE, "encode");
+    NX_BUILD(g->p_decode, NX_GLSL_FS_DECODE, "decode");
 #undef NX_BUILD_FS
 #undef NX_BUILD
 #undef NX_BUILD_MODE
     glDeleteShader(vs);
-    if (glGetError() != GL_NO_ERROR) {
+    if (gl_error(g) != GL_NO_ERROR) {
         gl_state_destroy(ctx, g);
         NX_ERR(ctx, "GL program setup failed", NEOX_ERROR_BACKEND);
     }
@@ -1190,6 +1264,21 @@ static void gl_get_caps(neox_device *dev, neox_caps *out_caps)
     out_caps->backend_memory_limit = 0;
 }
 
+static void gl_snapshot_release(void *data) { gl_rt_release((nx_gl_rt *)data); }
+
+static void gl_convert_target(nx_gl_dev *g,nx_gl_prog *program,GLuint src,
+                              GLuint dst,uint32_t w,uint32_t h)
+{
+    glBindFramebuffer(GL_FRAMEBUFFER,dst);
+    glViewport(0,0,(GLsizei)w,(GLsizei)h);
+    glDisable(GL_BLEND);glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_FRAMEBUFFER_SRGB);glDisable(GL_DITHER);
+    glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,src);
+    gl_use(program,2.0f/w,2.0f/h);
+    glUniform1i(program->u_tex,0);glUniform1f(program->u_ss,1.0f);
+    gl_draw_full(g,program,(float)w,(float)h,2.0f/w,2.0f/h);
+}
+
 /* ------------------------------------------------------------------ begin_target
  * 校验表面归属、确定帧尺寸、装载基底（clear = 清屏色；否则快照表面内容，
  * 与 Soft 同样在 frame_begin 期完成，基底统一为预乘线性 float） */
@@ -1212,6 +1301,20 @@ static neox_result gl_begin_target(neox_frame *fr,
     fr->surface = surf;
     fr->width = surf->w;
     fr->height = surf->h;
+    if(g->output_mode==NEOX_GL_OUTPUT_GPU) {
+        nx_gl_rt *snapshot;
+        neox_result result=gl_rt_acquire(ctx,g,fr->width,fr->height,1,&snapshot);
+        if(result!=NEOX_OK)return result;
+        fr->backend_base=(nx_backend_base){snapshot,gl_snapshot_release};
+        if(target->clear) {
+            float p[4];nx_paint_to_premul_linear(*target->clear,p);
+            glBindFramebuffer(GL_FRAMEBUFFER,snapshot->fbo);
+            glDisable(GL_SCISSOR_TEST);
+            glClearColor(p[0],p[1],p[2],p[3]);glClear(GL_COLOR_BUFFER_BIT);
+        } else gl_convert_target(g,&g->p_decode,surf->tex,snapshot->fbo,fr->width,fr->height);
+        if(gl_error(g)!=GL_NO_ERROR)NX_ERR(ctx,"GPU target snapshot failed",NEOX_ERROR_BACKEND);
+        return NEOX_OK;
+    }
     npix = (size_t)fr->width * fr->height;
     fr->base = (float *)nx_alloc(ctx, npix * 4 * sizeof(float), 16);
     if (!fr->base) NX_ERR(ctx, "frame buffer allocation failed",
@@ -1232,9 +1335,10 @@ static neox_result gl_begin_target(neox_frame *fr,
         }
         glBindFramebuffer(GL_FRAMEBUFFER, surf->fbo);
         glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        g->stats.pixel_readback_bytes+=(uint64_t)surf->w*surf->h*4;g->stats.readback_calls++;
         glReadPixels(0, 0, (GLsizei)surf->w, (GLsizei)surf->h,
                      GL_RGBA, GL_UNSIGNED_BYTE, snap);
-        if (glGetError() != GL_NO_ERROR) {
+        if (gl_error(g) != GL_NO_ERROR) {
             nx_free(ctx, snap, npix * 4, 16);
             nx_free(ctx, fr->base, npix * 4 * sizeof(float), 16);
             fr->base = NULL;
@@ -1284,7 +1388,7 @@ static neox_result gl_clamp_layer(neox_context *ctx, nx_gl_dev *g,
     gl_draw_full(g, &g->p_blit, (float)SSW, (float)SSH,
                  2.0f / (float)SSW, 2.0f / (float)SSH);
     gl_rt_release(tmp);
-    if (glGetError() != GL_NO_ERROR) {
+    if (gl_error(g) != GL_NO_ERROR) {
         ctx->last_error = "GL clamp pass failed";
         return NEOX_ERROR_BACKEND;
     }
@@ -1331,6 +1435,11 @@ static neox_result gl_fill_path(neox_device *dev, nx_gl_dev *g,
         if (y > maxy) maxy = y;
     }
     nx_flat_free(ctx, &flat);
+    /* Coverage is already evaluated in target space. Bound the cover quad
+     * before GPU vertex arithmetic and manual-blend integer scissor conversion. */
+    minx = (float)nx_pixel_floor(minx, w); miny = (float)nx_pixel_floor(miny, h);
+    maxx = (float)nx_pixel_ceil(maxx, w); maxy = (float)nx_pixel_ceil(maxy, h);
+    if (maxx <= minx || maxy <= miny) return NEOX_OK;
     nx_paint_to_premul_linear(*color, paint);
 
     nx_gl_rt *prt;
@@ -1378,9 +1487,11 @@ static neox_result gl_fill_path(neox_device *dev, nx_gl_dev *g,
     }
     glBindTexture(GL_TEXTURE_2D, mrt->tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    g->stats.pixel_upload_bytes+=(uint64_t)w*h*4;
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h,
                     GL_RED, GL_FLOAT, g->mask);
     glBindTexture(GL_TEXTURE_2D, prt->tex);
+    g->stats.pixel_upload_bytes+=(uint64_t)w*h*16;
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h,
                     GL_RGBA, GL_FLOAT, g->premul);
     glBindFramebuffer(GL_FRAMEBUFFER, layer->fbo);
@@ -1449,7 +1560,7 @@ static neox_result gl_fill_path(neox_device *dev, nx_gl_dev *g,
                          2.0f / (float)SSW, 2.0f / (float)SSH);
             glDisable(GL_SCISSOR_TEST);
             gl_rt_release(tmp);
-            if (glGetError() != GL_NO_ERROR) {
+            if (gl_error(g) != GL_NO_ERROR) {
                 gl_rt_release(mrt);
                 gl_rt_release(prt);
                 ctx->last_error = manual ? "GL manual fill failed"
@@ -1477,22 +1588,26 @@ static neox_result gl_draw_tex(neox_device *dev, nx_gl_dev *g,
     float xc[4], yc[4];
     neox_affine inv;
     float m3[9];
+    neox_rect sample_dst;
     if (cmd->dst.w == 0.0f || cmd->dst.h == 0.0f) return NEOX_OK;
-    if (nx_affine_det(ctm) == 0.0f) return NEOX_OK; /* §3 退化变换：无输出 */
-    if (!nx_affine_invert(ctm, &inv)) return NEOX_OK;
+    int inverse_status = nx_affine_invert(ctm, &inv);
+    if (!inverse_status) return NEOX_OK;
+    if (inverse_status < 0)
+        NX_ERR(dev->ctx, "inverse transform exceeds numeric range", NEOX_ERROR_INVALID_ARGUMENT);
+    if (!nx_sample_transform(inv,cmd->dst,w,h,&inv,&sample_dst))
+        NX_ERR(dev->ctx, "sampling transform exceeds float range", NEOX_ERROR_UNSUPPORTED);
     /* 环序角点：(x,y) (x+w,y) (x+w,y+h) (x,y+h) */
-    nx_affine_apply(ctm, cmd->dst.x, cmd->dst.y, &xc[0], &yc[0]);
-    nx_affine_apply(ctm, cmd->dst.x + cmd->dst.w, cmd->dst.y, &xc[1], &yc[1]);
-    nx_affine_apply(ctm, cmd->dst.x + cmd->dst.w, cmd->dst.y + cmd->dst.h,
-                    &xc[2], &yc[2]);
-    nx_affine_apply(ctm, cmd->dst.x, cmd->dst.y + cmd->dst.h, &xc[3], &yc[3]);
+    if (!nx_affine_quad(ctm, cmd->dst, xc, yc))
+        NX_ERR(dev->ctx, "transformed texture coordinates exceed numeric range", NEOX_ERROR_INVALID_ARGUMENT);
     /* 两个三角形：(0,1,2) (0,2,3)；几何外扩 0.6px，包含判定在 shader 内
      * 按设备像素中心完成（与参照后端逐位对齐）；负宽高目标矩形镜像由
      * tu/tv 反转自然产生（§8） */
     {
         float q[12], ix[4], iy[4];
         int k;
-        gl_inflate_quad(xc, yc, 0.6f, ix, iy);
+        if (!gl_inflate_quad(xc, yc, 0.6f, ix, iy))
+            NX_ERR(dev->ctx, "inflated geometry exceeds numeric range", NEOX_ERROR_INVALID_ARGUMENT);
+        if (!nx_bound_quad(ix,iy,w,h)) return NEOX_OK;
         for (k = 0; k < 4; k++) {
             ix[k] *= NEOX_GL_SS;
             iy[k] *= NEOX_GL_SS;
@@ -1508,7 +1623,7 @@ static neox_result gl_draw_tex(neox_device *dev, nx_gl_dev *g,
         /* 上传/获取纹理对象（槽位 px 已是内部统一表示） */
         {
             uint32_t idx = (uint32_t)(tx - (const nx_tex_slot *)dev->textures.slots);
-            neox_result r = gl_tex_ensure(dev->ctx, g, dev, idx);
+            neox_result r = gl_tex_ensure(dev->ctx, g, dev, idx, cmd->texture);
             if (r != NEOX_OK) return r;
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, g->texs[idx].id);
@@ -1524,8 +1639,8 @@ static neox_result gl_draw_tex(neox_device *dev, nx_gl_dev *g,
     glUniformMatrix3fv(g->p_tex.u_inv, 1, GL_FALSE, m3);
     glUniform4f(g->p_tex.u_src, cmd->src.x, cmd->src.y,
                 cmd->src.w, cmd->src.h);
-    glUniform4f(g->p_tex.u_dst, cmd->dst.x, cmd->dst.y,
-                cmd->dst.w, cmd->dst.h);
+    glUniform4f(g->p_tex.u_dst, sample_dst.x, sample_dst.y,
+                sample_dst.w, sample_dst.h);
     glUniform1f(g->p_tex.u_ss, (GLfloat)NEOX_GL_SS);
     glUniform1f(g->p_tex.u_opacity, cmd->tex_opacity);
     glUniform1i(g->p_tex.u_mode, (GLint)blend);
@@ -1543,8 +1658,9 @@ static neox_result gl_draw_tex(neox_device *dev, nx_gl_dev *g,
             if (iy[ti] < by0) by0 = iy[ti];
             if (iy[ti] > by1) by1 = iy[ti];
         }
-        rx0 = floorf(bx0); ry0 = floorf(by0);
-        rx1 = ceilf(bx1);  ry1 = ceilf(by1);
+        rx0 = (float)nx_pixel_floor(bx0, SSW); ry0 = (float)nx_pixel_floor(by0, SSH);
+        rx1 = (float)nx_pixel_ceil(bx1, SSW); ry1 = (float)nx_pixel_ceil(by1, SSH);
+        if (rx1 <= rx0 || ry1 <= ry0) return NEOX_OK;
         rq[0] = rx0; rq[1] = ry0; rq[2] = rx1; rq[3] = ry0; rq[4] = rx1; rq[5] = ry1;
         rq[6] = rx0; rq[7] = ry0; rq[8] = rx1; rq[9] = ry1; rq[10] = rx0; rq[11] = ry1;
         tr = gl_rt_acquire(dev->ctx, g, SSW, SSH, 1, &tmp);
@@ -1564,7 +1680,7 @@ static neox_result gl_draw_tex(neox_device *dev, nx_gl_dev *g,
         glUniform1i(g->p_manualtex.u_linear, cmd->filter == NEOX_FILTER_LINEAR ? 1 : 0);
         glUniformMatrix3fv(g->p_manualtex.u_inv, 1, GL_FALSE, m3);
         glUniform4f(g->p_manualtex.u_src, cmd->src.x, cmd->src.y, cmd->src.w, cmd->src.h);
-        glUniform4f(g->p_manualtex.u_dst, cmd->dst.x, cmd->dst.y, cmd->dst.w, cmd->dst.h);
+        glUniform4f(g->p_manualtex.u_dst, sample_dst.x, sample_dst.y, sample_dst.w, sample_dst.h);
         glUniform1f(g->p_manualtex.u_ss, (GLfloat)NEOX_GL_SS);
         glUniform1f(g->p_manualtex.u_opacity, cmd->tex_opacity);
         glUniform1i(g->p_manualtex.u_mode, (GLint)blend);
@@ -1582,7 +1698,7 @@ static neox_result gl_draw_tex(neox_device *dev, nx_gl_dev *g,
                      2.0f / (float)SSW, 2.0f / (float)SSH);
         glDisable(GL_SCISSOR_TEST);
         gl_rt_release(tmp);
-        if (glGetError() != GL_NO_ERROR) {
+        if (gl_error(g) != GL_NO_ERROR) {
             dev->ctx->last_error = "GL manual texture draw failed";
             return NEOX_ERROR_BACKEND;
         }
@@ -1607,16 +1723,19 @@ static neox_result gl_draw_glyphs(neox_device *dev, nx_gl_dev *g,
     float m3[9], paint[4];
     uint32_t gi, idx;
     neox_result r;
-    if (nx_affine_det(ctm) == 0.0f) return NEOX_OK; /* §3 */
-    if (!nx_affine_invert(ctm, &inv)) return NEOX_OK;
+    int inverse_status = nx_affine_invert(ctm, &inv);
+    if (!inverse_status) return NEOX_OK;
+    if (inverse_status < 0)
+        NX_ERR(dev->ctx, "inverse transform exceeds numeric range", NEOX_ERROR_INVALID_ARGUMENT);
+    neox_affine uploaded=inv;
     nx_paint_to_premul_linear(cmd->color, paint);
-    m3[0] = inv.a;  m3[1] = inv.b;  m3[2] = 0.0f;
-    m3[3] = inv.c;  m3[4] = inv.d;  m3[5] = 0.0f;
-    m3[6] = inv.tx; m3[7] = inv.ty; m3[8] = 1.0f;
+    m3[0]=inv.a;m3[1]=inv.b;m3[2]=0;
+    m3[3]=inv.c;m3[4]=inv.d;m3[5]=0;
+    m3[6]=inv.tx;m3[7]=inv.ty;m3[8]=1;
     glBindFramebuffer(GL_FRAMEBUFFER, layer->fbo);
     glViewport(0, 0, (GLsizei)SSW, (GLsizei)SSH);
     idx = (uint32_t)(at - (const nx_tex_slot *)dev->textures.slots);
-    r = gl_tex_ensure(dev->ctx, g, dev, idx);
+    r = gl_tex_ensure(dev->ctx, g, dev, idx, cmd->texture);
     if (r != NEOX_OK) return r;
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g->texs[idx].id);
@@ -1646,12 +1765,18 @@ static neox_result gl_draw_glyphs(neox_device *dev, nx_gl_dev *g,
         float gx0, gy0, gx1, gy1;
         int k;
         if (gw == 0.0f || gh == 0.0f) continue;
+        neox_affine sampling;neox_rect local;
+        if (!nx_sample_transform(inv,(neox_rect){gl2->x,gl2->y,gw,gh},w,h,&sampling,&local))
+            NX_ERR(dev->ctx, "sampling transform exceeds float range", NEOX_ERROR_UNSUPPORTED);
+        m3[0]=sampling.a;m3[1]=sampling.b;m3[2]=0;
+        m3[3]=sampling.c;m3[4]=sampling.d;m3[5]=0;
+        m3[6]=sampling.tx;m3[7]=sampling.ty;m3[8]=1;
         /* 环序角点（同 gl_draw_tex） */
-        nx_affine_apply(ctm, gl2->x, gl2->y, &xc[0], &yc[0]);
-        nx_affine_apply(ctm, gl2->x + gw, gl2->y, &xc[1], &yc[1]);
-        nx_affine_apply(ctm, gl2->x + gw, gl2->y + gh, &xc[2], &yc[2]);
-        nx_affine_apply(ctm, gl2->x, gl2->y + gh, &xc[3], &yc[3]);
-        gl_inflate_quad(xc, yc, 0.6f, ix, iy);
+        if (!nx_affine_quad(ctm, (neox_rect){gl2->x,gl2->y,gw,gh}, xc, yc))
+            NX_ERR(dev->ctx, "transformed glyph coordinates exceed numeric range", NEOX_ERROR_INVALID_ARGUMENT);
+        if (!gl_inflate_quad(xc, yc, 0.6f, ix, iy))
+            NX_ERR(dev->ctx, "inflated geometry exceeds numeric range", NEOX_ERROR_INVALID_ARGUMENT);
+        if (!nx_bound_quad(ix,iy,w,h)) continue;
         gx0 = floorf(ix[0]); gy0 = floorf(iy[0]);
         gx1 = ceilf(ix[2]);  gy1 = ceilf(iy[2]);
         /* 保守 device bbox（inflate 后角点未必有序，取全角点范围） */
@@ -1663,8 +1788,8 @@ static neox_result gl_draw_glyphs(neox_device *dev, nx_gl_dev *g,
                 if (iy[k] < by0) by0 = iy[k];
                 if (iy[k] > by1) by1 = iy[k];
             }
-            gx0 = floorf(bx0); gy0 = floorf(by0);
-            gx1 = ceilf(bx1);  gy1 = ceilf(by1);
+            gx0 = (float)nx_pixel_floor(bx0,w); gy0 = (float)nx_pixel_floor(by0,h);
+            gx1 = (float)nx_pixel_ceil(bx1,w); gy1 = (float)nx_pixel_ceil(by1,h);
         }
         for (k = 0; k < 4; k++) {
             ix[k] *= NEOX_GL_SS;
@@ -1687,7 +1812,7 @@ static neox_result gl_draw_glyphs(neox_device *dev, nx_gl_dev *g,
             const float *dv = q;
             r = gl_rt_acquire(dev->ctx, g, SSW, SSH, 1, &tmp);
             if (r != NEOX_OK) return r;
-            if (manual) {
+            { /* PLUS and manual blend both initialize the whole copied AABB. */
                 float rx0 = gx0 * (float)NEOX_GL_SS, ry0 = gy0 * (float)NEOX_GL_SS;
                 float rx1 = gx1 * (float)NEOX_GL_SS, ry1 = gy1 * (float)NEOX_GL_SS;
                 rq[0] = rx0; rq[1] = ry0; rq[2] = rx1; rq[3] = ry0; rq[4] = rx1; rq[5] = ry1;
@@ -1706,9 +1831,9 @@ static neox_result gl_draw_glyphs(neox_device *dev, nx_gl_dev *g,
             glActiveTexture(GL_TEXTURE0);
             glUniform4f(prog->u_color, paint[0], paint[1], paint[2], paint[3]);
             glUniformMatrix3fv(prog->u_inv, 1, GL_FALSE, m3);
-            glUniform4f(prog->u_glyph, gl2->x, gl2->y, gw, gh);
+            glUniform4f(prog->u_glyph, local.x, local.y, local.w, local.h);
             glUniform4f(prog->u_atlas_rect, (GLfloat)gl2->sx,
-                        (GLfloat)gl2->sy, gw, gh);
+                        (GLfloat)gl2->sy, gw/local.w, gh/local.h);
             glUniform1f(prog->u_ss, (GLfloat)NEOX_GL_SS);
             if (manual) glUniform1i(prog->u_mode, (GLint)blend);
             {
@@ -1738,15 +1863,20 @@ static neox_result gl_draw_glyphs(neox_device *dev, nx_gl_dev *g,
                          2.0f / (float)SSW, 2.0f / (float)SSH);
             glDisable(GL_SCISSOR_TEST);
             gl_rt_release(tmp);
-            if (glGetError() != GL_NO_ERROR) {
+            if (gl_error(g) != GL_NO_ERROR) {
                 dev->ctx->last_error = manual ? "GL manual glyph failed"
                                               : "GL PLUS glyph failed";
                 return NEOX_ERROR_BACKEND;
             }
         } else {
-            glUniform4f(g->p_glyph.u_glyph, gl2->x, gl2->y, gw, gh);
+            /* Ordinary glyph batches keep their single matrix upload. */
+            if (memcmp(&uploaded,&sampling,sizeof(uploaded))) {
+                glUniformMatrix3fv(g->p_glyph.u_inv, 1, GL_FALSE, m3);
+                uploaded=sampling;
+            }
+            glUniform4f(g->p_glyph.u_glyph, local.x, local.y, local.w, local.h);
             glUniform4f(g->p_glyph.u_atlas_rect, (GLfloat)gl2->sx, (GLfloat)gl2->sy,
-                        gw, gh);
+                        gw/local.w, gh/local.h);
             gl_draw(g, q, 6);
         }
     }
@@ -1807,6 +1937,7 @@ static neox_result gl_load_base(neox_context *ctx, nx_gl_dev *g,
     }
     glBindTexture(GL_TEXTURE_2D, g->snap_tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    g->stats.pixel_upload_bytes+=(uint64_t)w*h*16;
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h,
                     GL_RGBA, GL_FLOAT, base);
     glBindFramebuffer(GL_FRAMEBUFFER, layer->fbo);
@@ -1848,8 +1979,9 @@ static neox_result gl_resolve(neox_context *ctx, nx_gl_dev *g,
     }
     glBindFramebuffer(GL_READ_FRAMEBUFFER, base->fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    g->stats.pixel_readback_bytes+=(uint64_t)SSW*SSH*16;g->stats.readback_calls++;
     glReadPixels(0, 0, (GLsizei)SSW, (GLsizei)SSH, GL_RGBA, GL_FLOAT, ss);
-    if (glGetError() != GL_NO_ERROR) {
+    if (gl_error(g) != GL_NO_ERROR) {
         ctx->last_error = "GL SS layer readback failed";
         r = NEOX_ERROR_BACKEND;
         goto done;
@@ -1876,9 +2008,10 @@ static neox_result gl_resolve(neox_context *ctx, nx_gl_dev *g,
     }
     glBindTexture(GL_TEXTURE_2D, surf->tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    g->stats.pixel_upload_bytes+=(uint64_t)W*H*4;
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)W, (GLsizei)H,
                     GL_RGBA, GL_UNSIGNED_BYTE, out);
-    if (glGetError() != GL_NO_ERROR) {
+    if (gl_error(g) != GL_NO_ERROR) {
         ctx->last_error = "GL surface write failed";
         r = NEOX_ERROR_BACKEND;
     }
@@ -1897,6 +2030,7 @@ done:
 static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
 {
     neox_context *ctx = dev->ctx;
+    nx_execution_clips execution_clips = {0};
     nx_gl_dev *g = (nx_gl_dev *)dev->bstate;
     neox_gl_surface *surf = (neox_gl_surface *)sub->surface;
     uint32_t W = sub->width, H = sub->height;
@@ -1907,7 +2041,6 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
     uint32_t nlayers = 0, caplayers = 0;
     nx_gl_rt **clips = NULL;
     uint32_t nclips = 0, capclips = 0;
-    uint32_t max_layers = 1;
     uint32_t i;
     neox_result r = NEOX_ERROR_OUT_OF_MEMORY;
 
@@ -1920,7 +2053,8 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
         ctx->last_error = "GL: could not make context current";
         return NEOX_ERROR_BACKEND;
     }
-    glGetError(); /* 清粘滞错误 */
+    gl_error(g); /* Observe loss before clearing ordinary sticky errors. */
+    if (nx_device_check_live(dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glDisable(GL_SCISSOR_TEST);
@@ -1951,11 +2085,16 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
         nstk = 1;
     }
     /* 基底：清屏色或快照内容 → 基底层 */
-    r = gl_load_base(ctx, g, sub->accum, W, H, layers[0]);
+    if(g->output_mode==NEOX_GL_OUTPUT_GPU) {
+        const nx_gl_rt *snapshot=sub->backend_base.data;
+        gl_convert_target(g,&g->p_blit,snapshot->tex,layers[0]->fbo,W,H);
+        sub->report.flags |= NEOX_EXEC_USED_APPROXIMATION;
+        r=gl_error(g)==GL_NO_ERROR ? NEOX_OK : NEOX_ERROR_BACKEND;
+    } else r = gl_load_base(ctx, g, sub->accum, W, H, layers[0]);
     if (r != NEOX_OK) goto cleanup;
 
 #define GL_CHECK(msg) do { \
-        if (glGetError() != GL_NO_ERROR) { \
+        if (gl_error(g) != GL_NO_ERROR) { \
             ctx->last_error = (msg); \
             r = NEOX_ERROR_BACKEND; \
             goto cleanup; \
@@ -1986,7 +2125,6 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
                 layers[nlayers] = lb;
                 layer_idx = (int32_t)nlayers;
                 nlayers++;
-                if (nlayers > max_layers) max_layers = nlayers;
                 /* 隔离层清零（透明黑） */
                 glBindFramebuffer(GL_FRAMEBUFFER, lb->fbo);
                 glViewport(0, 0, (GLsizei)SSW, (GLsizei)SSH);
@@ -2009,7 +2147,8 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
             stk[nstk].ctm = c->ctm;
             stk[nstk].opacity = c->opacity;
             stk[nstk].blend = c->blend;
-            stk[nstk].clip = c->clip_mask;
+            r = nx_execution_clip_push(dev, &execution_clips, c, sub->width, sub->height, &stk[nstk].clip);
+            if (r != NEOX_OK) goto cleanup;
             stk[nstk].layer = layer_idx;
             nstk++;
             break;
@@ -2025,6 +2164,7 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
                     if (r != NEOX_OK) goto cleanup;
                     glBindTexture(GL_TEXTURE_2D, clip_rt->tex);
                     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+                    g->stats.pixel_upload_bytes+=(uint64_t)W*H*4;
                     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)W, (GLsizei)H,
                                     GL_RED, GL_FLOAT, top2->clip);
                     nc = (nx_gl_rt **)nx_array_grow(ctx, clips, sizeof(nx_gl_rt *),
@@ -2049,6 +2189,7 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
                 gl_rt_release(layers[top2->layer]);
                 nlayers--;
             }
+            if (top2->clip) nx_execution_clip_pop(ctx, &execution_clips);
             nstk--;
             break;
         }
@@ -2086,15 +2227,19 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
         }
     }
     /* 成功路径的最后一步才触碰表面（§10.1 原子性） */
-    r = gl_resolve(ctx, g, layers[0], surf);
+    if(g->output_mode==NEOX_GL_OUTPUT_GPU) {
+        gl_convert_target(g,&g->p_encode,layers[0]->tex,surf->fbo,W,H);
+        r=gl_error(g)==GL_NO_ERROR ? NEOX_OK : NEOX_ERROR_BACKEND;
+    } else r = gl_resolve(ctx, g, layers[0], surf);
     if (r != NEOX_OK) goto cleanup;
     glFlush(); /* pump 即执行：提交至 GL；同步点用 glFinish（最小实现允许阻塞） */
+    g->stats.finish_calls++;
     glFinish();
     GL_CHECK("GL error during resolve");
-    sub->report.peak_bytes = (uint64_t)max_layers * (uint64_t)SSW * SSH * 16u;
     r = NEOX_OK;
 
 cleanup:
+    nx_execution_clips_destroy(ctx, &execution_clips);
     /* 释放执行期占用的层（返回池内空闲） */
     {
         uint32_t k;
@@ -2125,23 +2270,24 @@ neox_result neox_gl_surface_create(neox_device *dev,
     neox_gl_surface **ns;
     if (!dev || !out_surface) return NEOX_ERROR_INVALID_ARGUMENT;
     *out_surface = NULL;
-    if (dev->kind != NEOX_BACKEND_GPU) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (dev->vt != nx_backend_gl()) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (nx_device_check_live(dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
     ctx = dev->ctx;
     g = (nx_gl_dev *)dev->bstate;
     if (width == 0 || height == 0 || width > g->max_tex || height > g->max_tex)
         NX_ERR(ctx, "invalid surface size", NEOX_ERROR_INVALID_ARGUMENT);
     if (!gl_make_current(g))
-        NX_ERR(ctx, "GL: could not make context current", NEOX_ERROR_BACKEND);
+        NX_ERR(ctx, "GL: could not make context current", gl_failure(g));
     s = (neox_gl_surface *)nx_alloc(ctx, sizeof(neox_gl_surface), 16);
     if (!s) NX_ERR(ctx, "surface allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
     memset(s, 0, sizeof(*s));
     s->dev = dev;
     if (!gl_surface_alloc_color(s, width, height)) {
         nx_free(ctx, s, sizeof(neox_gl_surface), 16);
-        NX_ERR(ctx, "GL surface framebuffer incomplete", NEOX_ERROR_BACKEND);
+        NX_ERR(ctx, "GL surface framebuffer incomplete", gl_failure(g));
     }
     ns = (neox_gl_surface **)nx_array_grow(ctx, g->surfs, sizeof(void *),
-                                           &g->capsurfs, g->nsurfs + 1);
+                                           &g->capsurfs, (uint64_t)g->nsurfs + 1);
     if (!ns) {
         gl_surface_release_color(s);
         nx_free(ctx, s, sizeof(neox_gl_surface), 16);
@@ -2164,6 +2310,7 @@ static void gl_surface_release_color(neox_gl_surface *surface)
 
 static int gl_surface_alloc_color(neox_gl_surface *surface, uint32_t w, uint32_t h)
 {
+    nx_gl_dev *g = surface->dev->bstate;
     glGenTextures(1, &surface->tex);
     glBindTexture(GL_TEXTURE_2D, surface->tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -2176,8 +2323,9 @@ static int gl_surface_alloc_color(neox_gl_surface *surface, uint32_t w, uint32_t
     glBindFramebuffer(GL_FRAMEBUFFER, surface->fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                            GL_TEXTURE_2D, surface->tex, 0);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE ||
-        glGetError() != GL_NO_ERROR) {
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    GLenum error = gl_error(g);
+    if (status != GL_FRAMEBUFFER_COMPLETE || error != GL_NO_ERROR) {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         gl_surface_release_color(surface);
         return 0;
@@ -2193,6 +2341,10 @@ void neox_gl_surface_destroy(neox_device *dev, neox_gl_surface *surface)
     nx_gl_dev *g;
     uint32_t i;
     if (!dev || !surface) return;
+    if (dev->vt != nx_backend_gl() || surface->dev != dev) {
+        dev->ctx->last_error = "GL surface destruction requires its owning GL device";
+        return;
+    }
     g = (nx_gl_dev *)dev->bstate;
     if (!g) return;
     if (gl_make_current(g))
@@ -2216,17 +2368,19 @@ neox_result neox_gl_surface_read_pixels(neox_gl_surface *surface,
                                         uint8_t *out_pixels)
 {
     if (!surface || !out_pixels) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (nx_device_check_live(surface->dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
     {
         nx_gl_dev *g = (nx_gl_dev *)surface->dev->bstate;
         if (!g || !gl_make_current(g))
-            return NEOX_ERROR_BACKEND;
+            return gl_failure(g);
         glBindFramebuffer(GL_FRAMEBUFFER, surface->fbo);
         glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        g->stats.pixel_readback_bytes+=(uint64_t)surface->w*surface->h*4;g->stats.readback_calls++;
         glReadPixels(0, 0, (GLsizei)surface->w, (GLsizei)surface->h,
                      GL_RGBA, GL_UNSIGNED_BYTE, out_pixels);
-        if (glGetError() != GL_NO_ERROR) {
+        if (gl_error(g) != GL_NO_ERROR) {
             surface->dev->ctx->last_error = "GL surface readback failed";
-            return NEOX_ERROR_BACKEND;
+            return gl_failure(g);
         }
     }
     return NEOX_OK;
@@ -2238,7 +2392,7 @@ static neox_result gl_surface_track(neox_device *dev, neox_gl_surface *s)
     nx_gl_dev *g = (nx_gl_dev *)dev->bstate;
     neox_gl_surface **ns =
         (neox_gl_surface **)nx_array_grow(ctx, g->surfs, sizeof(void *),
-                                          &g->capsurfs, g->nsurfs + 1);
+                                          &g->capsurfs, (uint64_t)g->nsurfs + 1);
     if (!ns) return NEOX_ERROR_OUT_OF_MEMORY;
     g->surfs = ns;
     g->surfs[g->nsurfs++] = s;
@@ -2263,7 +2417,8 @@ neox_result neox_gl_surface_create_window(neox_device *dev,
     if (!desc->native_window)
         NX_ERR(ctx, "window surface requires a native window",
                NEOX_ERROR_INVALID_ARGUMENT);
-    if (dev->kind != NEOX_BACKEND_GPU) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (dev->vt != nx_backend_gl()) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (nx_device_check_live(dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
     g = (nx_gl_dev *)dev->bstate;
     if (!g || !nx_gl_ctx_can_window(g->ctx))
         NX_ERR(ctx, "GL device was not created on a window display",
@@ -2272,7 +2427,7 @@ neox_result neox_gl_surface_create_window(neox_device *dev,
         desc->width > g->max_tex || desc->height > g->max_tex)
         NX_ERR(ctx, "invalid window surface size", NEOX_ERROR_INVALID_ARGUMENT);
     if (!gl_make_current(g))
-        NX_ERR(ctx, "GL: could not make context current", NEOX_ERROR_BACKEND);
+        NX_ERR(ctx, "GL: could not make context current", gl_failure(g));
     s = (neox_gl_surface *)nx_alloc(ctx, sizeof(*s), 16);
     if (!s) NX_ERR(ctx, "surface allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
     memset(s, 0, sizeof(*s));
@@ -2281,21 +2436,21 @@ neox_result neox_gl_surface_create_window(neox_device *dev,
     s->vsync = desc->vsync ? 1 : 0;
     if (!gl_surface_alloc_color(s, desc->width, desc->height)) {
         nx_free(ctx, s, sizeof(*s), 16);
-        NX_ERR(ctx, "GL surface framebuffer incomplete", NEOX_ERROR_BACKEND);
+        NX_ERR(ctx, "GL surface framebuffer incomplete", gl_failure(g));
     }
     s->win_egl = nx_gl_ctx_window_surface(g->ctx, desc->native_window, s->vsync);
     if (!s->win_egl) {
         const char *e = nx_gl_ctx_last_error();
         gl_surface_release_color(s);
         nx_free(ctx, s, sizeof(*s), 16);
-        NX_ERR(ctx, e ? e : "EGL window surface failed", NEOX_ERROR_BACKEND);
+        NX_ERR(ctx, e ? e : "EGL window surface failed", gl_failure(g));
     }
     /* 离屏绘制仍绑 FBO；把 current 从窗口表面换回辅助表面。 */
-    if (!nx_gl_ctx_make_current(g->ctx)) {
+    if (!gl_make_current(g)) {
         nx_gl_ctx_window_destroy(g->ctx, s->win_egl);
         gl_surface_release_color(s);
         nx_free(ctx, s, sizeof(*s), 16);
-        NX_ERR(ctx, "GL: could not restore offscreen current", NEOX_ERROR_BACKEND);
+        NX_ERR(ctx, "GL: could not restore offscreen current", gl_failure(g));
     }
     tr = gl_surface_track(dev, s);
     if (tr != NEOX_OK) {
@@ -2313,33 +2468,53 @@ neox_result neox_gl_surface_resize(neox_gl_surface *surface,
 {
     nx_gl_dev *g;
     neox_context *ctx;
-    void *win;
+    neox_gl_surface replacement = {0};
     if (!surface || !surface->dev) return NEOX_ERROR_INVALID_ARGUMENT;
+    neox_device *dev = surface->dev;
+    if (nx_device_check_live(dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
     if (width == surface->w && height == surface->h) return NEOX_OK;
-    g = (nx_gl_dev *)surface->dev->bstate;
-    ctx = surface->dev->ctx;
-    if (!g) return NEOX_ERROR_BACKEND;
+    g = (nx_gl_dev *)dev->bstate;
+    ctx = dev->ctx;
+    if (!g) return gl_failure(g);
     if (width == 0 || height == 0 || width > g->max_tex || height > g->max_tex)
-        NX_ERR(ctx, "invalid window surface size", NEOX_ERROR_INVALID_ARGUMENT);
+        NX_ERR(ctx, "invalid surface size", NEOX_ERROR_INVALID_ARGUMENT);
+    if (dev->active_frame && dev->active_frame->surface == surface)
+        NX_ERR(ctx, "surface resize during active recording", NEOX_ERROR_INVALID_ARGUMENT);
+    for (uint32_t i = 0; i < dev->pending_count; i++) {
+        nx_sub_slot *sub = &((nx_sub_slot *)dev->subs.slots)[dev->pending[i]];
+        if (sub->surface == surface && sub->status == NEOX_SUBMISSION_PENDING)
+            NX_ERR(ctx, "surface resize with pending work", NEOX_ERROR_INVALID_ARGUMENT);
+    }
     if (!gl_make_current(g))
-        NX_ERR(ctx, "GL: could not make context current", NEOX_ERROR_BACKEND);
+        NX_ERR(ctx, "GL: could not make context current", gl_failure(g));
+    /* Allocate independently: a recoverable GL failure must leave the original
+     * target and any captured presentation available for retry. */
+    replacement.dev = dev;
+    if (!gl_surface_alloc_color(&replacement, width, height))
+        NX_ERR(ctx, "GL surface resize failed", gl_failure(g));
     gl_surface_release_color(surface);
     if (surface->presented) {
         nx_free(ctx, surface->presented, (size_t)surface->w * surface->h * 4, 16);
         surface->presented = NULL;
     }
-    if (!gl_surface_alloc_color(surface, width, height))
-        NX_ERR(ctx, "GL surface resize failed", NEOX_ERROR_BACKEND);
-    if (!surface->win_egl) return NEOX_OK;
-    win = surface->native_window;
-    nx_gl_ctx_window_destroy(g->ctx, surface->win_egl);
-    surface->win_egl = nx_gl_ctx_window_surface(g->ctx, win, surface->vsync);
-    if (!nx_gl_ctx_make_current(g->ctx))
-        NX_ERR(ctx, "GL: could not restore offscreen current", NEOX_ERROR_BACKEND);
-    if (!surface->win_egl) {
-        const char *e = nx_gl_ctx_last_error();
-        NX_ERR(ctx, e ? e : "EGL window surface resize failed", NEOX_ERROR_BACKEND);
-    }
+    surface->presented_valid = 0;
+    surface->fbo = replacement.fbo;
+    surface->tex = replacement.tex;
+    surface->w = width;
+    surface->h = height;
+    /* Native adapters resize X11/wl_egl_window first. EGL updates the window
+     * surface at swap (EGL 1.5 sections 3.5.1, 3.10.1); retaining its identity
+     * avoids a destructive destroy/recreate step and EGL_BAD_ALLOC on duplicate
+     * native-window associations. The new color attachment is uninitialized. */
+    return NEOX_OK;
+}
+
+neox_result neox_gl_surface_request_readback(neox_gl_surface *surface)
+{
+    if (!surface || !surface->dev) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (nx_device_check_live(surface->dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
+    if (!surface->win_egl) return NEOX_ERROR_UNSUPPORTED;
+    surface->capture_next = 1;
     return NEOX_OK;
 }
 
@@ -2347,18 +2522,26 @@ neox_result neox_gl_surface_present(neox_gl_surface *surface)
 {
     nx_gl_dev *g;
     neox_context *ctx;
-    uint32_t w, h, y;
-    uint8_t *raw, *dst;
+    uint32_t w, h;
+    neox_result result = NEOX_OK;
     float v[6];
     if (!surface || !surface->dev) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (nx_device_check_live(surface->dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
     if (!surface->win_egl) return NEOX_ERROR_UNSUPPORTED;
     g = (nx_gl_dev *)surface->dev->bstate;
     ctx = surface->dev->ctx;
-    if (!g || !g->p_present.id) return NEOX_ERROR_BACKEND;
-    w = surface->w;
-    h = surface->h;
+    if (!g || !g->p_present.id) return gl_failure(g);
+    w = surface->w; h = surface->h;
+    surface->presented_valid = 0;
+    /* Normal presentation allocates nothing and performs no CPU readback.
+     * Snapshot storage is retained until resize/destroy and reused on demand. */
+    if (surface->capture_next && !surface->presented) {
+        surface->presented = nx_alloc(ctx,(size_t)w*h*4,16);
+        if (!surface->presented)
+            NX_ERR(ctx,"snapshot allocation failed",NEOX_ERROR_OUT_OF_MEMORY);
+    }
     if (!nx_gl_ctx_window_make_current(g->ctx, surface->win_egl))
-        NX_ERR(ctx, "GL: could not make window current", NEOX_ERROR_BACKEND);
+        NX_ERR(ctx,"GL: could not make window current",gl_failure(g));
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, (GLsizei)w, (GLsizei)h);
     glDisable(GL_BLEND);
@@ -2373,41 +2556,43 @@ neox_result neox_gl_surface_present(neox_gl_surface *surface)
     v[2] = 2.0f * (float)w; v[3] = 0.0f;
     v[4] = 0.0f; v[5] = 2.0f * (float)h;
     gl_draw(g, v, 3);
-    raw = (uint8_t *)nx_alloc(ctx, (size_t)w * h * 4, 16);
-    dst = (uint8_t *)nx_alloc(ctx, (size_t)w * h * 4, 16);
-    if (!raw || !dst) {
-        if (raw) nx_free(ctx, raw, (size_t)w * h * 4, 16);
-        if (dst) nx_free(ctx, dst, (size_t)w * h * 4, 16);
-        NX_ERR(ctx, "present readback allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
+    if (surface->capture_next) {
+        glPixelStorei(GL_PACK_ALIGNMENT,4);
+        g->stats.pixel_readback_bytes+=(uint64_t)w*h*4;g->stats.readback_calls++;
+        glReadPixels(0,0,(GLsizei)w,(GLsizei)h,GL_RGBA,GL_UNSIGNED_BYTE,surface->presented);
+        /* In-place row reversal needs no second full-window allocation. */
+        for (uint32_t y=0;y<h/2;y++) {
+            uint8_t *top=surface->presented+(size_t)y*w*4;
+            uint8_t *bottom=surface->presented+(size_t)(h-1-y)*w*4;
+            for (size_t x=0;x<(size_t)w*4;x++) {
+                uint8_t tmp=top[x];top[x]=bottom[x];bottom[x]=tmp;
+            }
+        }
     }
-    glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, raw);
-    if (glGetError() != GL_NO_ERROR) {
-        nx_free(ctx, raw, (size_t)w * h * 4, 16);
-        nx_free(ctx, dst, (size_t)w * h * 4, 16);
-        NX_ERR(ctx, "GL window readback failed", NEOX_ERROR_BACKEND);
+    if (gl_error(g)!=GL_NO_ERROR) {
+        ctx->last_error="GL window presentation failed";
+        result=gl_failure(g);
+    } else {
+        if (!nx_gl_ctx_window_swap(g->ctx,surface->win_egl)) {
+            ctx->last_error="EGL window swap failed";
+            result=gl_failure(g);
+        } else {
+            surface->presented_valid=surface->capture_next;
+            surface->capture_next=0;
+        }
     }
-    /* glReadPixels 底行在前；翻转成左上原点，与表面 read_pixels 同向。 */
-    for (y = 0; y < h; y++)
-        memcpy(dst + (size_t)y * w * 4,
-               raw + (size_t)(h - 1 - y) * w * 4,
-               (size_t)w * 4);
-    nx_free(ctx, raw, (size_t)w * h * 4, 16);
-    if (surface->presented)
-        nx_free(ctx, surface->presented, (size_t)w * h * 4, 16);
-    surface->presented = dst;
-    glFinish();
-    nx_gl_ctx_window_swap(g->ctx, surface->win_egl);
-    if (!nx_gl_ctx_make_current(g->ctx))
-        NX_ERR(ctx, "GL: could not restore offscreen current", NEOX_ERROR_BACKEND);
-    return NEOX_OK;
+    /* Restore even on readback/draw failure so later rendering can recover. */
+    if (!gl_make_current(g))
+        NX_ERR(ctx,"GL: could not restore offscreen current",gl_failure(g));
+    return result;
 }
 
 neox_result neox_gl_surface_read_presented(neox_gl_surface *surface,
                                            uint8_t *out_pixels)
 {
     if (!surface || !out_pixels) return NEOX_ERROR_INVALID_ARGUMENT;
-    if (!surface->presented) return NEOX_ERROR_UNSUPPORTED;
+    if (nx_device_check_live(surface->dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
+    if (!surface->presented_valid) return NEOX_ERROR_UNSUPPORTED;
     memcpy(out_pixels, surface->presented, (size_t)surface->w * surface->h * 4);
     return NEOX_OK;
 }
@@ -2417,11 +2602,40 @@ neox_result neox_gl_device_native_visual(neox_device *dev, uint32_t *out_visual_
     nx_gl_dev *g;
     unsigned long id = 0;
     if (!dev || !out_visual_id) return NEOX_ERROR_INVALID_ARGUMENT;
-    if (dev->kind != NEOX_BACKEND_GPU) return NEOX_ERROR_INVALID_ARGUMENT;
+    *out_visual_id = 0;
+    if (dev->vt != nx_backend_gl()) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (nx_device_check_live(dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
     g = (nx_gl_dev *)dev->bstate;
     if (!g || !nx_gl_ctx_native_visual(g->ctx, &id))
         return NEOX_ERROR_UNSUPPORTED;
     *out_visual_id = (uint32_t)id;
+    return NEOX_OK;
+}
+
+static void gl_memory_stats(neox_device *dev, neox_gpu_memory_stats *out)
+{
+    nx_gl_dev *g = dev->bstate;
+    out->texture_bytes = (uint64_t)g->snap_w * g->snap_h * 16;
+    for (uint32_t i = 0; i < g->nrts; i++) {
+        nx_gl_rt *rt = &g->rts[i];
+        uint64_t bytes = (uint64_t)rt->w * rt->h * (rt->is_layer ? 16 : 4);
+        out->pool_texture_bytes += bytes;
+        if (!rt->in_use) out->idle_pool_texture_bytes += bytes;
+    }
+    out->texture_bytes += out->pool_texture_bytes;
+    for (uint32_t i = 0; i < g->ntexs; i++) out->texture_bytes += g->texs[i].bytes;
+    for (uint32_t i = 0; i < g->nsurfs; i++)
+        out->texture_bytes += (uint64_t)g->surfs[i]->w * g->surfs[i]->h * 4;
+}
+
+neox_result neox_gl_device_get_stats(neox_device *dev,neox_gl_stats *out)
+{
+    if(!dev || !out || dev->vt!=nx_backend_gl())return NEOX_ERROR_INVALID_ARGUMENT;
+    nx_gl_dev *g=dev->bstate;
+    *out=g->stats;out->context_peak_bytes=dev->ctx->used_peak;
+    neox_gpu_memory_stats memory = {0};
+    gl_memory_stats(dev, &memory);
+    out->tracked_gpu_bytes = memory.texture_bytes;
     return NEOX_OK;
 }
 
@@ -2437,7 +2651,8 @@ const nx_backend *nx_backend_gl(void)
         gl_execute,
         gl_get_caps,
         NULL,               /* poll：execute 内 glFinish 同步完成 */
-        NULL                /* block：同步后端 */
+        NULL,               /* block：同步后端 */
+        gl_memory_stats
     };
     return &vt;
 }

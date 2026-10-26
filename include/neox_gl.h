@@ -32,7 +32,7 @@
  * 语义与 Soft 后端完全一致（docs/semantics-v0.md §9 容差内）：
  *   - 帧命令仍只录制，neox_device_pump 时经 GL 执行；执行期间表面内容
  *     不被写入（§10.1 原子性），失败时 submission 标记 FAILED。
- *   - 所有 GL 调用发生在 pump / 表面 API 内；录制阶段不触碰 GL 状态。
+ *   - frame_begin 可为目标创建 GPU 快照；绘制命令录制不触碰 GL 状态。
  * =========================================================================*/
 #ifndef NEOX_GL_H
 #define NEOX_GL_H
@@ -48,6 +48,15 @@ extern "C" {
 
 #define NEOX_GL_DESC_MAGIC 0x4e58474cu  /* 'NXGL'：NEOX_BACKEND_GPU 参数块后端标识 */
 
+/* REFERENCE keeps CPU output quantization for bit-exact reference comparisons.
+ * GPU explicitly permits final sRGB quantization differences (tested <=1/255),
+ * uses GPU target snapshots and conversion, and reports USED_APPROXIMATION.
+ * It does not authorize different geometry, blending, or distance-field rules. */
+typedef enum neox_gl_output_mode {
+    NEOX_GL_OUTPUT_REFERENCE = 0,
+    NEOX_GL_OUTPUT_GPU = 1
+} neox_gl_output_mode;
+
 typedef struct neox_gl_device_desc {
     uint32_t struct_size;   /* 必须 = sizeof(neox_gl_device_desc)（版本协商） */
     uint32_t magic;         /* 必须 = NEOX_GL_DESC_MAGIC（后端区分） */
@@ -59,7 +68,20 @@ typedef struct neox_gl_device_desc {
      * EGL window surface。macOS 忽略。 */
     void *native_display;   /* X11 Display* 或 wl_display*。NULL = 离屏。 */
     uint32_t native_kind;   /* NEOX_GL_NATIVE_* ；native_display 非空时必填 */
+    neox_gl_output_mode output_mode; /* zero = strict reference output */
 } neox_gl_device_desc;
+
+/* Cumulative payload counters, including explicit readback APIs. Pixel transfers
+ * exclude uniform/vertex traffic; vertex bytes are reported separately. These
+ * count API payloads, not physical bus traffic on unified-memory hardware.
+ * tracked_gpu_bytes counts owned texture storage, excluding driver overhead.
+ * context_peak_bytes is the allocator peak across this device's whole context. */
+typedef struct neox_gl_stats {
+    uint64_t pixel_upload_bytes, pixel_readback_bytes, vertex_upload_bytes;
+    uint64_t readback_calls, finish_calls;
+    uint64_t tracked_gpu_bytes, context_peak_bytes;
+} neox_gl_stats;
+neox_result neox_gl_device_get_stats(neox_device *dev, neox_gl_stats *out_stats);
 
 #define NEOX_GL_NATIVE_X11      0x58313120u /* 'X11 ' */
 #define NEOX_GL_NATIVE_WAYLAND  0x5741594cu /* 'WAYL' */
@@ -72,11 +94,13 @@ typedef struct neox_gl_device_desc {
 
 typedef struct neox_gl_surface neox_gl_surface;
 
-/* [own] 创建 RGBA8 sRGB 非预乘离屏表面（FBO） */
+/* [own] 创建 RGBA8 sRGB 非预乘离屏表面（FBO）。dev 必须为 GL 后端，
+ * 其他后端返回 INVALID_ARGUMENT。 */
 neox_result neox_gl_surface_create(neox_device *dev,
                                    uint32_t width, uint32_t height,
                                    neox_gl_surface **out_surface);
-/* [own] 销毁表面（GL 对象立即释放；不得在提交尚未 pump 时销毁被引用的表面） */
+/* [own] 销毁表面（GL 对象立即释放；不得在提交尚未 pump 时销毁被引用的表面）。
+ * dev 必须为表面所属设备；错误归属不销毁表面，并设置该 context 的错误详情。 */
 void        neox_gl_surface_destroy(neox_device *dev,
                                     neox_gl_surface *surface);
 
@@ -104,12 +128,21 @@ typedef struct neox_gl_window_desc {
 neox_result neox_gl_surface_create_window(neox_device *dev,
                                           const neox_gl_window_desc *desc,
                                           neox_gl_surface **out_surface);
-/* 重建颜色附件与 EGL window surface。不得在未 pump 的提交仍引用该表面时调用。 */
+/* Replace color storage; successful size changes discard old pixels/snapshots.
+ * A recoverable failure preserves storage, dimensions and captured pixels.
+ * Different-size requests reject active recording/pending work on this surface.
+ * For window surfaces, resize the native window first; EGL association is kept.
+ * Native window geometry is external and is not rolled back on allocation failure.
+ * Device loss remains terminal and does not guarantee preserved GPU contents. */
 neox_result neox_gl_surface_resize(neox_gl_surface *surface,
                                    uint32_t width, uint32_t height);
 /* 翻转到窗口并交换缓冲。离屏表面返回 NEOX_ERROR_UNSUPPORTED。 */
 neox_result neox_gl_surface_present(neox_gl_surface *surface);
-/* 最近一次 present 画进窗口的像素（RGBA8，左上原点）。尚未 present 则失败。 */
+/* Request a snapshot during the next present, before swap. One-shot; ordinary
+ * present has no readback or glFinish. Storage is reused until resize/destroy. */
+neox_result neox_gl_surface_request_readback(neox_gl_surface *surface);
+/* Snapshot of the latest present (RGBA8, top-left). Requires an explicit request
+ * before that present; a subsequent uncaptured present or resize invalidates it. */
 neox_result neox_gl_surface_read_presented(neox_gl_surface *surface,
                                            uint8_t *out_pixels);
 

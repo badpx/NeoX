@@ -570,6 +570,8 @@ static void test_failure_semantics(void)
     }
 
     /* (c) fail_next：frame_end 失败是原子的，帧保持可重试，目标不变 */
+    neox_device *saved_dev = g_dev;
+    CHECK_RES(neox_device_create(g_ctx, NULL, &g_dev), NEOX_OK);
     fill_bytes(target, sizeof(target), 0xCD);
     CHECK_RES(begin_frame(&fr, target, 64, 64, &WHITE), NEOX_OK);
     {
@@ -589,6 +591,9 @@ static void test_failure_semantics(void)
         CHECK_PX(target, 64, 0, 0, 255, 255, 255, 255); /* 清屏色保留 */
         CHECK(neox_submission_get_status(g_dev, sub) == NEOX_SUBMISSION_COMPLETE);
     }
+
+    neox_device_destroy(g_dev);
+    g_dev = saved_dev;
 
     /* (d) 执行期失败（pump 内分配失败）：submission FAILED，目标不变 */
     fill_bytes(target, sizeof(target), 0x77);

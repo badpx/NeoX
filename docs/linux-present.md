@@ -132,3 +132,65 @@ Clang 18，`-Wall -Wextra -Werror`。Mesa 25.2.8，llvmpipe（LLVM 20.1.2）。
 - 不支持 fractional-scale-v1。分数缩放只在 X11（`Xft.dpi`）上保留。
 - `eglSwapInterval` 在 Xvfb 上常常失败，垂直同步是尽力而为。
 - 没有 DMA-BUF / GBM。软件帧是一次拷贝，GL 帧是一次纹理绘制再交换。
+
+## 显式截图与所有权（2026-10 更新）
+
+窗口接口现在由独立的 `neox_present` 目标提供，它公开链接 `neox`；只使用核心的
+消费方不会链接 X11/Wayland 适配对象。截图调用顺序为 acquire → render/wait →
+`neox_window_request_readback` → present → `neox_window_read_pixels`。
+GL 正常 present 不分配截图缓冲、不回读、不调用 glFinish。显式截图使用一块可复用
+RGBA8 缓冲并原地翻转；下一次未请求截图的 present 或 resize 使旧截图失效。
+这仅消除了呈现步骤的额外成本，当前参考 GL 执行器内部仍有回读与同步，不能据此
+宣称整帧已是 GPU 原生路径。
+
+context 是 device 的存储所有者，window 持有可自动失效的借用引用。window 销毁
+会请求 device 销毁，并在设备排空/取消提交、销毁 EGL 后关闭原生 display。
+提前销毁 context 或 device 会将 window 脱离设备，随后销毁 window 安全；重复
+create_device 返回错误，设备销毁后允许重新关联。无显示环境的 present_contracts
+测试覆盖这些顺序；真实 X11/Wayland 截图方向与 resize 继续由 Linux CI 验证。
+
+
+### Resize 的失败边界
+
+GL 颜色附件先在独立对象中分配，成功后才替换旧附件。普通分配/FBO 错误保持
+旧尺寸、旧像素和已有截图；成功变更尺寸后旧像素未保留，截图失效。有活动录制
+或未完成提交引用该表面时，尺寸变更返回 INVALID_ARGUMENT。
+
+窗口层先更新 X11 / wl_egl_window 的原生尺寸；GL 表面保留原 EGL window surface
+关联。依据 [EGL 1.5 §3.5.1 与 §3.10.1](https://registry.khronos.org/EGL/specs/eglspec.1.5.pdf)，
+窗口表面随原生窗口调整，最迟在交换时更新尺寸，不需要每次销毁重建关联。
+GPU 分配失败不回滚外部窗口尺寸；目标获取失败后可在下一帧重试。设备失效
+仍按终态契约处理，不保证 GPU 内容保留。
+
+`test_gl_surface_faults` 对实际 GL 执行代码注入纹理分配/FBO 完整性错误，验证
+旧内容、截图、资源释放和重试；另注入 GL_CONTEXT_LOST 验证错误映射。
+这些测试使用真实离屏 GL，不等价于 X11/Wayland resize 的驱动运行验收。
+
+
+### 尺寸与缓冲使用边界
+
+逻辑和像素维度均须能用有符号 32 位整数表示，RGBA 字节数不得溢出 size_t。
+X11 的窗口宽高另受 [X11 协议 CARD16](https://xorg.freedesktop.org/releases/current/doc/xproto/x11protocol.html)
+限制，创建和请求 resize 在发送前拒绝超范围尺寸。Wayland 的双缓冲共享内存池
+总字节数须能通过 [wl_shm.create_pool 的有符号 size](https://wayland.freedesktop.org/docs/html/apa.html)
+表达；这个约束只属于共享内存呈现，不强加给 GL 目标。
+
+resize 返回失败保留原 metrics；成功或 poll 收到实际尺寸变化后，调用方须重新
+acquire_target，再呈现或读回。Soft 的 acquire 会清空缓冲，活动帧/排队提交尚
+借用它时明确拒绝，调用方先完成或取消工作。已返回的 target 不得跨下一次
+成功 acquire 使用。GL 旧尺寸的截图也不能写入按新尺寸分配的输出缓冲。
+
+present_adapter_bounds 在无显示服务器时执行实际适配代码的尺寸和事件分支，
+使用模拟 native dispatch；它不证明真实协议连接、窗口生命周期或呈现结果。
+
+
+## 本轮完整运行验收
+
+在 Ubuntu 24.04 ARM64、Mesa 25.2.8 llvmpipe、Weston 13.0.0 下，开启
+ASan/UBSan 与 warnings-as-errors，离屏 41/41，X11/Wayland 的 Soft/GL
+窗口及示例四组各 2/2 通过；GL/Text/Present 八组合与模块消费矩阵全部通过。
+软件 GL 驱动验证 EGL 和渲染路径，不代替物理 GPU 驱动覆盖。
+
+环境依赖就绪后可执行 `bash tests/check_linux.sh /tmp/neox-linux-acceptance`。
+脚本不安装依赖，只在指定输出目录构建；Xvfb 和 Weston 由脚本启动，退出时
+清理 compositor。必需的 GL/窗口不可用即失败。详细范围见 implementation-review.md。

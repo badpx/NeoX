@@ -31,7 +31,8 @@ typedef struct neox_present_desc {
     uint32_t width;         /* 逻辑宽度（point），必须 > 0 */
     uint32_t height;
     float scale;            /* 0 = 跟随输出（Xft.dpi / wl_output.scale）；
-                             * >0 强制。Wayland 会取最近的整数 buffer scale。 */
+                             * 必须有限且非负；>0 强制（小于 0.5 时沿用 1）。
+                             * Wayland 会取最近的整数 buffer scale，最小为 1。 */
     int vsync;              /* 非 0：请求交换间隔 1 / 帧回调。失败仍呈现。 */
 } neox_present_desc;
 
@@ -60,9 +61,9 @@ typedef struct neox_window_event {
 } neox_window_event;
 
 neox_result neox_window_create(const neox_present_desc *desc, neox_window **out);
-/* 释放窗口，以及 neox_window_create_device 创建的设备。
- * 设备必须留到这里再释放：Wayland 上要先 eglTerminate，再断开 wl_display。
- * 调用方不要再 neox_device_destroy 那台设备。 */
+/* Destroy the window and its attached device, draining in-flight work before
+ * closing the native display. Context/device destruction may happen first:
+ * the window is detached automatically and remains safe to destroy. */
 void        neox_window_destroy(neox_window *win);
 const char *neox_window_last_error(void);
 
@@ -77,28 +78,39 @@ void neox_window_metrics(const neox_window *win,
 /* 非阻塞。有事件返回 1。 */
 int neox_window_poll(neox_window *win, neox_window_event *out);
 
-/* 改逻辑尺寸。像素尺寸随之变化；下一帧 acquire_target 会重建表面。 */
+/* 改逻辑尺寸。像素尺寸随之变化；下一帧 acquire_target 会重建表面。
+ * 非法尺寸或适配器返回失败时保留原 metrics。尺寸须可表示为有符号 32 位；
+ * X11 另受像素尺寸 CARD16 限制。原生窗口管理器的异步决定经 poll 报告。 */
 neox_result neox_window_resize(neox_window *win, uint32_t points_w, uint32_t points_h);
 
 /* 请求关闭。之后 poll 得到 NEOX_WINDOW_CLOSE。 */
 void neox_window_request_close(neox_window *win);
 
 /* SOFT：CPU 帧缓冲。GPU：在该窗口的 EGL display 上建 GL 设备
- * （不是 surfaceless），才能创建 EGL window surface。 */
+ * （不是 surfaceless），才能创建 EGL window surface。
+ * A window accepts one device at a time; duplicate creation fails. The returned
+ * device is borrowed from the context. After its destruction the window can
+ * attach a new device, but acquire/present fail until then. */
 neox_result neox_window_create_device(neox_window *win, neox_context *ctx,
                                       neox_backend_kind backend,
                                       neox_device **out_dev);
 
 /* 填 neox_frame_begin 用的 target。尺寸是像素。SOFT 指向窗口内部缓冲；
- * GL 指向窗口表面。尺寸变化后必须再次调用。 */
+ * GL 指向窗口表面。尺寸变化后必须再次调用。
+ * SOFT 会清空缓冲；活动帧或尚未完成的提交存在时拒绝重新获取，
+ * 避免破坏其借用的存储。返回的 target 不得跨下一次成功 acquire 使用。 */
 neox_result neox_window_acquire_target(neox_window *win, neox_device *dev,
                                        neox_target_desc *out_target);
 
 /* neox_device_pump 完成之后调用。GL：eglSwapBuffers。SOFT：XPutImage 或 wl_shm。 */
 neox_result neox_window_present(neox_window *win);
 
-/* 最近一次 present 的像素，RGBA8 左上原点，行距 pixels_w*4。
- * X11 尽量读窗口本身；Wayland GL 读交换前的窗口帧缓冲。 */
+/* GL: request a one-shot snapshot of the next present, after acquire_target.
+ * Soft: no extra readback is needed. Ordinary present never captures GL pixels. */
+neox_result neox_window_request_readback(neox_window *win);
+/* RGBA8 top-left, stride pixels_w*4. GL requires request_readback before the
+ * latest present; Soft reads the window or its current CPU framebuffer.
+ * After a size change, present/readback require a newly acquired target. */
 neox_result neox_window_read_pixels(neox_window *win, uint8_t *out_pixels);
 
 #ifdef __cplusplus

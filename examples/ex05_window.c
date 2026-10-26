@@ -118,7 +118,10 @@ static int frame(neox_window *win, neox_device *dev, const char *bmp)
     neox_draw_path(fr, c, &paint);
     if (neox_pop_state(fr) != NEOX_OK) return 0;
     if (neox_frame_end(fr, &sub) != NEOX_OK) return 0;
-    if (neox_submission_wait(dev, sub) != NEOX_OK) return 0;
+    neox_result waited = neox_submission_wait(dev, sub);
+    neox_submission_release(dev, sub);
+    if (waited != NEOX_OK) return 0;
+    if (bmp && neox_window_request_readback(win) != NEOX_OK) return 0;
     if (neox_window_present(win) != NEOX_OK) return 0;
     neox_path_release(dev, a);
     neox_path_release(dev, b);
@@ -159,7 +162,7 @@ int main(void)
             return 1;
         }
         printf("ex05: skipped (no DISPLAY or WAYLAND_DISPLAY)\n");
-        return 0;
+        return 77;
     }
     if (frames_env && frames_env[0]) limit = atoi(frames_env);
     if (gpu) kind = NEOX_BACKEND_GPU;

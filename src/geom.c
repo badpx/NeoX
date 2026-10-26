@@ -1,22 +1,19 @@
 /* ===========================================================================
- * geom.c — 路径 flatten 与覆盖率光栅化（Soft / GL 后端共享）
- *
- * 规范引用（docs/semantics-v0.md）：§3 变换、§4 路径几何、§4.4 覆盖率。
- *
- * 共享原因：跨后端一致性（§9）要求两后端的几何输入完全一致，因此
- * 曲线细分（flatten）与裁剪掩码光栅化只此一份实现：
- *   - Soft：flatten → 扫描线填充；裁剪掩码直接作为覆盖率参与合成。
- *   - GL  ：flatten → 三角扇 stencil-then-cover；裁剪掩码在 push 期由
- *           本文件急切光栅化（与 Soft 同一覆盖率语义），执行期上传纹理。
+ * geom.c — Soft / GL / Metal 共用的曲线细分与覆盖率光栅化。
+ * 路径和裁剪都经同一 CPU 几何/覆盖率实现；GPU 上传其掩码再执行合成。
+ * 规范：docs/semantics-v0.md §3、§4、§9、§10。
  * =========================================================================*/
 #include "internal.h"
 
 /* ------------------------------------------------------------------ 路径 flatten（§4）
- * 曲线在设备空间（已应用 CTM）flatten，容差 NEOX_FLAT_TOL 像素、最深 12 层。
+ * 曲线在设备空间 flatten，目标误差 NEOX_FLAT_TOL 像素、最深 12 层；
+ * 达到深度上限仍不能满足弦段距离检查时返回 UNSUPPORTED，不静默降精度。
  * 输出：点列表 + 轮廓表（轮廓隐式闭合，填充语义）。 */
 
 static neox_result flat_put_pt(neox_context *ctx, nx_flat *f, float x, float y)
 {
+    if (!isfinite(x) || !isfinite(y)) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (f->npts > UINT32_MAX - 2) return NEOX_ERROR_OUT_OF_MEMORY;
     float *np = (float *)nx_array_grow(ctx, f->pts, sizeof(float),
                                        &f->cap_pts, f->npts + 2);
     if (!np) return NEOX_ERROR_OUT_OF_MEMORY;
@@ -29,6 +26,7 @@ static neox_result flat_put_pt(neox_context *ctx, nx_flat *f, float x, float y)
 
 static neox_result flat_begin_poly(neox_context *ctx, nx_flat *f)
 {
+    if (f->npolys == UINT32_MAX) return NEOX_ERROR_OUT_OF_MEMORY;
     nx_poly *np = (nx_poly *)nx_array_grow(ctx, f->polys, sizeof(nx_poly),
                                            &f->cap_polys, f->npolys + 1);
     if (!np) return NEOX_ERROR_OUT_OF_MEMORY;
@@ -39,62 +37,51 @@ static neox_result flat_begin_poly(neox_context *ctx, nx_flat *f)
     return NEOX_OK;
 }
 
-/* 二次贝塞尔细分判平：控制点对弦中点的偏离 ≤ 容差 */
-static int quad_is_flat(float x0, float y0, float cx, float cy, float x1, float y1)
+/* A Bezier lies in its control hull. If every control (including the exact
+ * endpoints) is within tolerance of the emitted float chord, the whole curve
+ * is within that convex capsule. Checking each control avoids cancellation at
+ * inflections; clamping the projection also preserves collinear overshoots.
+ * Subdivision uses double so finite float controls cannot overflow midpoints. */
+static int flat_near_chord(double x, double y, float ax, float ay, float bx, float by)
 {
-    float dx = cx * 2.0f - x0 - x1;
-    float dy = cy * 2.0f - y0 - y1;
-    return fabsf(dx) <= NEOX_FLAT_TOL * 2.0f && fabsf(dy) <= NEOX_FLAT_TOL * 2.0f;
+    double dx = (double)bx - ax, dy = (double)by - ay;
+    double length2 = dx*dx + dy*dy;
+    double t = length2 ? ((x-ax)*dx + (y-ay)*dy) / length2 : 0.0;
+    t = fmax(0.0, fmin(1.0, t));
+    double ex = x - ((double)ax + t*dx), ey = y - ((double)ay + t*dy);
+    return ex*ex + ey*ey <= (double)NEOX_FLAT_TOL * NEOX_FLAT_TOL;
 }
 
-static neox_result flat_quad(neox_context *ctx, nx_flat *f,
-                             float x0, float y0, float cx, float cy,
-                             float x1, float y1, int depth)
+static neox_result flat_curve(neox_context *ctx, nx_flat *f,
+                              const double *points, unsigned degree, unsigned depth)
 {
-    if ((quad_is_flat(x0, y0, cx, cy, x1, y1) && depth > 0) ||
-        depth >= NEOX_FLAT_MAX_DEPTH) {
-        return flat_put_pt(ctx, f, x1, y1);
+    float ax = f->pts[f->npts-2], ay = f->pts[f->npts-1];
+    float bx = (float)points[degree*2], by = (float)points[degree*2+1];
+    int flat = 1;
+    for (unsigned i = 0; i <= degree; i++)
+        if (!flat_near_chord(points[i*2], points[i*2+1], ax, ay, bx, by)) flat = 0;
+    if (flat) return flat_put_pt(ctx, f, bx, by);
+    if (depth >= NEOX_FLAT_MAX_DEPTH) {
+        ctx->last_error = "curve flattening exceeds precision or subdivision limit";
+        return NEOX_ERROR_UNSUPPORTED;
     }
-    {
-        float mx01 = (x0 + cx) * 0.5f, my01 = (y0 + cy) * 0.5f;
-        float mx12 = (cx + x1) * 0.5f, my12 = (cy + y1) * 0.5f;
-        float mxx  = (mx01 + mx12) * 0.5f, myy = (my01 + my12) * 0.5f;
-        neox_result r = flat_quad(ctx, f, x0, y0, mx01, my01, mxx, myy, depth + 1);
-        if (r != NEOX_OK) return r;
-        return flat_quad(ctx, f, mxx, myy, mx12, my12, x1, y1, depth + 1);
+    /* de Casteljau at t=1/2. Arrays are bounded for quadratic/cubic curves. */
+    double tmp[8], left[8], right[8];
+    memcpy(tmp, points, (degree+1)*2*sizeof(double));
+    left[0] = tmp[0]; left[1] = tmp[1];
+    right[degree*2] = tmp[degree*2]; right[degree*2+1] = tmp[degree*2+1];
+    for (unsigned level = 1; level <= degree; level++) {
+        for (unsigned i = 0; i <= degree-level; i++) {
+            tmp[i*2] = (tmp[i*2] + tmp[i*2+2]) * 0.5;
+            tmp[i*2+1] = (tmp[i*2+1] + tmp[i*2+3]) * 0.5;
+        }
+        left[level*2] = tmp[0]; left[level*2+1] = tmp[1];
+        right[(degree-level)*2] = tmp[(degree-level)*2];
+        right[(degree-level)*2+1] = tmp[(degree-level)*2+1];
     }
-}
-
-/* 三次贝塞尔细分判平：两控制点均值对端点均值的偏离 ≤ 容差 */
-static int cubic_is_flat(float x0, float y0, float c1x, float c1y,
-                         float c2x, float c2y, float x1, float y1)
-{
-    float dx = c1x + c2x - x0 - x1;
-    float dy = c1y + c2y - y0 - y1;
-    return fabsf(dx) <= NEOX_FLAT_TOL * 2.0f && fabsf(dy) <= NEOX_FLAT_TOL * 2.0f;
-}
-
-static neox_result flat_cubic(neox_context *ctx, nx_flat *f,
-                              float x0, float y0, float c1x, float c1y,
-                              float c2x, float c2y, float x1, float y1, int depth)
-{
-    if ((cubic_is_flat(x0, y0, c1x, c1y, c2x, c2y, x1, y1) && depth > 0) ||
-        depth >= NEOX_FLAT_MAX_DEPTH) {
-        return flat_put_pt(ctx, f, x1, y1);
-    }
-    {
-        float a01x = (x0 + c1x) * 0.5f,  a01y = (y0 + c1y) * 0.5f;
-        float a12x = (c1x + c2x) * 0.5f, a12y = (c1y + c2y) * 0.5f;
-        float a23x = (c2x + x1) * 0.5f,  a23y = (c2y + y1) * 0.5f;
-        float b012x = (a01x + a12x) * 0.5f, b012y = (a01y + a12y) * 0.5f;
-        float b123x = (a12x + a23x) * 0.5f, b123y = (a12y + a23y) * 0.5f;
-        float cxx   = (b012x + b123x) * 0.5f, cyy = (b012y + b123y) * 0.5f;
-        neox_result r = flat_cubic(ctx, f, x0, y0, a01x, a01y,
-                                   b012x, b012y, cxx, cyy, depth + 1);
-        if (r != NEOX_OK) return r;
-        return flat_cubic(ctx, f, cxx, cyy, b123x, b123y,
-                          a23x, a23y, x1, y1, depth + 1);
-    }
+    neox_result r = flat_curve(ctx, f, left, degree, depth+1);
+    if (r != NEOX_OK) return r;
+    return flat_curve(ctx, f, right, degree, depth+1);
 }
 
 void nx_flat_free(neox_context *ctx, nx_flat *f)
@@ -107,13 +94,17 @@ void nx_flat_free(neox_context *ctx, nx_flat *f)
 neox_result nx_flatten_path(neox_context *ctx, const nx_path_slot *path,
                             neox_affine ctm, nx_flat *out)
 {
-    uint32_t i, pi = 0;
-    float cx = 0.0f, cy = 0.0f;   /* 当前点（§4.1 隐式 MOVE(0,0) 前的起点） */
-    float sx = 0.0f, sy = 0.0f;   /* 当前子路径 MOVE 点 */
+    uint32_t i;
+    size_t pi = 0; /* scalar offset can exceed UINT32_MAX for a valid point count */
+    float cx = ctm.tx, cy = ctm.ty; /* transformed implicit MOVE(0,0) */
+    float sx = cx, sy = cy;
     int in_poly = 0;
     neox_result r;
 
     memset(out, 0, sizeof(*out));
+    if (!nx_affine_is_finite(ctm)) return NEOX_ERROR_INVALID_ARGUMENT;
+    /* Singular transforms have no filled area, including curved paths. */
+    if ((double)ctm.a*ctm.d - (double)ctm.b*ctm.c == 0.0) return NEOX_OK;
     for (i = 0; i < path->verb_count; i++) {
         switch ((neox_path_verb)path->verbs[i]) {
         case NEOX_VERB_MOVE: {
@@ -132,12 +123,12 @@ neox_result nx_flatten_path(neox_context *ctx, const nx_path_slot *path,
             float x, y;
             nx_affine_apply(ctm, path->points[pi], path->points[pi + 1], &x, &y);
             pi += 2;
-            if (!in_poly) { /* 隐式 MOVE(0,0) */
+            if (!in_poly) { /* implicit origin, or previous CLOSE's MOVE point */
                 r = flat_begin_poly(ctx, out);
                 if (r != NEOX_OK) goto fail;
-                r = flat_put_pt(ctx, out, 0.0f, 0.0f);
+                r = flat_put_pt(ctx, out, cx, cy);
                 if (r != NEOX_OK) goto fail;
-                cx = 0.0f; cy = 0.0f;
+                sx = cx; sy = cy;
                 in_poly = 1;
             }
             r = flat_put_pt(ctx, out, x, y);
@@ -153,12 +144,16 @@ neox_result nx_flatten_path(neox_context *ctx, const nx_path_slot *path,
             if (!in_poly) {
                 r = flat_begin_poly(ctx, out);
                 if (r != NEOX_OK) goto fail;
-                r = flat_put_pt(ctx, out, 0.0f, 0.0f);
+                r = flat_put_pt(ctx, out, cx, cy);
                 if (r != NEOX_OK) goto fail;
-                cx = 0.0f; cy = 0.0f;
+                sx = cx; sy = cy;
                 in_poly = 1;
             }
-            r = flat_quad(ctx, out, cx, cy, c1x, c1y, x1, y1, 0);
+            if (!isfinite(c1x) || !isfinite(c1y) || !isfinite(x1) || !isfinite(y1)) {
+                r = NEOX_ERROR_INVALID_ARGUMENT; goto fail;
+            }
+            double curve[] = {cx,cy,c1x,c1y,x1,y1};
+            r = flat_curve(ctx, out, curve, 2, 0);
             if (r != NEOX_OK) goto fail;
             cx = x1; cy = y1;
             break;
@@ -172,12 +167,17 @@ neox_result nx_flatten_path(neox_context *ctx, const nx_path_slot *path,
             if (!in_poly) {
                 r = flat_begin_poly(ctx, out);
                 if (r != NEOX_OK) goto fail;
-                r = flat_put_pt(ctx, out, 0.0f, 0.0f);
+                r = flat_put_pt(ctx, out, cx, cy);
                 if (r != NEOX_OK) goto fail;
-                cx = 0.0f; cy = 0.0f;
+                sx = cx; sy = cy;
                 in_poly = 1;
             }
-            r = flat_cubic(ctx, out, cx, cy, c1x, c1y, c2x, c2y, x1, y1, 0);
+            if (!isfinite(c1x) || !isfinite(c1y) || !isfinite(c2x) || !isfinite(c2y) ||
+                !isfinite(x1) || !isfinite(y1)) {
+                r = NEOX_ERROR_INVALID_ARGUMENT; goto fail;
+            }
+            double curve[] = {cx,cy,c1x,c1y,c2x,c2y,x1,y1};
+            r = flat_curve(ctx, out, curve, 3, 0);
             if (r != NEOX_OK) goto fail;
             cx = x1; cy = y1;
             break;
@@ -188,19 +188,20 @@ neox_result nx_flatten_path(neox_context *ctx, const nx_path_slot *path,
             in_poly = 0;
             break;
         default:
+            r = NEOX_ERROR_INVALID_ARGUMENT;
             goto fail;
         }
     }
     return NEOX_OK;
 fail:
     nx_flat_free(ctx, out);
-    return NEOX_ERROR_OUT_OF_MEMORY;
+    return r;
 }
 
 /* ------------------------------------------------------------------ 扫描线光栅化（§4.2、§4.4）
  * 每个像素行取 NEOX_SS 条子扫描线；子扫描线上求解析水平 coverage。
  * 半开规则 [ymin, ymax)：顶点不会被重复计数；水平边跳过。 */
-typedef struct nx_cross { float x; int32_t w; } nx_cross;
+typedef struct nx_cross { double x; int32_t w; uint32_t path; } nx_cross;
 
 static int nx_cross_cmp(const void *pa, const void *pb)
 {
@@ -212,19 +213,16 @@ static int nx_cross_cmp(const void *pa, const void *pb)
 }
 
 /* 将覆盖区间 [xa,xb) 的水平 coverage 累加进一行掩码 */
-static void nx_span_add(float *row, uint32_t w, float xa, float xb, float scale)
+static void nx_span_add(float *row, uint32_t w, double xa, double xb, float scale)
 {
-    int32_t i0, i1, i;
+    xa = fmax(xa, 0.0); xb = fmin(xb, (double)w);
     if (xb <= xa) return;
-    i0 = (int32_t)floorf(xa);
-    i1 = (int32_t)floorf(xb);
-    for (i = i0; i <= i1; i++) {
-        float hi, lo, cov;
-        if (i < 0 || i >= (int32_t)w) continue;
-        hi = xb < (float)(i + 1) ? xb : (float)(i + 1);
-        lo = xa > (float)i ? xa : (float)i;
-        cov = hi - lo;
-        if (cov > 0.0f) row[i] += cov * scale;
+    /* Both endpoints are clamped before conversion. The exclusive end may be
+     * INT32_MAX; no signed loop increment or float-rounded viewport overflow. */
+    uint32_t begin = (uint32_t)floor(xa), end = (uint32_t)ceil(xb);
+    for (uint32_t i = begin; i < end; i++) {
+        double cov = fmin(xb, (double)i+1.0) - fmax(xa, (double)i);
+        if (cov > 0.0) row[i] += (float)cov * scale;
     }
 }
 
@@ -232,65 +230,84 @@ neox_result nx_rasterize_path(neox_context *ctx, const nx_path_slot *path,
                               neox_affine ctm, uint32_t w, uint32_t h,
                               float *mask)
 {
-    nx_flat flat;
+    nx_clip_path input = {path, ctm};
+    return nx_rasterize_intersection(ctx, &input, 1, w, h, mask);
+}
+
+neox_result nx_rasterize_intersection(neox_context *ctx, const nx_clip_path *paths,
+    uint32_t count, uint32_t w, uint32_t h, float *mask)
+{
+    nx_flat *flats = NULL;
     nx_cross *xs = NULL;
-    uint32_t total_pts, xi, j, k, p;
-    float scale = 1.0f / (float)NEOX_SS;
-    neox_result r;
-
-    r = nx_flatten_path(ctx, path, ctm, &flat);
-    if (r != NEOX_OK) return r;
-    total_pts = flat.npts / 2;
-    if (total_pts < 3 || flat.npolys == 0) {
-        memset(mask, 0, (size_t)w * h * sizeof(float));
-        nx_flat_free(ctx, &flat);
-        return NEOX_OK;
+    int32_t *winding = NULL;
+    size_t total = 0, xi, flat_bytes, winding_bytes, mask_bytes, pixels;
+    neox_result result = NEOX_ERROR_OUT_OF_MEMORY;
+    const float scale = 1.0f / (float)NEOX_SS;
+    if (!count || !paths || !mask || !w || !h || w > INT32_MAX || h > INT32_MAX ||
+        !nx_size_mul(count, sizeof(*flats), &flat_bytes) ||
+        !nx_size_mul(count, sizeof(*winding), &winding_bytes) ||
+        !nx_size_mul(w, h, &pixels) || !nx_size_mul(pixels, sizeof(float), &mask_bytes))
+        return NEOX_ERROR_INVALID_ARGUMENT;
+    flats = nx_alloc(ctx, flat_bytes, 16);
+    if (!flats) return result;
+    memset(flats, 0, flat_bytes);
+    for (uint32_t q = 0; q < count; q++) {
+        result = nx_flatten_path(ctx, paths[q].path, paths[q].ctm, &flats[q]);
+        if (result != NEOX_OK) goto done;
+        if (flats[q].npts / 2 > SIZE_MAX / sizeof(*xs) - total) {
+            result = NEOX_ERROR_OUT_OF_MEMORY; goto done;
+        }
+        total += flats[q].npts / 2;
     }
-    xs = (nx_cross *)nx_alloc(ctx, ((size_t)total_pts + 2) * sizeof(nx_cross), 16);
-    if (!xs) { nx_flat_free(ctx, &flat); return NEOX_ERROR_OUT_OF_MEMORY; }
-
-    memset(mask, 0, (size_t)w * h * sizeof(float));
-    for (j = 0; j < h; j++) {
+    xs = nx_alloc(ctx, total * sizeof(*xs), 16);
+    winding = nx_alloc(ctx, winding_bytes, 16);
+    if (!xs || !winding) { result = NEOX_ERROR_OUT_OF_MEMORY; goto done; }
+    memset(mask, 0, mask_bytes);
+    for (uint32_t j = 0; j < h; j++) {
         float *row = mask + (size_t)j * w;
-        for (k = 0; k < NEOX_SS; k++) {
-            float y = (float)j + ((float)k + 0.5f) * scale;
-            int wn = 0;
+        for (uint32_t k = 0; k < NEOX_SS; k++) {
+            double y = (double)j + ((double)k + 0.5) * scale;
+            uint32_t inside_count = 0;
             xi = 0;
-            for (p = 0; p < flat.npolys; p++) {
-                const nx_poly *pl = &flat.polys[p];
-                uint32_t e, n = pl->count;
-                const float *pp = &flat.pts[(size_t)pl->start * 2];
-                for (e = 0; e < n; e++) {
-                    float x0 = pp[e * 2], y0 = pp[e * 2 + 1];
-                    uint32_t e2 = (e + 1 == n) ? 0 : e + 1;
-                    float x1 = pp[e2 * 2], y1 = pp[e2 * 2 + 1];
-                    float ymin, ymax, x;
-                    if (y0 == y1) continue;
-                    ymin = y0 < y1 ? y0 : y1;
-                    ymax = y0 > y1 ? y0 : y1;
-                    if (y < ymin || y >= ymax) continue;
-                    x = x0 + (y - y0) * (x1 - x0) / (y1 - y0);
-                    xs[xi].x = x;
-                    xs[xi].w = (y1 > y0) ? 1 : -1; /* +y 向下为正方向 */
-                    xi++;
+            memset(winding, 0, winding_bytes);
+            for (uint32_t q = 0; q < count; q++) {
+                const nx_flat *flat = &flats[q];
+                for (uint32_t p = 0; p < flat->npolys; p++) {
+                    const nx_poly *pl = &flat->polys[p];
+                    uint32_t n = pl->count;
+                    const float *pp = &flat->pts[(size_t)pl->start * 2];
+                    for (uint32_t e = 0; e < n; e++) {
+                        uint32_t e2 = (e + 1 == n) ? 0 : e + 1;
+                        float x0 = pp[e * 2], y0 = pp[e * 2 + 1];
+                        float x1 = pp[e2 * 2], y1 = pp[e2 * 2 + 1];
+                        if (y0 == y1 || y < fminf(y0,y1) || y >= fmaxf(y0,y1)) continue;
+                        /* Double intermediates keep finite float endpoints from overflowing. */
+                        xs[xi].x = (double)x0 + (y-y0) * ((double)x1-x0) / ((double)y1-y0);
+                        xs[xi].w = y1 > y0 ? 1 : -1;
+                        xs[xi++].path = q;
+                    }
                 }
             }
-            if (xi < 2) continue;
-            qsort(xs, xi, sizeof(nx_cross), nx_cross_cmp);
-            for (p = 0; p + 1 < xi; p++) {
-                int inside;
-                if (path->fill_rule == NEOX_FILL_NONZERO) {
-                    wn += xs[p].w;
-                    inside = (wn != 0);
-                } else {
-                    inside = ((p & 1u) == 0);
-                }
-                if (inside)
-                    nx_span_add(row, w, xs[p].x, xs[p + 1].x, scale);
+            qsort(xs, xi, sizeof(*xs), nx_cross_cmp);
+            for (size_t p = 0; p + 1 < xi; p++) {
+                uint32_t q = xs[p].path;
+                int was = winding[q] != 0;
+                if (paths[q].path->fill_rule == NEOX_FILL_NONZERO)
+                    winding[q] += xs[p].w;
+                else winding[q] ^= 1;
+                int now = winding[q] != 0;
+                if (now && !was) inside_count++;
+                if (was && !now) inside_count--;
+                if (inside_count == count)
+                    nx_span_add(row,w,xs[p].x,xs[p+1].x,scale);
             }
         }
     }
-    nx_free(ctx, xs, ((size_t)total_pts + 2) * sizeof(nx_cross), 16);
-    nx_flat_free(ctx, &flat);
-    return NEOX_OK;
+    result = NEOX_OK;
+done:
+    if (xs) nx_free(ctx,xs,total*sizeof(*xs),16);
+    if (winding) nx_free(ctx,winding,winding_bytes,16);
+    for (uint32_t q = 0; q < count; q++) nx_flat_free(ctx,&flats[q]);
+    nx_free(ctx,flats,flat_bytes,16);
+    return result;
 }

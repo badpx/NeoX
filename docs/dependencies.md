@@ -13,13 +13,19 @@ Mesa llvmpipe，包名见下）。找不到库时 GL 设备创建返回
 
 | 依赖 | 版本 | 许可证 | 用途 | 裁剪方式 | 获取 |
 |---|---|---|---|---|---|
-| stb_truetype.h（notions/stb） | v1.26（2021-08-28） | public domain（仓库以 MIT/Unlicense 双授权发布） | NeoX-Text 字体解析与字形 A8 光栅化 | 原文未改，单头文件全量 vendor | `third_party/stb/`（详见 `third_party/README.md`） |
+| stb_truetype.h（notions/stb） | v1.26（2021-08-28） | public domain（仓库以 MIT/Unlicense 双授权发布） | NeoX-Text 字体解析与字形 A8 光栅化 | 单头文件全量 vendor，保留少量 OOM 检查补丁 | `third_party/stb/`（详见 `third_party/README.md`） |
 
 - 构建开关：`NEOX_WITH_TEXT=OFF` 时 `neox_text` 库、测试与示例不参与构建，
   核心与其余测试不受影响（ubuntu CI 无字体环境走此路径 + 集成测试 SKIP）。
-- stb 的瞬态光栅化中间分配走系统分配器（`STBTT_malloc` 默认实现，光栅化
-  后立即释放）；NeoX-Text 的持久内存（字体缓冲、排版结果、图集、缓存表）
-  全部经调用方注入的分配器。
+- stb 的 `STBTT_malloc/free` 经 Text 上下文的注入分配器，临时与持久内存都
+  计入核心 `memory_budget`；显式替换 Text 分配器也不绕过预算。
+  分配尺寸和 owner 保存在对齐前缀中，释放无需全局状态。
+- vendored stb 保留局部 OOM 补丁：扫描线 NULL 检查、活动边失败返回、SDF
+  数据/预计算缓冲失败清理、CFF 输出缓冲失败清理。外层捕捉分配失败标志，
+  避免 stb 的 void 函数提前返回后把不完整位图当成成功结果。
+  补丁范围与升级要求见 `third_party/README.md`。
+- 文件 I/O 的系统内部缓冲、调用方自定义字体后端自身分配不在库的自动预算
+  内；受限环境使用内存字体或离线资产，核心不强制依赖文件 I/O。
 
 ## 平台系统框架（Apple 后端，链接期）
 
@@ -34,3 +40,9 @@ Mesa llvmpipe，包名见下）。找不到库时 GL 设备创建返回
 ## 仅工具链
 
 CMake ≥ 3.16、C11 编译器、macOS 上 ObjC++ 编译器（Metal 后端）。
+
+
+模块边界：Text 只包含私有 `src/module.h` 的不透明分配/归属服务和检查过的
+字节算术，不读取核心 context/device/frame 布局。该私有头不安装；公开消费
+仅使用 `neox.h`、已启用模块的公开头和自动生成的 `neox_config.h`。
+Scene/CAP 开关不引入新依赖，安装与独立消费方式见 README。

@@ -21,6 +21,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "neox_config.h"
 
 #define NEOX_API_DRAFT 1
 
@@ -35,7 +36,7 @@ typedef enum neox_result {
     NEOX_ERROR_INVALID_ARGUMENT,   /* 参数违反文档约定 */
     NEOX_ERROR_OUT_OF_MEMORY,      /* 分配器失败；状态保持调用前一致 */
     NEOX_ERROR_UNSUPPORTED,        /* 无法满足语义规范；默认失败而非近似 */
-    NEOX_ERROR_DEVICE_LOST,        /* 设备丢失；资源句柄全部失效 */
+    NEOX_ERROR_DEVICE_LOST,        /* 设备失效；拒绝后续 GPU 提交 */
     NEOX_ERROR_STALE_HANDLE,       /* generation 不匹配：句柄已过期 */
     NEOX_ERROR_OWNERSHIP_VIOLATION,/* 句柄跨实例/跨设备/跨类型使用 */
     NEOX_ERROR_BACKEND             /* 后端内部错误，细节见 error_detail */
@@ -92,7 +93,8 @@ typedef enum neox_fill_rule {
 typedef enum neox_pixel_format {
     NEOX_FORMAT_RGBA8_SRGB = 0,  /* 上传输入为非预乘；内部转为预乘 */
     NEOX_FORMAT_RGBA8_LINEAR,
-    NEOX_FORMAT_A8               /* 遮罩（字形图集）；采样值为 alpha */
+    NEOX_FORMAT_A8,              /* coverage or scalar data */
+    NEOX_FORMAT_RGBA8_DATA       /* linear numeric channels, never premultiplied */
 } neox_pixel_format;
 
 typedef enum neox_filter {
@@ -117,6 +119,25 @@ void        neox_context_destroy(neox_context *ctx);           /* [own] 销毁�
  * 创建时传 NULL（系统默认分配器）则返回 NULL；ctx 为 NULL 返回 NULL。
  * 模块（如 NeoX-Text）据此决定转发 malloc/free 还是直接使用调用方分配器。 */
 const neox_allocator *neox_context_get_allocator(neox_context *ctx);
+/* CPU accounting is context-wide, in requested bytes through NeoX allocators.
+ * Excludes the context header, caller buffers, native objects and allocator overhead.
+ * Calls sharing a context (including queries) must be externally serialized. */
+typedef struct neox_cpu_memory_stats {
+    uint64_t live_bytes;
+    uint64_t peak_bytes;       /* monotonic since context creation */
+    uint64_t budget_bytes;     /* 0 = unlimited; same scope as live_bytes */
+} neox_cpu_memory_stats;
+neox_result neox_context_get_memory_stats(neox_context *ctx, neox_cpu_memory_stats *out);
+/* Device-owned texture payload only: dimensions * format bytes, no mipmaps.
+ * Excludes native buffers, stencil, driver alignment/metadata and transient driver
+ * copies. Not physical VRAM, and must not be added to CPU bytes on unified memory.
+ * Pool fields are subsets of texture_bytes, not additional allocations. */
+typedef struct neox_gpu_memory_stats {
+    uint64_t texture_bytes;
+    uint64_t pool_texture_bytes;
+    uint64_t idle_pool_texture_bytes;
+} neox_gpu_memory_stats;
+neox_result neox_device_get_memory_stats(neox_device *dev, neox_gpu_memory_stats *out);
 uint32_t    neox_version(void);                                /* 0xMMmmpp */
 /* 最近一次错误的静态描述串（英文 ASCII，进程内常量）；无错误返回 NULL */
 const char *neox_get_error_detail(neox_context *ctx);
@@ -152,8 +173,17 @@ typedef struct neox_device_desc {
 neox_result neox_device_create(neox_context *ctx,
                                const neox_device_desc *desc,   /* [borrow] */
                                neox_device **out_dev);
+/* Cancels queued work, drains submitted work, then destroys all resources. */
 void        neox_device_destroy(neox_device *dev);             /* [own] */
 void        neox_device_get_caps(neox_device *dev, neox_caps *out_caps);
+/* Sticky observed failure state, updated by backend calls/pump (not a live
+ * hardware health probe). Lost devices reject frame_begin/frame_end and GPU
+ * surface operations with DEVICE_LOST; an active frame remains cancellable.
+ * pump cancels queued work and drains started work before reclaiming resources.
+ * CPU resource operations, CAP finalization, status/report queries and release
+ * remain available. Recovery requires a new device and recreated resources.
+ * Previously completed submissions retain their status; failed GPU surface
+ * contents are unspecified and must not be used for recovery. NULL returns 0. */
 int         neox_device_is_lost(neox_device *dev);
 /* 驱动异步完成与延迟回收队列。无线程环境下这是唯一的进度来源；
  * 应用每帧至少调用一次；返回已完成的 submission 数。 */
@@ -172,13 +202,17 @@ typedef struct neox_texture_desc {
 neox_result neox_texture_create(neox_device *dev,
                                 const neox_texture_desc *desc, /* [borrow] */
                                 neox_texture *out_tex);
+/* 绘制命令固定录制时的纹理内容；更新只影响随后录制的命令。
+ * region 必须为界内、非负、有限的整数像素坐标；空区域不改变内容。
+ * 旧版本仍被命令或 CAP 引用时会写时复制，可能因预算不足返回 OOM；
+ * 失败保持原内容。输入像素在调用返回前拷贝，不要求等待旧提交完成。 */
 neox_result neox_texture_update(neox_device *dev,
                                 neox_texture tex,
                                 neox_rect region,
                                 const void *pixels,            /* [borrow] */
                                 size_t row_stride);
 /* 释放进入延迟回收：若设备尚未完成使用，实际回收由 neox_device_pump 驱动。
- * 调用后句柄立即失效（generation 递增），不得再用于绘制。 */
+ * 调用后句柄立即失效，不得再用于绘制；代际在实际回收时递增。 */
 void        neox_texture_release(neox_device *dev, neox_texture tex); /* [own] */
 
 /* ------------------------------------------------------------------ 路径 */
@@ -209,8 +243,9 @@ typedef struct neox_target_desc {
     union {
         struct {                 /* SOFT：调用方提供的帧缓冲 */
             uint8_t *pixels;     /* [borrow] RGBA8_SRGB */
-            size_t stride;
-            uint32_t width, height;
+            size_t stride;      /* >= width*4; accessible span is
+                                 * (height-1)*stride + width*4, without overflow */
+            uint32_t width, height; /* nonzero, <= INT32_MAX for Soft rasterization */
         } soft;
         void *surface;           /* GPU：平台胶水层提供的表面句柄；
                                     目标宽高从表面对象获取，不在此重复声明 */
@@ -231,7 +266,8 @@ neox_result neox_frame_begin(neox_device *dev,
                              const neox_target_desc *target,   /* [borrow] */
                              neox_frame **out_frame);
 
-/* 状态栈：初始为 {恒等变换, opacity=1, SRC_OVER, flags=0, 无裁剪} */
+/* 状态栈：初始为 {恒等变换, opacity=1, SRC_OVER, flags=0, 无裁剪}。
+ * 裁剪只录制路径引用；光栅化精度/内存错误在执行提交时报告，失败不写目标。 */
 neox_result neox_push_state(neox_frame *frame, const neox_state *state); /* [borrow] */
 neox_result neox_pop_state(neox_frame *frame);
 
@@ -255,7 +291,7 @@ typedef struct neox_glyph {
 typedef enum neox_atlas_mode {
     NEOX_ATLAS_COVERAGE = 0,  /* A8 覆盖率遮罩 */
     NEOX_ATLAS_SDF,           /* A8 单通道有向距离场 */
-    NEOX_ATLAS_MSDF           /* RGBA8_LINEAR 三通道距离场（median 重建） */
+    NEOX_ATLAS_MSDF           /* RGBA8_DATA 三通道距离场（median 重建） */
 } neox_atlas_mode;
 
 typedef struct neox_glyph_style {
@@ -269,7 +305,7 @@ neox_result neox_draw_glyphs(neox_frame *frame, neox_texture atlas,
                              const neox_glyph *glyphs, uint32_t count, /* [borrow] */
                              const neox_paint *paint);
 /* style == NULL 等价于 COVERAGE 默认。图集格式须匹配：COVERAGE/SDF → A8，
-   MSDF → NEOX_FORMAT_RGBA8_LINEAR（距离场是线性数据，禁止 sRGB 解码）；
+   MSDF → NEOX_FORMAT_RGBA8_DATA（距离场是线性数据，禁止 sRGB 解码）；
    不匹配返回 NEOX_ERROR_INVALID_ARGUMENT。语义见规范 §8.1。 */
 neox_result neox_draw_glyphs_ex(neox_frame *frame, neox_texture atlas,
                                 const neox_glyph *glyphs, uint32_t count,
@@ -280,6 +316,9 @@ neox_result neox_draw_glyphs_ex(neox_frame *frame, neox_texture atlas,
  * 成功时 out_sub 可用于查询完成状态；frame 随提交销毁。 */
 neox_result neox_frame_end(neox_frame *frame,                   /* [own] */
                            neox_submission *out_sub);
+
+/* Discard a recording frame without touching its target. */
+void neox_frame_cancel(neox_frame *frame);
 
 /* ------------------------------------------------------------------ 提交与执行报告 */
 
@@ -293,6 +332,10 @@ neox_submission_status neox_submission_get_status(neox_device *dev,
                                                   neox_submission sub);
 /* 阻塞至完成；无线程环境内部为 pump 循环。设备丢失时返回非 OK 而非死等。 */
 neox_result neox_submission_wait(neox_device *dev, neox_submission sub);
+/* Relinquish the submission/report handle. Pending work is not cancelled:
+ * pump reclaims it after completion. Target storage must still outlive work.
+ * Release every returned submission to keep long-running memory bounded. */
+void neox_submission_release(neox_device *dev, neox_submission sub);
 
 /* 实际执行路径，正式构建可用（能力协商的反馈回路） */
 #define NEOX_EXEC_USED_APPROXIMATION 0x1u
@@ -303,15 +346,17 @@ typedef struct neox_exec_report {
     uint32_t flags;
     neox_exec_algorithm algorithm;
     uint32_t draw_calls;
-    uint64_t peak_bytes;         /* 本提交经注入分配器的内部缓冲峰值；
-                                    不含 GPU 显存（其统计接口待后续版本） */
+    uint64_t peak_bytes;         /* Maximum extra live CPU bytes above each execution
+                                   phase's entry baseline (encode/resolve). Includes
+                                   failed phases; excludes recording and GPU storage.
+                                   Not an allocation sum or whole-frame budget. */
 } neox_exec_report;
 neox_result neox_submission_get_report(neox_device *dev,
                                        neox_submission sub,
                                        neox_exec_report *out_report);
 
 /* ------------------------------------------------------------------ 场景（保留模式）
- * 节点拥有稳定身份，可定点修改；内部维护脏区与依赖（增量执行）。
+ * 节点拥有稳定身份，可定点修改；当前仍全量展开和重绘，脏位仅为增量执行预留。
  * 节点引用的 texture/path 为借用关系：场景不延长资源寿命，
  * 资源释放后再渲染引用它的场景为契约错误。 */
 
@@ -331,11 +376,13 @@ typedef struct neox_node_desc {
                  neox_filter filter; } image;                   /* [borrow] */
         struct { neox_texture atlas;                            /* [borrow] */
                  const neox_glyph *glyphs;                      /* [borrow] 创建时拷贝 */
-                 uint32_t count; neox_paint paint; } glyphs;
+                 uint32_t count; neox_paint paint;
+                 neox_glyph_style style; } glyphs;
         struct { neox_path clip; } group;                       /* [borrow] 可为空 */
     };
 } neox_node_desc;
 
+#if NEOX_ENABLE_SCENE
 neox_scene  neox_scene_create(neox_device *dev);               /* 失败返回无效句柄 */
 void        neox_scene_destroy(neox_device *dev, neox_scene scene); /* [own] 级联销毁节点 */
 
@@ -359,13 +406,21 @@ neox_result neox_node_set_visible(neox_device *dev, neox_node node, int visible)
 neox_result neox_scene_render(neox_frame *frame, neox_scene scene,
                               neox_node root);                  /* root 无效 = 场景根 */
 
+#endif
+
 /* ------------------------------------------------------------------ 捕获（CAP 最小版）
  * 第一阶段仅本地录制/回放；格式带版本号，不承诺跨版本兼容。 */
 
 typedef struct neox_capture neox_capture;
 
+#if NEOX_ENABLE_CAPTURE
+/* begin/end 只能在帧之间调用。成功 frame_end 提交录制内容；frame_cancel
+ * 撤销该帧的捕获命令和资源快照。CAP 只保存绘制命令，不保存目标清屏/呈现。 */
 neox_result neox_capture_begin(neox_device *dev, neox_capture **out_cap);
-/* 结束录制，产出自包含缓冲（含资源快照与版本头）；缓冲所有权移交调用方 */
+/* 可在帧内取消捕获；已有绘制命令继续有效，后续命令不再捕获。 */
+void neox_capture_cancel(neox_capture *cap);
+/* 成功结束时消费 cap，并移交自包含缓冲；失败时 cap 仍归调用方，
+ * 可重试或 cancel。尚未结束的帧须先 frame_end 或 frame_cancel。 */
 neox_result neox_capture_end(neox_capture *cap,                 /* [own] */
                              uint8_t **out_data, size_t *out_size);
 /* 回放到当前帧。CAP 内资源 ID 经会话内映射表重建为本地句柄。
@@ -374,6 +429,8 @@ neox_result neox_capture_replay(neox_frame *frame,
                                 const uint8_t *data, size_t size); /* [borrow] */
 void        neox_capture_free_buffer(neox_context *ctx,
                                      uint8_t *data, size_t size);  /* [own] */
+
+#endif
 
 /* 回放确定性所需的注入点（规范 §10 配套）：时间源与随机源由调用方提供 */
 typedef struct neox_replay_env {

@@ -11,6 +11,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <math.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -431,8 +432,9 @@ static void wl_close(neox_window *w)
 
 static int shell_scale(const neox_window *w)
 {
-    int s = (int)(w->scale + 0.5f);
-    return s < 1 ? 1 : s;
+    double s = floor((double)w->scale + 0.5);
+    if (!isfinite(s) || s > INT32_MAX) return 0;
+    return s < 1 ? 1 : (int)s;
 }
 
 static void apply_geom(nx_wl *p)
@@ -486,9 +488,8 @@ static void on_tl_configure(void *data, void *tl, int32_t width, int32_t height,
     if (!p->opened || width <= 0 || height <= 0) return;
     if ((uint32_t)width == p->win->pt_w && (uint32_t)height == p->win->pt_h)
         return;
-    p->win->pt_w = (uint32_t)width;
-    p->win->pt_h = (uint32_t)height;
-    nx_win_recompute(p->win);
+    if (nx_win_set_geometry(p->win, (uint32_t)width, (uint32_t)height,
+                            p->win->scale) != NEOX_OK) return;
     memset(&ev, 0, sizeof ev);
     ev.kind = NEOX_WINDOW_RESIZE;
     ev.width = p->win->pt_w;
@@ -552,8 +553,8 @@ static void on_out_scale(void *data, void *out, int32_t factor)
     p->output_scale = factor;
     if (!p->win || p->win->scale_locked || !p->opened) return;
     if (p->win->scale == (float)factor) return;
-    p->win->scale = (float)factor;
-    nx_win_recompute(p->win);
+    if (nx_win_set_geometry(p->win, p->win->pt_w, p->win->pt_h,
+                            (float)factor) != NEOX_OK) return;
     memset(&ev, 0, sizeof ev);
     ev.kind = NEOX_WINDOW_SCALE;
     ev.scale = p->win->scale;
@@ -803,8 +804,13 @@ static void on_frame_done(void *data, void *cb, uint32_t time)
 
 static neox_result ensure_pool(nx_wl *p, uint32_t w, uint32_t h)
 {
-    size_t stride = (size_t)w * 4u;
-    size_t bytes = stride * (size_t)h * 2u;
+    size_t bytes;
+    /* Both pool size and buffer offsets/stride are signed protocol integers. */
+    if (!nx_win_rgba_size(w, h, &bytes) || bytes > INT32_MAX / 2u) {
+        nx_win_set_error("Wayland shared-memory buffers exceed protocol size limits");
+        return NEOX_ERROR_INVALID_ARGUMENT;
+    }
+    bytes *= 2u;
     if (p->pool && p->buf_w == w && p->buf_h == h && p->map) return NEOX_OK;
     drop_buffers(p);
     p->shm_fd = memfd_new(bytes);
@@ -1005,8 +1011,10 @@ static neox_result wl_open(neox_window *w)
     }
     if (!w->scale_locked && p->output_scale > 0)
         w->scale = (float)p->output_scale;
-    w->scale = (float)shell_scale(w);
-    nx_win_recompute(w);
+    if (nx_win_set_geometry(w, w->pt_w, w->pt_h, (float)shell_scale(w)) != NEOX_OK) {
+        wl_close(w);
+        return NEOX_ERROR_INVALID_ARGUMENT;
+    }
 
     p->surf_ver = p->comp_ver ? p->comp_ver : 1;
     p->surface = g_wl.marshal(p->compositor, 0, g_wl.surface, p->surf_ver, 0, NULL);

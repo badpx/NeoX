@@ -499,6 +499,18 @@ static void test_atlas(void)
         at = NULL;
     }
 
+    /* Width overflow must fail before copying, without consuming a shelf. */
+    CHECK_RES(nx_atlas_create(g_tctx, soft, 2, 8, &at), NEOX_OK);
+    if (at) {
+        CHECK_RES(nx_atlas_glyph(at, f, 'D', 4.0f, &rc1), NEOX_ERROR_OUT_OF_MEMORY);
+        CHECK_RES(nx_atlas_glyph(at, f, 'A', 4.0f, &rc1), NEOX_OK);
+        CHECK(rc1.x == 0 && rc1.y == 0);
+        CHECK_RES(nx_atlas_glyph(at, f, 'A', INFINITY, &rc1), NEOX_ERROR_INVALID_ARGUMENT);
+        nx_atlas_destroy(at); at = NULL;
+    }
+    CHECK_RES(nx_atlas_create_ex(g_tctx, soft, 8, 8, NEOX_ATLAS_SDF, NAN, &at), NEOX_ERROR_INVALID_ARGUMENT);
+    CHECK_RES(nx_atlas_create_ex(g_tctx, soft, 8, 8, NEOX_ATLAS_MSDF, INFINITY, &at), NEOX_ERROR_INVALID_ARGUMENT);
+
     /* 空字形（空格：零矩形，不占容量） */
     CHECK_RES(nx_atlas_create(g_tctx, soft, 64, 64, &at), NEOX_OK);
     if (at) {
@@ -667,7 +679,7 @@ static void draw_field(neox_device *soft, int msdf, float v0, float v1, float v2
     memset(&td, 0, sizeof(td));
     td.width = 8;
     td.height = 8;
-    td.format = msdf ? NEOX_FORMAT_RGBA8_LINEAR : NEOX_FORMAT_A8;
+    td.format = msdf ? NEOX_FORMAT_RGBA8_DATA : NEOX_FORMAT_A8;
     td.pixels = texels;
     td.row_stride = (size_t)8 * (msdf ? 4 : 1);
     if (neox_texture_create(soft, &td, &tex) != NEOX_OK) {
@@ -762,7 +774,7 @@ static neox_result try_style(neox_device *soft, int msdf,
     memset(&td, 0, sizeof(td));
     td.width = 8;
     td.height = 8;
-    td.format = msdf ? NEOX_FORMAT_RGBA8_LINEAR : NEOX_FORMAT_A8;
+    td.format = msdf ? NEOX_FORMAT_RGBA8_DATA : NEOX_FORMAT_A8;
     td.pixels = texels;
     td.row_stride = (size_t)8 * (msdf ? 4 : 1);
     if (neox_texture_create(soft, &td, &tex) != NEOX_OK)

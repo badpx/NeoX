@@ -65,11 +65,13 @@ typedef struct neox_mtl_device_desc {
 
 typedef struct neox_mtl_surface neox_mtl_surface;
 
-/* [own] 创建 RGBA8 sRGB 非预乘离屏表面 */
+/* [own] 创建 RGBA8 sRGB 非预乘离屏表面；dev 必须为 Metal 后端，
+ * 其他后端返回 INVALID_ARGUMENT。 */
 neox_result neox_mtl_surface_create(neox_device *dev,
                                     uint32_t width, uint32_t height,
                                     neox_mtl_surface **out_surface);
-/* [own] 销毁表面（不得在提交尚未完成时销毁被引用的表面） */
+/* [own] 销毁表面（不得在提交尚未完成时销毁被引用的表面）。
+ * dev 必须为表面所属设备；错误归属不销毁表面，并设置该 context 的错误详情。 */
 void        neox_mtl_surface_destroy(neox_device *dev,
                                      neox_mtl_surface *surface);
 

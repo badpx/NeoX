@@ -30,6 +30,7 @@ struct neox_window {
     int is_gl;
     uint8_t *soft_px;
     size_t soft_bytes;
+    uint32_t soft_w, soft_h; /* dimensions of the acquired CPU target */
 #if NEOX_ENABLE_GL
     neox_gl_surface *gl_surf;
     void *gl_native;
@@ -56,7 +57,9 @@ struct nx_win_vt {
     void (*use_visual)(neox_window *w, unsigned long visual_id);
 };
 
-void nx_win_recompute(neox_window *w);
+/* Checked geometry publication. Failure leaves all metrics unchanged. */
+neox_result nx_win_set_geometry(neox_window *w, uint32_t width, uint32_t height, float scale);
+int nx_win_rgba_size(uint32_t width, uint32_t height, size_t *bytes);
 void nx_win_push_event(neox_window *w, const neox_window_event *ev);
 void nx_win_set_error(const char *msg);
 

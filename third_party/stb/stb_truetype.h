@@ -2273,11 +2273,13 @@ static int stbtt__GetGlyphShapeT2(const stbtt_fontinfo *info, int glyph_index, s
    stbtt__csctx output_ctx = STBTT__CSCTX_INIT(0);
    if (stbtt__run_charstring(info, glyph_index, &count_ctx)) {
       *pvertices = (stbtt_vertex*)STBTT_malloc(count_ctx.num_vertices*sizeof(stbtt_vertex), info->userdata);
+      if (*pvertices == NULL) return 0; // NeoX: allocation failure
       output_ctx.pvertices = *pvertices;
       if (stbtt__run_charstring(info, glyph_index, &output_ctx)) {
          STBTT_assert(output_ctx.num_vertices == count_ctx.num_vertices);
          return output_ctx.num_vertices;
       }
+      STBTT_free(*pvertices, info->userdata); // NeoX: failed CFF decode
    }
    *pvertices = NULL;
    return 0;
@@ -2836,7 +2838,7 @@ static stbtt__active_edge *stbtt__new_active(stbtt__hheap *hh, stbtt__edge *e, i
 {
    stbtt__active_edge *z = (stbtt__active_edge *) stbtt__hheap_alloc(hh, sizeof(*z), userdata);
    float dxdy = (e->x1 - e->x0) / (e->y1 - e->y0);
-   STBTT_assert(z != NULL);
+   // NeoX: allocation failure is handled by the NULL return below.
    if (!z) return z;
 
    // round dx down to avoid overshooting
@@ -2858,7 +2860,7 @@ static stbtt__active_edge *stbtt__new_active(stbtt__hheap *hh, stbtt__edge *e, i
 {
    stbtt__active_edge *z = (stbtt__active_edge *) stbtt__hheap_alloc(hh, sizeof(*z), userdata);
    float dxdy = (e->x1 - e->x0) / (e->y1 - e->y0);
-   STBTT_assert(z != NULL);
+   // NeoX: allocation failure is handled by the NULL return below.
    //STBTT_assert(e->y0 <= start_point);
    if (!z) return z;
    z->fdx = dxdy;
@@ -2934,6 +2936,8 @@ static void stbtt__rasterize_sorted_edges(stbtt__bitmap *result, stbtt__edge *e,
       scanline = (unsigned char *) STBTT_malloc(result->w, userdata);
    else
       scanline = scanline_data;
+
+   if (scanline == NULL) return; // NeoX: propagate allocation failure via allocator
 
    y = off_y * vsubsample;
    e[n].y0 = (off_y + result->h) * (float) vsubsample + 1;
@@ -3307,6 +3311,8 @@ static void stbtt__rasterize_sorted_edges(stbtt__bitmap *result, stbtt__edge *e,
       scanline = (float *) STBTT_malloc((result->w*2+1) * sizeof(float), userdata);
    else
       scanline = scanline_data;
+
+   if (scanline == NULL) return; // NeoX: propagate allocation failure via allocator
 
    scanline2 = scanline + result->w;
 
@@ -4612,6 +4618,13 @@ STBTT_DEF unsigned char * stbtt_GetGlyphSDF(const stbtt_fontinfo *info, float sc
       int num_verts = stbtt_GetGlyphShape(info, glyph, &verts);
       data = (unsigned char *) STBTT_malloc(w * h, info->userdata);
       precompute = (float *) STBTT_malloc(num_verts * sizeof(float), info->userdata);
+      // NeoX: SDF must not dereference failed allocations.
+      if (!data || !precompute || !verts || num_verts <= 0) {
+         STBTT_free(data, info->userdata);
+         STBTT_free(precompute, info->userdata);
+         STBTT_free(verts, info->userdata);
+         return NULL;
+      }
 
       for (i=0,j=num_verts-1; i < num_verts; j=i++) {
          if (verts[i].type == STBTT_vline) {

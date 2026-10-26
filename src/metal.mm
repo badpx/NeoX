@@ -34,7 +34,7 @@
  * retain/release；所有 CPU 分配走注入分配器。GL 对象随 device destroy 全清
  * （shutdown 前等待在途 command buffer 完成，避免完成回调触碰已释放状态）。
  * =========================================================================*/
-#include "internal.h"
+#include "execution.h"
 #include "neox_mtl.h"
 
 #import <Metal/Metal.h>
@@ -91,7 +91,7 @@ static const char *NX_MSL_SRC =
     "    return nx_fill_core(in, u, mask, premul, o1a);\n"
     "}\n"
     "\n"
-    "struct NxDsOut { float4 c0 [[color(0)]]; float4 c1 [[color(1)]]; };\n"
+    "struct NxDsOut { float4 c0 [[color(0), index(0)]]; float4 c1 [[color(0), index(1)]]; };\n"
     "\n"
     "fragment NxDsOut nx_fs_fill_ds(NxVsOut in [[stage_in]], constant NxUFill &u [[buffer(0)]],\n"
     "                               texture2d<float> mask [[texture(0)]],\n"
@@ -108,23 +108,22 @@ static const char *NX_MSL_SRC =
     "/* a = {ss, mode, linear, opacity}；b = src.xywh；c = dst.xywh；d = {tex_w, tex_h, 0, 0}\n"
     " * e/f/g = u_inv 三列（设备 → 局部） */\n"
     "\n"
-    "float4 nx_tex_core(NxVsOut in, constant NxUTex &u, texture2d<float> tex,\n"
-    "                   thread float &o1a) {\n"
+    "float4 nx_tex_core(NxVsOut in, constant NxUTex &u, texture2d<float> tex) {\n"
     "    float2 devc = floor(in.p.xy / u.a.x) + 0.5f;\n"
     "    float3 l = u.e.xyz * devc.x + u.f.xyz * devc.y + u.g.xyz;\n"
     "    float tu = (l.x - u.c.x) / u.c.z;\n"
     "    float tv = (l.y - u.c.y) / u.c.w;\n"
-    "    if (tu < 0.0f || tu > 1.0f || tv < 0.0f || tv > 1.0f) discard_fragment();\n"
+    "    if (!(tu >= 0.0f && tu <= 1.0f && tv >= 0.0f && tv <= 1.0f)) discard_fragment();\n"
     "    float uu = u.b.x + tu * u.b.z;\n"
     "    float vv = u.b.y + tv * u.b.w;\n"
     "    int tw = int(u.d.x), th = int(u.d.y);\n"
     "    float4 cc;\n"
     "    if (u.a.z < 0.5f) {\n"
-    "        int i = clamp(int(floor(uu)), 0, tw - 1);\n"
-    "        int j = clamp(int(floor(vv)), 0, th - 1);\n"
+    "        int i = int(floor(clamp(uu, 0.0f, float(tw - 1))));\n"
+    "        int j = int(floor(clamp(vv, 0.0f, float(th - 1))));\n"
     "        cc = tex.read(uint2(i, j));\n"
     "    } else {\n"
-    "        float x = uu - 0.5f, y = vv - 0.5f;\n"
+    "        float x = clamp(uu - 0.5f, 0.0f, float(tw - 1)), y = clamp(vv - 0.5f, 0.0f, float(th - 1));\n"
     "        float fx = x - floor(x), fy = y - floor(y);\n"
     "        int i0 = clamp(int(floor(x)), 0, tw - 1);\n"
     "        int i1 = clamp(int(floor(x)) + 1, 0, tw - 1);\n"
@@ -138,26 +137,12 @@ static const char *NX_MSL_SRC =
     "           + p01 * ((1.0f - fx) * fy) + p11 * (fx * fy);\n"
     "    }\n"
     "    float sa = cc.a * u.a.w;\n"
-    "    int m = int(u.a.y);\n"
-    "    o1a = NX_O1A(m, 1.0f, sa);\n"
-    "    float oa = (m == 1) ? 1.0f : ((m == 6) ? 1.0f - sa : sa);\n"
-    "    return float4(cc.rgb * u.a.w, oa);\n"
+    "    return float4(cc.rgb * u.a.w, sa);\n"
     "}\n"
     "\n"
     "fragment float4 nx_fs_tex(NxVsOut in [[stage_in]], constant NxUTex &u [[buffer(0)]],\n"
     "                          texture2d<float> tex [[texture(0)]]) {\n"
-    "    float o1a;\n"
-    "    return nx_tex_core(in, u, tex, o1a);\n"
-    "}\n"
-    "\n"
-    "fragment NxDsOut nx_fs_tex_ds(NxVsOut in [[stage_in]], constant NxUTex &u [[buffer(0)]],\n"
-    "                              texture2d<float> tex [[texture(0)]]) {\n"
-    "    float o1a;\n"
-    "    float4 c0 = nx_tex_core(in, u, tex, o1a);\n"
-    "    NxDsOut o;\n"
-    "    o.c0 = c0;\n"
-    "    o.c1 = float4(0.0, 0.0, 0.0, o1a);\n"
-    "    return o;\n"
+    "    return nx_tex_core(in, u, tex);\n"
     "}\n"
     "\n"
     "float nx_median3(float a, float b, float c) {\n"
@@ -190,17 +175,17 @@ static const char *NX_MSL_SRC =
     "}\n"
     "\n"
     "struct NxUGlyph { float4 a, b, c, d, e, f, g, h; };\n"
-    "/* a = {ss, mode, 0, 0}；b = paint；c = glyph.xywh；d = atlas_rect.xywh\n"
+    "/* a = {ss, mode, 0, 0}；b = paint；c = glyph.xywh；d = {atlas_x,atlas_y,local_to_texel_x,local_to_texel_y}\n"
     " * e/f/g = u_inv 三列；h = {atlas_mode, dist_range, softness, sdf_scale} */\n"
     "\n"
     "float4 nx_glyph_core(NxVsOut in, constant NxUGlyph &u, texture2d<float> atlas,\n"
     "                     thread float &o1a) {\n"
     "    float2 devc = floor(in.p.xy / u.a.x) + 0.5f;\n"
     "    float3 l = u.e.xyz * devc.x + u.f.xyz * devc.y + u.g.xyz;\n"
-    "    if (l.x < u.c.x || l.x > u.c.x + u.c.z ||\n"
-    "        l.y < u.c.y || l.y > u.c.y + u.c.w) discard_fragment();\n"
-    "    float cov = nx_glyph_cov(float2(u.d.x + (l.x - u.c.x),\n"
-    "                                    u.d.y + (l.y - u.c.y)), u.h, atlas);\n"
+    "    if (!(l.x >= u.c.x && l.x <= u.c.x + u.c.z &&\n"
+    "        l.y >= u.c.y && l.y <= u.c.y + u.c.w)) discard_fragment();\n"
+    "    float cov = nx_glyph_cov(float2(u.d.x + (l.x - u.c.x) * u.d.z,\n"
+    "                                    u.d.y + (l.y - u.c.y) * u.d.w), u.h, atlas);\n"
     "    int m = int(u.a.y);\n"
     "    float pa = u.b.a;\n"
     "    o1a = NX_O1A(m, cov, pa);\n"
@@ -265,15 +250,15 @@ static const char *NX_MSL_SRC =
     "fragment float4 nx_fs_plusglyph(NxVsOut in [[stage_in]], constant NxUGlyph &u [[buffer(0)]],\n"
     "                                texture2d<float> atlas [[texture(0)]],\n"
     "                                texture2d<float> layer [[texture(1)]]) {\n"
-    "    float2 devc = floor(in.p.xy / u.a.x) + 0.5f;\n"
-    "    float3 l = u.e.xyz * devc.x + u.f.xyz * devc.y + u.g.xyz;\n"
-    "    if (l.x < u.c.x || l.x > u.c.x + u.c.z ||\n"
-    "        l.y < u.c.y || l.y > u.c.y + u.c.w) discard_fragment();\n"
-    "    float uu = u.d.x + (l.x - u.c.x);\n"
-    "    float vv = u.d.y + (l.y - u.c.y);\n"
-    "    float cov = nx_glyph_cov(float2(uu, vv), u.h, atlas);\n"
     "    uint2 dp = uint2(in.p.xy / u.a.x);\n"
     "    float4 dst = layer.read(dp);\n"
+    "    float2 devc = floor(in.p.xy / u.a.x) + 0.5f;\n"
+    "    float3 l = u.e.xyz * devc.x + u.f.xyz * devc.y + u.g.xyz;\n"
+    "    if (!(l.x >= u.c.x && l.x <= u.c.x + u.c.z &&\n"
+    "        l.y >= u.c.y && l.y <= u.c.y + u.c.w)) return dst;\n"
+    "    float uu = u.d.x + (l.x - u.c.x) * u.d.z;\n"
+    "    float vv = u.d.y + (l.y - u.c.y) * u.d.w;\n"
+    "    float cov = nx_glyph_cov(float2(uu, vv), u.h, atlas);\n"
     "    if (cov <= 0.0f) return dst;\n"
     "    float4 sc = u.b * cov;\n"
     "    return min(sc + cov * dst, float4(cov)) + (1.0f - cov) * dst;\n"
@@ -285,15 +270,15 @@ static const char *NX_MSL_SRC =
     "                                constant NxUGlyph &u [[buffer(0)]],\n"
     "                                texture2d<float> atlas [[texture(0)]],\n"
     "                                texture2d<float> layer [[texture(1)]]) {\n"
-    "    float2 devc = floor(in.p.xy / u.a.x) + 0.5f;\n"
-    "    float3 l = u.e.xyz * devc.x + u.f.xyz * devc.y + u.g.xyz;\n"
-    "    if (l.x < u.c.x || l.x > u.c.x + u.c.z ||\n"
-    "        l.y < u.c.y || l.y > u.c.y + u.c.w) discard_fragment();\n"
-    "    float uu = u.d.x + (l.x - u.c.x);\n"
-    "    float vv = u.d.y + (l.y - u.c.y);\n"
-    "    float cov = nx_glyph_cov(float2(uu, vv), u.h, atlas);\n"
     "    uint2 dp = uint2(in.p.xy / u.a.x);\n"
     "    float4 dst = layer.read(dp);\n"
+    "    float2 devc = floor(in.p.xy / u.a.x) + 0.5f;\n"
+    "    float3 l = u.e.xyz * devc.x + u.f.xyz * devc.y + u.g.xyz;\n"
+    "    if (!(l.x >= u.c.x && l.x <= u.c.x + u.c.z &&\n"
+    "        l.y >= u.c.y && l.y <= u.c.y + u.c.w)) return dst;\n"
+    "    float uu = u.d.x + (l.x - u.c.x) * u.d.z;\n"
+    "    float vv = u.d.y + (l.y - u.c.y) * u.d.w;\n"
+    "    float cov = nx_glyph_cov(float2(uu, vv), u.h, atlas);\n"
     "    if (cov <= 0.0f) return dst;\n"
     "    float4 s = u.b;\n"
     "    int m = int(u.a.y);\n"
@@ -334,7 +319,8 @@ typedef struct nx_mtl_rt {          /* 渲染目标池项（层 / 掩码纹理�
 
 typedef struct nx_mtl_texent {      /* 纹理槽 → MTLTexture（惰性上传） */
     id<MTLTexture> tex;
-    uint32_t version;
+    uint64_t version;
+    uint32_t generation;
 } nx_mtl_texent;
 
 struct neox_mtl_surface {
@@ -350,7 +336,7 @@ typedef struct nx_mtl_inflight {
     id<MTLBuffer> vbo;              /* +1，poll/destroy 释放 */
     nx_mtl_rt *base;
     nx_mtl_rt **held;               /* 执行期占用的纹理（poll 完成后归还池） */
-    uint32_t nheld;
+    uint32_t nheld, capheld;
     int completed;                  /* 完成回调置位（lock 保护） */
 } nx_mtl_inflight;
 
@@ -361,13 +347,13 @@ typedef struct nx_mtl_dev {
     id<MTLCommandQueue> queue;
     id<MTLLibrary> lib;
     id<MTLFunction> vs;
-    id<MTLFunction> fs_fill, fs_fill_ds, fs_tex, fs_tex_ds, fs_glyph, fs_glyph_ds;
+    id<MTLFunction> fs_fill, fs_fill_ds, fs_tex, fs_glyph, fs_glyph_ds;
     id<MTLFunction> fs_comp, fs_blit, fs_clamp, fs_plusfill, fs_plusglyph, fs_manual;
     id<MTLFunction> fs_manualglyph;
     /* 每程序 × 混合模式的管线（blend 因子内建于管线；dual 模式单独一套）。
      * dual_ok = 0 时 SRC/SRC_IN/SRC_OUT/DST_ATOP 走 ps_manual ping-pong。 */
     id<MTLRenderPipelineState> ps_fill[NX_MTL_NMODE], ps_fill_ds[NX_MTL_NMODE];
-    id<MTLRenderPipelineState> ps_tex[NX_MTL_NMODE], ps_tex_ds[NX_MTL_NMODE];
+    id<MTLRenderPipelineState> ps_tex[NX_MTL_NMODE];
     id<MTLRenderPipelineState> ps_glyph[NX_MTL_NMODE], ps_glyph_ds[NX_MTL_NMODE];
     id<MTLRenderPipelineState> ps_comp[NX_MTL_NMODE];
     id<MTLRenderPipelineState> ps_blit, ps_clamp, ps_plusfill, ps_plusglyph, ps_manual;
@@ -475,7 +461,7 @@ static neox_result mtl_rt_acquire(neox_context *ctx, nx_mtl_dev *g,
 
 static void mtl_rt_release(nx_mtl_rt *rt) { rt->in_use = 0; }
 
-/* CPU → 纹理上传（replaceRegion；行距由调用方按 16 字节对齐保证） */
+/* CPU → 纹理上传（replaceRegion；行距按纹理像素大小对齐） */
 static void mtl_upload(id<MTLTexture> tex, uint32_t w, uint32_t h,
                        const void *data, uint32_t stride_bytes)
 {
@@ -485,7 +471,7 @@ static void mtl_upload(id<MTLTexture> tex, uint32_t w, uint32_t h,
 
 /* 纹理槽惰性上传（version 失效标记；同 gl_tex_ensure） */
 static neox_result mtl_tex_ensure(neox_context *ctx, nx_mtl_dev *g,
-                                  neox_device *dev, uint32_t idx)
+                                  neox_device *dev, uint32_t idx, const nx_tex_data *data)
 {
     const nx_tex_slot *s = &((nx_tex_slot *)dev->textures.slots)[idx];
     nx_mtl_texent *e;
@@ -499,8 +485,10 @@ static neox_result mtl_tex_ensure(neox_context *ctx, nx_mtl_dev *g,
         g->ntexs = idx + 1;
     }
     e = &g->texs[idx];
-    if (e->tex && e->version == s->version) return NEOX_OK;
-    if (!e->tex) {
+    if (e->tex && e->generation == s->gen && e->version == data->version) return NEOX_OK;
+    e->version=0; /* A failed upload must never validate an empty replacement. */
+    if (e->tex) { [e->tex release]; e->tex = nil; }
+    {
         MTLTextureDescriptor *td =
             [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
                 width:s->width height:s->height mipmapped:NO];
@@ -512,12 +500,19 @@ static neox_result mtl_tex_ensure(neox_context *ctx, nx_mtl_dev *g,
             return NEOX_ERROR_OUT_OF_MEMORY;
         }
     }
-    /* 注：replaceRegion 与 pending GPU 读无隐式同步。纹理更新若可能撞上在途
-     * 提交，调用方应先经 pump/wait 排空（帧协议保证：录制新帧前上一帧已
-     * 完成——与 CAP 回放、跨帧资源复用同一契约）。 */
-    mtl_upload(e->tex, s->width, s->height, s->px,
-               (uint32_t)s->width * 16u);
-    e->version = s->version;
+    if(data->linear) mtl_upload(e->tex,s->width,s->height,(const float *)data->pixels,s->width*16u);
+    else {
+        float *row=(float *)nx_alloc(ctx,(size_t)s->width*16,16);
+        if(!row)return NEOX_ERROR_OUT_OF_MEMORY;
+        for(uint32_t y=0;y<s->height;y++) {
+            nx_texture_expand_row(s,data,y,row);
+            [e->tex replaceRegion:MTLRegionMake2D(0,y,s->width,1) mipmapLevel:0
+                withBytes:row bytesPerRow:s->width*16u];
+        }
+        nx_free(ctx,row,(size_t)s->width*16,16);
+    }
+    e->version = data->version;
+    e->generation = s->gen;
     return NEOX_OK;
 }
 
@@ -543,7 +538,7 @@ static id<MTLRenderPipelineState> mtl_make_pipe(nx_mtl_dev *g, id<MTLFunction> f
     }
     ps = [g->device newRenderPipelineStateWithDescriptor:pd error:&err];  /* +1 */
     [pd release];
-    if (err) [err release];
+    /* NSError out-parameter is borrowed under MRC. */
     return ps;
 }
 
@@ -662,6 +657,9 @@ static void mtl_copy_back(nx_mtl_dev *g, nx_mtl_enc *e, nx_mtl_rt *src,
     NSUInteger off;
     MTLScissorRect sc;
     float ublit[4] = { (float)NEOX_MTL_SS, 0.0f, 0.0f, 0.0f };
+    minx = fmaxf(0.0f, floorf(minx)); miny = fmaxf(0.0f, floorf(miny));
+    maxx = fminf((float)e->W, ceilf(maxx)); maxy = fminf((float)e->H, ceilf(maxy));
+    if (maxx <= minx || maxy <= miny) return;
     enc = mtl_pass(g, e, dst->tex, MTLLoadActionLoad);
     sc.x = (NSUInteger)(minx * NEOX_MTL_SS);
     sc.y = (NSUInteger)(miny * NEOX_MTL_SS);
@@ -676,18 +674,18 @@ static void mtl_copy_back(nx_mtl_dev *g, nx_mtl_enc *e, nx_mtl_rt *src,
 /* 凸四边形各边外扩 d（设备像素）：与 gl.c gl_inflate_quad 同算法——纹理/字形
  * 四边形的覆盖判定在参照后端是"设备像素中心二值包含"，外扩保证被保留像素
  * 的全部子像素产生 fragment。 */
-static void mtl_inflate_quad(const float xc[4], const float yc[4], float d,
+static int mtl_inflate_quad(const float xc[4], const float yc[4], float d,
                              float ox[4], float oy[4])
 {
-    float cx = (xc[0] + xc[1] + xc[2] + xc[3]) * 0.25f;
-    float cy = (yc[0] + yc[1] + yc[2] + yc[3]) * 0.25f;
-    float A[4], B[4], C[4];
+    double cx = ((double)xc[0] + xc[1] + xc[2] + xc[3]) * 0.25f;
+    double cy = ((double)yc[0] + yc[1] + yc[2] + yc[3]) * 0.25f;
+    double A[4], B[4], C[4];
     int i;
     for (i = 0; i < 4; i++) {
         int i2 = (i + 1) & 3;
-        float dx = xc[i2] - xc[i], dy = yc[i2] - yc[i];
-        float len = sqrtf(dx * dx + dy * dy);
-        float nx, ny;
+        double dx = (double)xc[i2] - xc[i], dy = (double)yc[i2] - yc[i];
+        double len = sqrt(dx * dx + dy * dy);
+        double nx, ny;
         if (len == 0.0f) { A[i] = 0.0f; B[i] = 0.0f; C[i] = 0.0f; continue; }
         nx = -dy / len;
         ny = dx / len;
@@ -697,11 +695,14 @@ static void mtl_inflate_quad(const float xc[4], const float yc[4], float d,
     }
     for (i = 0; i < 4; i++) {
         int i0 = (i + 3) & 3;
-        float det = A[i0] * B[i] - A[i] * B[i0];
+        double det = A[i0] * B[i] - A[i] * B[i0];
         if (det == 0.0f) { ox[i] = xc[i]; oy[i] = yc[i]; continue; }
-        ox[i] = (C[i0] * B[i] - C[i] * B[i0]) / det;
-        oy[i] = (A[i0] * C[i] - A[i] * C[i0]) / det;
+        double x = (C[i0] * B[i] - C[i] * B[i0]) / det;
+        double y = (A[i0] * C[i] - A[i] * C[i0]) / det;
+        if (!isfinite(x) || !isfinite(y) || fabs(x) > FLT_MAX || fabs(y) > FLT_MAX) return 0;
+        ox[i] = (float)x; oy[i] = (float)y;
     }
+    return 1;
 }
 
 /* PLUS 后的整层 clamp（等价 gl_clamp_layer：tmp clamp 再拷回） */
@@ -735,14 +736,8 @@ static void mtl_state_destroy(neox_context *ctx, nx_mtl_dev *g)
     if (!g) return;
     if (g->device) {
         /* 等待在途提交完成：完成回调会触碰 lock/done，必须先排空 */
-        for (;;) {
-            id<MTLCommandBuffer> cb = nil;
-            pthread_mutex_lock(&g->lock);
-            if (g->ninflight > 0) cb = [g->inflight[0].cb retain];
-            pthread_mutex_unlock(&g->lock);
-            if (!cb) break;
-            [cb waitUntilCompleted];
-            [cb release];
+        for (i = 0; i < g->ninflight; i++) {
+            [g->inflight[i].cb waitUntilCompleted];
         }
     }
     pthread_mutex_lock(&g->lock);
@@ -754,13 +749,13 @@ static void mtl_state_destroy(neox_context *ctx, nx_mtl_dev *g)
             mtl_rt_release(g->inflight[i].held[h2]);
         if (g->inflight[i].held)
             nx_free(ctx, g->inflight[i].held,
-                    (size_t)g->inflight[i].nheld * sizeof(nx_mtl_rt *), 16);
+                    (size_t)g->inflight[i].capheld * sizeof(nx_mtl_rt *), 16);
     }
     g->ninflight = 0;
     pthread_mutex_unlock(&g->lock);
     for (i = 0; i < NX_MTL_NMODE; i++) {
         [g->ps_fill[i] release]; [g->ps_fill_ds[i] release];
-        [g->ps_tex[i] release]; [g->ps_tex_ds[i] release];
+        [g->ps_tex[i] release];
         [g->ps_glyph[i] release]; [g->ps_glyph_ds[i] release];
         [g->ps_comp[i] release];
     }
@@ -769,7 +764,7 @@ static void mtl_state_destroy(neox_context *ctx, nx_mtl_dev *g)
     [g->ps_manual release]; [g->ps_manual_glyph release];
     [g->vs release];
     [g->fs_fill release]; [g->fs_fill_ds release];
-    [g->fs_tex release]; [g->fs_tex_ds release];
+    [g->fs_tex release];
     [g->fs_glyph release]; [g->fs_glyph_ds release];
     [g->fs_comp release]; [g->fs_blit release]; [g->fs_clamp release];
     [g->fs_plusfill release]; [g->fs_plusglyph release];
@@ -852,7 +847,7 @@ static neox_result mtl_device_init(neox_device *dev, const void *platform,
         g->device = MTLCreateSystemDefaultDevice();
     }
     if (!g->device) {
-        nx_free(ctx, g, sizeof(nx_mtl_dev), 16);
+        mtl_state_destroy(ctx, g);
         NX_ERR(ctx, "Metal: no default MTLDevice", NEOX_ERROR_BACKEND);
     }
     if (mtd.command_queue) {
@@ -861,9 +856,7 @@ static neox_result mtl_device_init(neox_device *dev, const void *platform,
         g->queue = [g->device newCommandQueue];  /* +1 */
     }
     if (!g->queue) {
-        pthread_mutex_destroy(&g->lock);
-        [g->device release];
-        nx_free(ctx, g, sizeof(nx_mtl_dev), 16);
+        mtl_state_destroy(ctx, g);
         NX_ERR(ctx, "Metal: command queue creation failed",
                NEOX_ERROR_BACKEND);
     }
@@ -873,7 +866,6 @@ static neox_result mtl_device_init(neox_device *dev, const void *platform,
         NSError *err = nil;
         NSString *src = [NSString stringWithUTF8String:NX_MSL_SRC];
         g->lib = [g->device newLibraryWithSource:src options:nil error:&err];  /* +1 */
-        if (err) [err release];
         if (!g->lib) {
             mtl_state_destroy(ctx, g);
             NX_ERR(ctx, "Metal: MSL library compilation failed",
@@ -889,7 +881,6 @@ static neox_result mtl_device_init(neox_device *dev, const void *platform,
     NX_GETFN(g->fs_fill, "nx_fs_fill");
     NX_GETFN(g->fs_fill_ds, "nx_fs_fill_ds");
     NX_GETFN(g->fs_tex, "nx_fs_tex");
-    NX_GETFN(g->fs_tex_ds, "nx_fs_tex_ds");
     NX_GETFN(g->fs_glyph, "nx_fs_glyph");
     NX_GETFN(g->fs_glyph_ds, "nx_fs_glyph_ds");
     NX_GETFN(g->fs_comp, "nx_fs_comp");
@@ -910,30 +901,38 @@ static neox_result mtl_device_init(neox_device *dev, const void *platform,
         else
             g->ps_fill[m] = mtl_make_pipe(g, g->fs_fill,
                                           NX_MTL_COV[m].sb, NX_MTL_COV[m].db, 1);
-        g->ps_tex[m] = mtl_make_pipe(g, NX_MTL_COV[m].dual ? g->fs_tex_ds : g->fs_tex,
-                                     NX_MTL_COV[m].sb, NX_MTL_COV[m].db, 1);
-        g->ps_glyph[m] = mtl_make_pipe(g, NX_MTL_COV[m].dual ? g->fs_glyph_ds : g->fs_glyph,
-                                       NX_MTL_COV[m].sb, NX_MTL_COV[m].db, 1);
+        /* Texture containment is binary: surviving fragments carry true
+         * premultiplied alpha, so ordinary Porter-Duff needs no dual source. */
+        g->ps_tex[m] = mtl_make_pipe(g, g->fs_tex,
+                                     NX_MTL_PLAIN[m].sb, NX_MTL_PLAIN[m].db, 1);
+        if (NX_MTL_COV[m].dual)
+            g->ps_glyph_ds[m] = mtl_make_pipe(g, g->fs_glyph_ds,
+                                             NX_MTL_COV[m].sb, NX_MTL_COV[m].db, 1);
+        else
+            g->ps_glyph[m] = mtl_make_pipe(g, g->fs_glyph,
+                                          NX_MTL_COV[m].sb, NX_MTL_COV[m].db, 1);
         g->ps_comp[m] = mtl_make_pipe(g, g->fs_comp,
                                       NX_MTL_PLAIN[m].sb, NX_MTL_PLAIN[m].db, 1);
     }
     for (m = 0; m < NX_MTL_NMODE; m++) {
-        if (NX_MTL_COV[m].dual && !g->ps_fill_ds[m]) g->dual_ok = 0;
+        if (NX_MTL_COV[m].dual && (!g->ps_fill_ds[m] || !g->ps_glyph_ds[m])) g->dual_ok = 0;
     }
     /* 测试钩子：强制走 ping-pong 手动混合回退路径（验证无双源硬件下的行为） */
     if (getenv("NEOX_MTL_FORCE_NO_DUAL")) g->dual_ok = 0;
+    if (getenv("NEOX_MTL_REQUIRE_DUAL") && !g->dual_ok) {
+        mtl_state_destroy(ctx, g);
+        NX_ERR(ctx, "Metal: dual-source blending required but unavailable", NEOX_ERROR_UNSUPPORTED);
+    }
     if (!g->dual_ok) {
         /* 无双源混合：清掉 dual 管线，四模式走 ps_manual ping-pong */
         for (m = 0; m < NX_MTL_NMODE; m++) {
             if (NX_MTL_COV[m].dual) {
                 [g->ps_fill[m] release]; g->ps_fill[m] = nil;
                 [g->ps_fill_ds[m] release]; g->ps_fill_ds[m] = nil;
-                [g->ps_tex[m] release]; g->ps_tex[m] = nil;
                 [g->ps_glyph[m] release]; g->ps_glyph[m] = nil;
+                [g->ps_glyph_ds[m] release]; g->ps_glyph_ds[m] = nil;
                 g->ps_fill[m] = mtl_make_pipe(g, g->fs_fill,
                                               MTLBlendFactorOne, MTLBlendFactorZero, 0);
-                g->ps_tex[m] = mtl_make_pipe(g, g->fs_tex,
-                                             MTLBlendFactorOne, MTLBlendFactorZero, 0);
                 g->ps_glyph[m] = mtl_make_pipe(g, g->fs_glyph,
                                                MTLBlendFactorOne, MTLBlendFactorZero, 0);
             }
@@ -953,7 +952,9 @@ static neox_result mtl_device_init(neox_device *dev, const void *platform,
     g->ps_plusglyph = mtl_make_pipe(g, g->fs_plusglyph, MTLBlendFactorOne,
                                     MTLBlendFactorZero, 0);
     for (m = 0; m < NX_MTL_NMODE; m++) {
-        if (!g->ps_fill[m] || !g->ps_tex[m] || !g->ps_glyph[m] || !g->ps_comp[m]) {
+        int dual = NX_MTL_COV[m].dual && g->dual_ok;
+        if (!(dual ? g->ps_fill_ds[m] : g->ps_fill[m]) || !g->ps_tex[m] ||
+            !(dual ? g->ps_glyph_ds[m] : g->ps_glyph[m]) || !g->ps_comp[m]) {
             mtl_state_destroy(ctx, g);
             NX_ERR(ctx, "Metal: render pipeline creation failed",
                    NEOX_ERROR_BACKEND);
@@ -1048,7 +1049,9 @@ static neox_result mtl_fill_prep(neox_context *ctx, nx_mtl_dev *g,
     if (!g->mask || g->mask_w != w || g->mask_h != h) {
         if (g->mask)
             nx_free(ctx, g->mask, (size_t)g->mask_h * g->mask_stride, 16);
-        mstride = (w * 4u + 15u) & ~15u;
+        /* Rasterizer writes tightly packed rows; Metal accepts a row pitch
+         * aligned to the pixel size for replaceRegion. */
+        mstride = w * 4u;
         g->mask = (float *)nx_alloc(ctx, (size_t)mstride * h, 16);
         if (!g->mask) { g->mask_w = g->mask_h = 0; return NEOX_ERROR_OUT_OF_MEMORY; }
         g->mask_w = w; g->mask_h = h; g->mask_stride = mstride;
@@ -1139,6 +1142,11 @@ static neox_result mtl_fill_path(neox_device *dev, nx_mtl_dev *g, nx_mtl_enc *e,
         if (y > maxy) maxy = y;
     }
     nx_flat_free(ctx, &flat);
+    /* Coverage is already evaluated in target space. Bound the cover quad
+     * before GPU vertex arithmetic and manual-blend integer scissor conversion. */
+    minx = (float)nx_pixel_floor(minx, e->W); miny = (float)nx_pixel_floor(miny, e->H);
+    maxx = (float)nx_pixel_ceil(maxx, e->W); maxy = (float)nx_pixel_ceil(maxy, e->H);
+    if (maxx <= minx || maxy <= miny) return NEOX_OK;
     nx_paint_to_premul_linear(*color, paint);
     r = mtl_fill_prep(ctx, g, ps, ctm, paint, e->W, e->H, &mrt, &prt);
     if (r != NEOX_OK) return r;
@@ -1194,17 +1202,21 @@ static neox_result mtl_draw_tex(neox_device *dev, nx_mtl_dev *g, nx_mtl_enc *e,
     NSUInteger off;
     neox_result r;
     if (cmd->dst.w == 0.0f || cmd->dst.h == 0.0f) return NEOX_OK;
-    if (nx_affine_det(ctm) == 0.0f) return NEOX_OK; /* §3 退化变换 */
-    if (!nx_affine_invert(ctm, &inv)) return NEOX_OK;
+    int inverse_status = nx_affine_invert(ctm, &inv);
+    if (!inverse_status) return NEOX_OK;
+    if (inverse_status < 0)
+        NX_ERR(dev->ctx, "inverse transform exceeds numeric range", NEOX_ERROR_INVALID_ARGUMENT);
+    neox_rect sample_dst;
+    if (!nx_sample_transform(inv,cmd->dst,e->W,e->H,&inv,&sample_dst))
+        NX_ERR(dev->ctx, "sampling transform exceeds float range", NEOX_ERROR_UNSUPPORTED);
     idx = (uint32_t)(tx - (const nx_tex_slot *)dev->textures.slots);
-    r = mtl_tex_ensure(dev->ctx, g, dev, idx);
+    r = mtl_tex_ensure(dev->ctx, g, dev, idx, cmd->texture);
     if (r != NEOX_OK) return r;
-    nx_affine_apply(ctm, cmd->dst.x, cmd->dst.y, &xc[0], &yc[0]);
-    nx_affine_apply(ctm, cmd->dst.x + cmd->dst.w, cmd->dst.y, &xc[1], &yc[1]);
-    nx_affine_apply(ctm, cmd->dst.x + cmd->dst.w, cmd->dst.y + cmd->dst.h,
-                    &xc[2], &yc[2]);
-    nx_affine_apply(ctm, cmd->dst.x, cmd->dst.y + cmd->dst.h, &xc[3], &yc[3]);
-    mtl_inflate_quad(xc, yc, 0.6f, ix, iy);
+    if (!nx_affine_quad(ctm, cmd->dst, xc, yc))
+        NX_ERR(dev->ctx, "transformed texture coordinates exceed numeric range", NEOX_ERROR_INVALID_ARGUMENT);
+    if (!mtl_inflate_quad(xc, yc, 0.6f, ix, iy))
+            NX_ERR(dev->ctx, "inflated geometry exceeds numeric range", NEOX_ERROR_INVALID_ARGUMENT);
+    if (!nx_bound_quad(ix,iy,e->W,e->H)) return NEOX_OK;
     for (k = 0; k < 4; k++) { ix[k] *= NEOX_MTL_SS; iy[k] *= NEOX_MTL_SS; }
     q[0] = ix[0]; q[1] = iy[0]; q[2] = ix[1]; q[3] = iy[1];
     q[4] = ix[2]; q[5] = iy[2]; q[6] = ix[0]; q[7] = iy[0];
@@ -1213,7 +1225,7 @@ static neox_result mtl_draw_tex(neox_device *dev, nx_mtl_dev *g, nx_mtl_enc *e,
     ut[2] = cmd->filter == NEOX_FILTER_LINEAR ? 1.0f : 0.0f;
     ut[3] = cmd->tex_opacity;
     ut[4] = cmd->src.x; ut[5] = cmd->src.y; ut[6] = cmd->src.w; ut[7] = cmd->src.h;
-    ut[8] = cmd->dst.x; ut[9] = cmd->dst.y; ut[10] = cmd->dst.w; ut[11] = cmd->dst.h;
+    ut[8] = sample_dst.x; ut[9] = sample_dst.y; ut[10] = sample_dst.w; ut[11] = sample_dst.h;
     ut[12] = (float)tx->width; ut[13] = (float)tx->height; ut[14] = 0; ut[15] = 0;
     ut[16] = inv.a; ut[17] = inv.b; ut[18] = 0; ut[19] = 0;
     ut[20] = inv.c; ut[21] = inv.d; ut[22] = 0; ut[23] = 0;
@@ -1224,7 +1236,7 @@ static neox_result mtl_draw_tex(neox_device *dev, nx_mtl_dev *g, nx_mtl_enc *e,
         return NEOX_ERROR_BACKEND;
     }
     enc = mtl_pass(g, e, layer->tex, MTLLoadActionLoad);
-    mtl_emit(enc, NX_MTL_COV[blend].dual ? g->ps_tex_ds[blend] : g->ps_tex[blend],
+    mtl_emit(enc, g->ps_tex[blend],
              e, off, 6, ut, sizeof(ut), g->texs[idx].tex, nil, nil);
     [enc endEncoding];
     if (blend == NEOX_BLEND_PLUS)
@@ -1242,12 +1254,14 @@ static neox_result mtl_draw_glyphs(neox_device *dev, nx_mtl_dev *g, nx_mtl_enc *
     float paint[4];
     neox_result r = NEOX_OK;
     int dual;
-    if (nx_affine_det(ctm) == 0.0f) return NEOX_OK; /* §3 */
-    if (!nx_affine_invert(ctm, &inv)) return NEOX_OK;
+    int inverse_status = nx_affine_invert(ctm, &inv);
+    if (!inverse_status) return NEOX_OK;
+    if (inverse_status < 0)
+        NX_ERR(dev->ctx, "inverse transform exceeds numeric range", NEOX_ERROR_INVALID_ARGUMENT);
     nx_paint_to_premul_linear(cmd->color, paint);
     dual = NX_MTL_COV[blend].dual && g->dual_ok;
     idx = (uint32_t)(at - (const nx_tex_slot *)dev->textures.slots);
-    r = mtl_tex_ensure(dev->ctx, g, dev, idx);
+    r = mtl_tex_ensure(dev->ctx, g, dev, idx, cmd->texture);
     if (r != NEOX_OK) return r;
     for (gi = 0; gi < cmd->glyph_count; gi++) {
         const neox_glyph *gl2 = &cmd->glyphs[gi];
@@ -1258,11 +1272,14 @@ static neox_result mtl_draw_glyphs(neox_device *dev, nx_mtl_dev *g, nx_mtl_enc *
         id<MTLRenderCommandEncoder> enc;
         NSUInteger off;
         if (gw == 0.0f || gh == 0.0f) continue;
-        nx_affine_apply(ctm, gl2->x, gl2->y, &xc[0], &yc[0]);
-        nx_affine_apply(ctm, gl2->x + gw, gl2->y, &xc[1], &yc[1]);
-        nx_affine_apply(ctm, gl2->x + gw, gl2->y + gh, &xc[2], &yc[2]);
-        nx_affine_apply(ctm, gl2->x, gl2->y + gh, &xc[3], &yc[3]);
-        mtl_inflate_quad(xc, yc, 0.6f, ix, iy);
+        neox_affine sampling;neox_rect local;
+        if (!nx_sample_transform(inv,(neox_rect){gl2->x,gl2->y,gw,gh},e->W,e->H,&sampling,&local))
+            NX_ERR(dev->ctx, "sampling transform exceeds float range", NEOX_ERROR_UNSUPPORTED);
+        if (!nx_affine_quad(ctm, (neox_rect){gl2->x,gl2->y,gw,gh}, xc, yc))
+            NX_ERR(dev->ctx, "transformed glyph coordinates exceed numeric range", NEOX_ERROR_INVALID_ARGUMENT);
+        if (!mtl_inflate_quad(xc, yc, 0.6f, ix, iy))
+            NX_ERR(dev->ctx, "inflated geometry exceeds numeric range", NEOX_ERROR_INVALID_ARGUMENT);
+        if (!nx_bound_quad(ix,iy,e->W,e->H)) continue;
         bx0 = ix[0]; by0 = iy[0]; bx1 = ix[0]; by1 = iy[0];
         for (k = 1; k < 4; k++) {
             if (ix[k] < bx0) bx0 = ix[k];
@@ -1276,11 +1293,11 @@ static neox_result mtl_draw_glyphs(neox_device *dev, nx_mtl_dev *g, nx_mtl_enc *
         q[8] = ix[2]; q[9] = iy[2]; q[10] = ix[3]; q[11] = iy[3];
         ug[0] = (float)NEOX_MTL_SS; ug[1] = (float)blend; ug[2] = 0; ug[3] = 0;
         ug[4] = paint[0]; ug[5] = paint[1]; ug[6] = paint[2]; ug[7] = paint[3];
-        ug[8] = gl2->x; ug[9] = gl2->y; ug[10] = gw; ug[11] = gh;
-        ug[12] = (float)gl2->sx; ug[13] = (float)gl2->sy; ug[14] = gw; ug[15] = gh;
-        ug[16] = inv.a; ug[17] = inv.b; ug[18] = 0; ug[19] = 0;
-        ug[20] = inv.c; ug[21] = inv.d; ug[22] = 0; ug[23] = 0;
-        ug[24] = inv.tx; ug[25] = inv.ty; ug[26] = 1; ug[27] = 0;
+        ug[8] = local.x; ug[9] = local.y; ug[10] = local.w; ug[11] = local.h;
+        ug[12] = (float)gl2->sx; ug[13] = (float)gl2->sy; ug[14] = gw/local.w; ug[15] = gh/local.h;
+        ug[16] = sampling.a; ug[17] = sampling.b; ug[18] = 0; ug[19] = 0;
+        ug[20] = sampling.c; ug[21] = sampling.d; ug[22] = 0; ug[23] = 0;
+        ug[24] = sampling.tx; ug[25] = sampling.ty; ug[26] = 1; ug[27] = 0;
         /* 图集语义（§8.2）：s 因子与 soft.c/gl.c 同式（线性部分奇异值平均） */
         if (cmd->atlas_mode == NEOX_ATLAS_SDF ||
             cmd->atlas_mode == NEOX_ATLAS_MSDF)
@@ -1289,6 +1306,14 @@ static neox_result mtl_draw_glyphs(neox_device *dev, nx_mtl_dev *g, nx_mtl_enc *
         ug[29] = cmd->dist_range;
         ug[30] = cmd->softness;
         ug[31] = s_fac;
+        if (blend == NEOX_BLEND_PLUS || (NX_MTL_COV[blend].dual && !g->dual_ok)) {
+            /* Every copied pixel must be initialized, including the corners
+             * outside a rotated/inflated glyph. Shader returns dst there. */
+            bx0=(float)nx_pixel_floor(bx0,e->W);by0=(float)nx_pixel_floor(by0,e->H);
+            bx1=(float)nx_pixel_ceil(bx1,e->W);by1=(float)nx_pixel_ceil(by1,e->H);
+            q[0]=q[6]=q[10]=bx0*NEOX_MTL_SS;q[2]=q[4]=q[8]=bx1*NEOX_MTL_SS;
+            q[1]=q[3]=q[7]=by0*NEOX_MTL_SS;q[5]=q[9]=q[11]=by1*NEOX_MTL_SS;
+        }
         if (blend == NEOX_BLEND_PLUS) {
             r = mtl_draw_pingpong(dev->ctx, g, e, layer, g->ps_plusglyph,
                                   g->texs[idx].tex, layer->tex, nil,
@@ -1377,16 +1402,17 @@ static neox_result mtl_resolve(neox_context *ctx, nx_mtl_dev *g, nx_mtl_rt *base
 static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
 {
     neox_context *ctx = dev->ctx;
+    nx_execution_clips execution_clips = {};
     nx_mtl_dev *g = (nx_mtl_dev *)dev->bstate;
     neox_mtl_surface *surf = (neox_mtl_surface *)sub->surface;
     uint32_t W = sub->width, H = sub->height;
     uint32_t SSW = W * NEOX_MTL_SS, SSH = H * NEOX_MTL_SS;
     nx_mtl_rt **layers = NULL, **clips = NULL;
     uint32_t nlayers = 0, caplayers = 0, nclips = 0, capclips = 0;
-    uint32_t nstk = 0, capstk = 0, max_layers = 1, i, glyphs_total = 0;
+    uint32_t nstk = 0, capstk = 0, i;
     uint32_t sidx;
     size_t vbo_len;
-    nx_mtl_enc e;
+    nx_mtl_enc e = {};
     id<MTLCommandBuffer> cb;
     id<MTLBuffer> vbo = nil;
     nx_mtl_rt *base = nil;
@@ -1410,14 +1436,23 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
     }
     sidx = (uint32_t)(sub - (nx_sub_slot *)dev->subs.slots);
 
+    /* Count in bytes without a 32-bit intermediate. Check the device limit
+     * before asking Metal to allocate; huge counts must never wrap to a small
+     * staging buffer or trigger a platform validation exception. */
+    if (!nx_size_mul(sub->cmd_count, 2, &vbo_len) ||
+        !nx_size_add(vbo_len, 8, &vbo_len))
+        NX_ERR(ctx, "MTL vertex buffer size overflow", NEOX_ERROR_OUT_OF_MEMORY);
+    for (i = 0; i < sub->cmd_count; i++) {
+        if (sub->cmds[i].op == NXC_GLYPHS &&
+            !nx_size_add(vbo_len, sub->cmds[i].glyph_count, &vbo_len))
+            NX_ERR(ctx, "MTL glyph count exceeds staging range", NEOX_ERROR_OUT_OF_MEMORY);
+    }
+    if (!nx_size_mul(vbo_len, 1024, &vbo_len) ||
+        !nx_size_add(vbo_len, 4096, &vbo_len) ||
+        vbo_len > [g->device maxBufferLength])
+        NX_ERR(ctx, "MTL vertex buffer exceeds device limit", NEOX_ERROR_OUT_OF_MEMORY);
     @autoreleasepool {
         cb = [[g->queue commandBuffer] retain];
-
-        for (i = 0; i < sub->cmd_count; i++) {
-            if (sub->cmds[i].op == NXC_GLYPHS)
-                glyphs_total += sub->cmds[i].glyph_count;
-        }
-        vbo_len = (size_t)(sub->cmd_count * 2 + glyphs_total + 8) * 1024 + 4096;
         vbo = [g->device newBufferWithLength:vbo_len options:0];  /* +1 */
         if (!cb || !vbo) {
             ctx->last_error = "MTL command buffer/vertex buffer allocation failed";
@@ -1506,7 +1541,6 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
                     layers[nlayers] = lb;
                     layer_idx = (int32_t)nlayers;
                     nlayers++;
-                    if (nlayers > max_layers) max_layers = nlayers;
                     mtl_clear_layer(g, &e, lb);
                 }
                 nst = (mtl_ex_state *)nx_array_grow(ctx, stk, sizeof(mtl_ex_state),
@@ -1524,7 +1558,8 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
                 stk[nstk].ctm = c->ctm;
                 stk[nstk].opacity = c->opacity;
                 stk[nstk].blend = c->blend;
-                stk[nstk].clip = c->clip_mask;
+                r = nx_execution_clip_push(dev, &execution_clips, c, sub->width, sub->height, &stk[nstk].clip);
+            if (r != NEOX_OK) goto enc_fail;
                 stk[nstk].layer = layer_idx;
                 nstk++;
                 break;
@@ -1543,7 +1578,7 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
                         r = mtl_rt_acquire(ctx, g, W, H, 0, &clip_rt);
                         if (r != NEOX_OK) goto enc_fail;
                         mtl_upload(clip_rt->tex, W, H, top2->clip,
-                                   ((W * 4u + 15u) & ~15u));
+                                   W * 4u);
                         nc = (nx_mtl_rt **)nx_array_grow(ctx, clips,
                                     sizeof(nx_mtl_rt *), &capclips, nclips + 1);
                         if (!nc) {
@@ -1585,7 +1620,8 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
                     mtl_rt_release(layers[top2->layer]);
                     nlayers--;
                 }
-                nstk--;
+                if (top2->clip) nx_execution_clip_pop(ctx, &execution_clips);
+            nstk--;
                 break;
             }
             case NXC_PATH: {
@@ -1658,12 +1694,11 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
             g->inflight[g->ninflight].base = base;   /* 池内保持 in_use */
             g->inflight[g->ninflight].held = e.held;
             g->inflight[g->ninflight].nheld = e.nheld;
+            g->inflight[g->ninflight].capheld = e.capheld;
             g->inflight[g->ninflight].completed = 0;
             g->ninflight++;
             pthread_mutex_unlock(&g->lock);
         }
-        sub->report.peak_bytes =
-            (uint64_t)max_layers * (uint64_t)SSW * SSH * 16u;
         [cb commit];
         /* cb/vbo/base 所有权转移至 inflight（enc_fail 路径不经过此处） */
         cb = nil;
@@ -1673,6 +1708,7 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
     }
 
 enc_fail:
+    nx_execution_clips_destroy(ctx, &execution_clips);
     if (r != NEOX_OK) {
         uint32_t k;
         sub->status = NEOX_SUBMISSION_FAILED;
@@ -1688,6 +1724,7 @@ enc_fail:
         if (e.held)
             nx_free(ctx, e.held, (size_t)e.capheld * sizeof(nx_mtl_rt *), 16);
         e.held = NULL;
+        if (base) mtl_rt_release(base);
     }
     (void)failed;
     if (layers) nx_free(ctx, layers, (size_t)caplayers * sizeof(nx_mtl_rt *), 16);
@@ -1706,7 +1743,7 @@ static uint32_t mtl_poll(neox_device *dev)
     uint32_t k = 0;
     if (!g) return 0;
     for (;;) {
-        uint32_t sidx = 0, nheld = 0, h2;
+        uint32_t sidx = 0, nheld = 0, capheld = 0, h2;
         id<MTLCommandBuffer> cb = nil;
         id<MTLBuffer> vb = nil;
         nx_mtl_rt *base = nil;
@@ -1722,6 +1759,7 @@ static uint32_t mtl_poll(neox_device *dev)
                 base = g->inflight[k].base;
                 held = g->inflight[k].held;
                 nheld = g->inflight[k].nheld;
+                capheld = g->inflight[k].capheld;
                 g->inflight[k] = g->inflight[g->ninflight - 1];
                 g->ninflight--;
                 found = 1;
@@ -1732,20 +1770,31 @@ static uint32_t mtl_poll(neox_device *dev)
         if (!found) break;
         sub = &((nx_sub_slot *)dev->subs.slots)[sidx];
         /* 成功路径的最后一步才触碰表面（§10.1 原子性） */
-        if (mtl_resolve(dev->ctx, g, base, (neox_mtl_surface *)sub->surface)
-                == NEOX_OK) {
-            sub->status = NEOX_SUBMISSION_COMPLETE;
+        neox_result result;
+        nx_memory_probe probe;
+        nx_memory_probe_begin(dev->ctx, &probe);
+        if (dev->loss_reason) result = NEOX_ERROR_DEVICE_LOST;
+        else if (cb.status == MTLCommandBufferStatusCompleted)
+            result = mtl_resolve(dev->ctx, g, base, (neox_mtl_surface *)sub->surface);
+        else if ([cb.error.domain isEqualToString:MTLCommandBufferErrorDomain] &&
+                 cb.error.code == MTLCommandBufferErrorOutOfMemory) {
+            dev->ctx->last_error = "Metal command buffer exhausted memory";
+            result = NEOX_ERROR_OUT_OF_MEMORY;
         } else {
-            sub->status = NEOX_SUBMISSION_FAILED;
+            /* Conservatively retire the NeoX device on execution faults: its
+             * private GPU state is no longer trusted. Not a claim that physical
+             * hardware was removed. Recover by creating a new device. */
+            result = nx_device_mark_lost(dev, "Metal command buffer execution fault");
         }
+        nx_memory_probe_end(dev->ctx, &probe, &sub->report);
         for (h2 = 0; h2 < nheld; h2++)
             mtl_rt_release(held[h2]);  /* GPU 已完成：归还执行期占用纹理 */
         if (held)
-            nx_free(dev->ctx, held, (size_t)nheld * sizeof(nx_mtl_rt *), 16);
+            nx_free(dev->ctx, held, (size_t)capheld * sizeof(nx_mtl_rt *), 16);
         mtl_rt_release(base);
         [cb release];   /* inflight 的 cb 引用 */
         [vb release];   /* inflight 的 vbo 引用 */
-        nx_sub_release_payload(dev, sub);
+        nx_submission_complete(dev, sub, result);
         done++;
         k = 0; /* swap-remove 打乱了顺序，从头扫描 */
     }
@@ -1781,7 +1830,8 @@ neox_result neox_mtl_surface_create(neox_device *dev,
     MTLTextureDescriptor *td;
     if (!dev || !out_surface) return NEOX_ERROR_INVALID_ARGUMENT;
     *out_surface = NULL;
-    if (dev->kind != NEOX_BACKEND_GPU) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (dev->vt != nx_backend_mtl()) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (nx_device_check_live(dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
     ctx = dev->ctx;
     g = (nx_mtl_dev *)dev->bstate;
     (void)g;
@@ -1803,7 +1853,7 @@ neox_result neox_mtl_surface_create(neox_device *dev,
         NX_ERR(ctx, "MTL surface allocation failed", NEOX_ERROR_BACKEND);
     }
     ns = (neox_mtl_surface **)nx_array_grow(ctx, g->surfs, sizeof(void *),
-                                            &g->capsurfs, g->nsurfs + 1);
+                                            &g->capsurfs, (uint64_t)g->nsurfs + 1);
     if (!ns) {
         [s->tex release];
         nx_free(ctx, s, sizeof(neox_mtl_surface), 16);
@@ -1821,6 +1871,10 @@ void neox_mtl_surface_destroy(neox_device *dev, neox_mtl_surface *surface)
     nx_mtl_dev *g;
     uint32_t i;
     if (!dev || !surface) return;
+    if (dev->vt != nx_backend_mtl() || surface->dev != dev) {
+        dev->ctx->last_error = "Metal surface destruction requires its owning Metal device";
+        return;
+    }
     g = (nx_mtl_dev *)dev->bstate;
     if (!g) return;
     [surface->tex release];
@@ -1841,6 +1895,7 @@ neox_result neox_mtl_surface_read_pixels(neox_mtl_surface *surface,
     uint32_t stride, y;
     uint8_t *tmp;
     if (!surface || !out_pixels) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (nx_device_check_live(surface->dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
     g = (nx_mtl_dev *)surface->dev->bstate;
     if (!g) return NEOX_ERROR_BACKEND;
     /* 正式读回通道：同步在途提交（resolve 由 poll 在完成后执行） */
@@ -1854,6 +1909,7 @@ neox_result neox_mtl_surface_read_pixels(neox_mtl_surface *surface,
         (void)mtl_poll(surface->dev); /* 收割（含 resolve） */
     }
     stride = (surface->w * 4u + 15u) & ~15u;
+    if (nx_device_check_live(surface->dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
     tmp = (uint8_t *)nx_alloc(surface->dev->ctx, (size_t)stride * surface->h, 16);
     if (!tmp) return NEOX_ERROR_OUT_OF_MEMORY;
     [surface->tex getBytes:tmp bytesPerRow:stride
@@ -1868,6 +1924,22 @@ neox_result neox_mtl_surface_read_pixels(neox_mtl_surface *surface,
 
 /* ------------------------------------------------------------------ Metal 后端 vtable */
 
+static void mtl_memory_stats(neox_device *dev, neox_gpu_memory_stats *out)
+{
+    nx_mtl_dev *g = (nx_mtl_dev *)dev->bstate;
+    for (uint32_t i = 0; i < g->nrts; i++) {
+        nx_mtl_rt *rt = &g->rts[i];
+        uint64_t bytes = (uint64_t)rt->w * rt->h * (rt->is_layer ? 16 : 4);
+        out->pool_texture_bytes += bytes;
+        if (!rt->in_use) out->idle_pool_texture_bytes += bytes;
+    }
+    out->texture_bytes = out->pool_texture_bytes;
+    for (uint32_t i = 0; i < g->ntexs; i++)
+        out->texture_bytes += (uint64_t)g->texs[i].tex.width * g->texs[i].tex.height * 16;
+    for (uint32_t i = 0; i < g->nsurfs; i++)
+        out->texture_bytes += (uint64_t)g->surfs[i]->w * g->surfs[i]->h * 4;
+}
+
 const nx_backend *nx_backend_mtl(void)
 {
     static const nx_backend vt = {
@@ -1878,7 +1950,8 @@ const nx_backend *nx_backend_mtl(void)
         mtl_execute,
         mtl_get_caps,
         mtl_poll,           /* 真异步：completedHandler 事件收割 */
-        mtl_block           /* submission_wait 的进度等待 */
+        mtl_block,          /* submission_wait 的进度等待 */
+        mtl_memory_stats
     };
     return &vt;
 }

@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+include("${CMAKE_CURRENT_LIST_DIR}/NeoXTargets.cmake")
+set(NeoX_Core_FOUND TRUE)
+set(NeoX_Scene_FOUND @NEOX_WITH_SCENE@)
+set(NeoX_Capture_FOUND @NEOX_WITH_CAPTURE@)
+set(NeoX_Text_FOUND @NEOX_WITH_TEXT@)
+set(NeoX_Present_FOUND @NEOX_PRESENT@)
+set(NeoX_GL_FOUND @NEOX_ENABLE_GL@)
+set(NeoX_Metal_FOUND @NEOX_ENABLE_METAL@)
+check_required_components(NeoX)

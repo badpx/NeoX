@@ -391,9 +391,14 @@ static neox_result x11_open(neox_window *w)
         res = g_x.res(p->dpy);
         dpi = parse_dpi(res);
         if (dpi >= 48.0f && dpi <= 480.0f) {
-            w->scale = dpi / 96.0f;
-            nx_win_recompute(w);
+            if (nx_win_set_geometry(w, w->pt_w, w->pt_h, dpi / 96.0f) != NEOX_OK)
+                return NEOX_ERROR_INVALID_ARGUMENT;
         }
+    }
+    /* X11 window dimensions are CARD16 on the wire. */
+    if (w->px_w > UINT16_MAX || w->px_h > UINT16_MAX) {
+        nx_win_set_error("X11 window dimensions exceed CARD16");
+        return NEOX_ERROR_INVALID_ARGUMENT;
     }
     bg = g_x.black(p->dpy, p->screen);
     p->win = g_x.simple(p->dpy, p->root, 0, 0, w->px_w, w->px_h, 0, bg, bg);
@@ -503,15 +508,16 @@ static int x11_poll(neox_window *w)
             if (window != p->win) continue;
             width = ev_i(ev, 56);
             height = ev_i(ev, 60);
-            if (width < 1 || height < 1) continue;
+            if (width < 1 || height < 1 || width > UINT16_MAX || height > UINT16_MAX) continue;
             npt_w = (uint32_t)((double)width / (double)w->scale + 0.5);
             npt_h = (uint32_t)((double)height / (double)w->scale + 0.5);
             if (npt_w < 1) npt_w = 1;
             if (npt_h < 1) npt_h = 1;
-            if (npt_w == w->pt_w && npt_h == w->pt_h) continue;
-            w->pt_w = npt_w;
-            w->pt_h = npt_h;
-            nx_win_recompute(w);
+            if ((uint32_t)width == w->px_w && (uint32_t)height == w->px_h) continue;
+            if (nx_win_set_geometry(w, npt_w, npt_h, w->scale) != NEOX_OK) continue;
+            /* ConfigureNotify reports the actual pixel extent. Rounding a
+             * logical size back to pixels need not reproduce it exactly. */
+            w->px_w = (uint32_t)width; w->px_h = (uint32_t)height;
             out.kind = NEOX_WINDOW_RESIZE;
             out.width = w->pt_w;
             out.height = w->pt_h;
@@ -555,6 +561,10 @@ static neox_result x11_resize(neox_window *w, uint32_t pt_w, uint32_t pt_h)
     (void)pt_w;
     (void)pt_h;
     if (!p) return NEOX_ERROR_BACKEND;
+    if (w->px_w > UINT16_MAX || w->px_h > UINT16_MAX) {
+        nx_win_set_error("X11 window dimensions exceed CARD16");
+        return NEOX_ERROR_INVALID_ARGUMENT;
+    }
     g_x.resize(p->dpy, p->win, w->px_w, w->px_h);
     g_x.sync(p->dpy, 0);
     return NEOX_OK;

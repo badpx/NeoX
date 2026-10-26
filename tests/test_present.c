@@ -83,21 +83,44 @@ static int draw_bars(neox_window *win, neox_device *dev)
         return 0;
     }
     td.clear = &blue;
-    if (neox_frame_begin(dev, &td, &fr) != NEOX_OK) return 0;
+    if (neox_frame_begin(dev, &td, &fr) != NEOX_OK) {
+        fprintf(stderr, "begin %s\n", neox_window_last_error());
+        return 0;
+    }
     memset(&st, 0, sizeof st);
     st.transform.a = scale;
     st.transform.d = scale;
     st.opacity = 1.0f;
-    if (neox_push_state(fr, &st) != NEOX_OK) return 0;
+    if (neox_push_state(fr, &st) != NEOX_OK) {
+        fprintf(stderr, "push failed\n");
+        return 0;
+    }
     top = make_rect(dev, 0.0f, 0.0f, (float)pt_w, 8.0f);
     bot = make_rect(dev, 0.0f, (float)pt_h - 8.0f, (float)pt_w, 8.0f);
     memset(&paint, 0, sizeof paint);
     paint.color = red;
-    if (neox_draw_path(fr, top, &paint) != NEOX_OK) return 0;
+    if (neox_draw_path(fr, top, &paint) != NEOX_OK) {
+        fprintf(stderr, "draw top failed\n");
+        return 0;
+    }
     paint.color = green;
-    if (neox_draw_path(fr, bot, &paint) != NEOX_OK) return 0;
-    if (neox_frame_end(fr, &sub) != NEOX_OK) return 0;
-    if (neox_submission_wait(dev, sub) != NEOX_OK) return 0;
+    if (neox_draw_path(fr, bot, &paint) != NEOX_OK) {
+        fprintf(stderr, "draw bot failed\n");
+        return 0;
+    }
+    if (neox_pop_state(fr) != NEOX_OK) {
+        fprintf(stderr, "pop failed\n");
+        return 0;
+    }
+    if (neox_frame_end(fr, &sub) != NEOX_OK) {
+        fprintf(stderr, "end failed\n");
+        return 0;
+    }
+    if (neox_submission_wait(dev, sub) != NEOX_OK) {
+        fprintf(stderr, "wait failed status=%d\n",
+                (int)neox_submission_get_status(dev, sub));
+        return 0;
+    }
     if (neox_window_present(win) != NEOX_OK) {
         fprintf(stderr, "present: %s\n", neox_window_last_error());
         return 0;
@@ -187,7 +210,6 @@ static void run_backend(neox_context *ctx, neox_backend_kind kind, const char *t
     expect(neox_window_poll(win, &ev) == 1 && ev.kind == NEOX_WINDOW_CLOSE,
            "request_close yields CLOSE");
     neox_window_destroy(win);
-    neox_device_destroy(dev);
 }
 
 #if NEOX_ENABLE_GL

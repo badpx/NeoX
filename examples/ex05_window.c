@@ -116,6 +116,7 @@ static int frame(neox_window *win, neox_device *dev, const char *bmp)
     neox_draw_path(fr, b, &paint);
     paint.color = yellow;
     neox_draw_path(fr, c, &paint);
+    if (neox_pop_state(fr) != NEOX_OK) return 0;
     if (neox_frame_end(fr, &sub) != NEOX_OK) return 0;
     if (neox_submission_wait(dev, sub) != NEOX_OK) return 0;
     if (neox_window_present(win) != NEOX_OK) return 0;
@@ -195,7 +196,6 @@ int main(void)
         if (!frame(win, dev, shot)) {
             fprintf(stderr, "ex05 frame failed: %s\n", neox_window_last_error());
             neox_window_destroy(win);
-            neox_device_destroy(dev);
             neox_context_destroy(ctx);
             return 1;
         }
@@ -205,7 +205,6 @@ int main(void)
             if (neox_window_resize(win, 480, 320) != NEOX_OK) {
                 fprintf(stderr, "ex05 resize: %s\n", neox_window_last_error());
                 neox_window_destroy(win);
-                neox_device_destroy(dev);
                 neox_context_destroy(ctx);
                 return 1;
             }
@@ -226,7 +225,6 @@ int main(void)
         }
     }
     neox_window_destroy(win);
-    neox_device_destroy(dev);
     neox_context_destroy(ctx);
     return 0;
 }

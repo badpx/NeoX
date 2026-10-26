@@ -109,8 +109,11 @@ static int g_handlers;
 
 static int on_xerr(void *dpy, void *ev)
 {
+    const unsigned char *e = (const unsigned char *)ev;
+    unsigned char code = e ? e[32] : 0;
+    unsigned char req = e ? e[33] : 0;
     (void)dpy;
-    (void)ev;
+    fprintf(stderr, "X error code=%u request=%u\n", code, req);
     return 0;
 }
 
@@ -370,7 +373,11 @@ static neox_result x11_open(neox_window *w)
     }
     p->dpy = g_x.open(NULL);
     if (!p->dpy) {
-        nx_win_set_error("X11: XOpenDisplay failed (is DISPLAY set?)");
+        const char *ds = getenv("DISPLAY");
+        char buf[256];
+        snprintf(buf, sizeof buf, "X11: XOpenDisplay failed (DISPLAY=%s)",
+                 ds ? ds : "(null)");
+        nx_win_set_error(buf);
         free(p);
         return NEOX_ERROR_BACKEND;
     }

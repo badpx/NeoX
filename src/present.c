@@ -164,13 +164,18 @@ neox_result neox_window_create(const neox_present_desc *desc, neox_window **out)
 
 void neox_window_destroy(neox_window *win)
 {
+    neox_device *dev;
     if (!win) return;
+    dev = win->dev;
+    win->dev = NULL;
 #if NEOX_ENABLE_GL
-    if (win->gl_surf && win->dev) {
-        neox_gl_surface_destroy(win->dev, win->gl_surf);
+    if (win->gl_surf && dev) {
+        neox_gl_surface_destroy(dev, win->gl_surf);
         win->gl_surf = NULL;
     }
 #endif
+    /* 本地 display 还连着，先拆设备（含 eglTerminate），再让平台断开连接。 */
+    if (dev) neox_device_destroy(dev);
     if (win->vt && win->vt->close) win->vt->close(win);
     free(win->soft_px);
     free(win);

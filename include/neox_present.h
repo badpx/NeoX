@@ -60,6 +60,9 @@ typedef struct neox_window_event {
 } neox_window_event;
 
 neox_result neox_window_create(const neox_present_desc *desc, neox_window **out);
+/* 释放窗口，以及 neox_window_create_device 创建的设备。
+ * 设备必须留到这里再释放：Wayland 上要先 eglTerminate，再断开 wl_display。
+ * 调用方不要再 neox_device_destroy 那台设备。 */
 void        neox_window_destroy(neox_window *win);
 const char *neox_window_last_error(void);
 

@@ -71,9 +71,10 @@ callback（最多约 100ms）。Xvfb 上交换间隔失败不算错误，帧照�
 xdg min/max 设成这个尺寸，避免合成器把它拉成输出大小。
 
 `neox_window_acquire_target` 给出的目标是像素尺寸。应用若要按 point 绘制，
-自己压入 `{scale, 0, 0, scale, 0, 0}`。销毁窗口会释放它持有的 GL 表面和
-软件缓冲，不销毁 device / context，并且必须发生在 `neox_device_destroy`
-之前。
+自己压入 `{scale, 0, 0, scale, 0, 0}`，并在 `neox_frame_end` 前弹出。
+`neox_window_destroy` 会释放 `neox_window_create_device` 得到的设备
+（先拆掉 GL 表面并 `eglTerminate`，再断开 Wayland/X11）。调用方不要再
+销毁这台设备。context 仍由调用方销毁。
 
 X11 读回优先 `XGetImage`（窗口里的像素）。Wayland 没有通用的屏幕读取：
 Soft 回退到刚提交的缓冲，GL 用交换前的窗口帧缓冲。
@@ -112,6 +113,15 @@ Escape。
 `ctest` 里的 `present` 与 `ex05_smoke` 在没有显示时跳过。
 `NEOX_REQUIRE_PRESENT=1` 把跳过改成失败，给 CI 的 `ubuntu-present` 用。
 默认的 `ubuntu-gl` 不设显示，这两项保持跳过，离屏一致性测试不依赖窗口。
+
+## 本机验收
+
+Clang 18，`-Wall -Wextra -Werror`。Mesa 25.2.8，llvmpipe（LLVM 20.1.2）。
+
+- 无显示：`ctest` 9/9。`present` 与 `ex05_smoke` 跳过，离屏 Soft/GL（含 `NEOX_GL_FORCE_NO_DUAL`）通过。
+- Xvfb（`-screen 0 1280x1024x24`，`NEOX_PRESENT_BACKEND=x11`）：`test_present` 覆盖 Soft 与 GL、scale 1 与 2、放大后重画、`request_close`。顶行红、中行蓝、底行绿，朝向与 Soft 一致。
+- weston 13 `--backend=headless`：同一组测试通过。`ex05_window` 在两条后端、Soft 与 GL 上都写出 320×240 与放大后的 480×320。四组成对的读回颜色相同（顶 `(230,56,46)`、中 `(242,199,51)`、底 `(51,191,89)`）。
+- Xvfb 上 EGL 会提示没有 DRI3，随后用 llvmpipe。weston 上 Mesa 会先试一次 ZINK 再落到 llvmpipe。两条都不是失败。
 
 ## 已知限制
 

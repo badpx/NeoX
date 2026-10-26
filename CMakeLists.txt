@@ -14,8 +14,11 @@ option(NEOX_SANITIZE "Build with -fsanitize=address,undefined" OFF)
 if(APPLE)
   option(NEOX_BACKEND_GL "OpenGL backend (macOS CGL offscreen + GL 4.1 Core)" ON)
   option(NEOX_BACKEND_METAL "Metal backend (macOS native, Objective-C++)" ON)
+elseif(UNIX)
+  option(NEOX_BACKEND_GL "OpenGL backend (Linux EGL surfaceless + GL 4.1 Core)" ON)
+  option(NEOX_BACKEND_METAL "Metal backend (macOS native, Objective-C++)" OFF)
 else()
-  option(NEOX_BACKEND_GL "OpenGL backend (macOS CGL offscreen + GL 4.1 Core)" OFF)
+  option(NEOX_BACKEND_GL "OpenGL backend" OFF)
   option(NEOX_BACKEND_METAL "Metal backend (macOS native, Objective-C++)" OFF)
 endif()
 
@@ -25,15 +28,25 @@ target_compile_options(neox PRIVATE -Wall -Wextra)
 
 set(NEOX_TARGETS neox test_semantics ex01_scene)
 
-# GPU 后端：仅 macOS（OpenGL.framework）；gl.c 使用已废弃 API（ intentional，
-# 本后端定位为链路验证，移植目标为 GLES3/WebGL2）
-if(NEOX_BACKEND_GL AND APPLE)
-  target_sources(neox PRIVATE src/gl.c)
-  target_compile_definitions(neox PUBLIC NEOX_ENABLE_GL=1)
-  target_link_libraries(neox PRIVATE "-framework OpenGL")
-  set_source_files_properties(src/gl.c PROPERTIES
-    COMPILE_OPTIONS "-Wno-deprecated-declarations")
-  set(NEOX_GL_ENABLED 1)
+# GPU 后端：gl.c 是平台无关的 GL 4.1 Core 执行器。上下文与入口按平台
+# 选编译单元（docs/linux-port.md）：macOS = CGL + 框架静态链接；
+# Linux = EGL surfaceless + 运行期 dlopen。定位仍是链路验证。
+if(NEOX_BACKEND_GL)
+  if(APPLE)
+    target_sources(neox PRIVATE src/gl.c src/gl_ctx_cgl.c)
+    target_compile_definitions(neox PUBLIC NEOX_ENABLE_GL=1)
+    target_link_libraries(neox PRIVATE "-framework OpenGL")
+    set_source_files_properties(src/gl.c src/gl_ctx_cgl.c PROPERTIES
+      COMPILE_OPTIONS "-Wno-deprecated-declarations")
+    set(NEOX_GL_ENABLED 1)
+  elseif(UNIX)
+    target_sources(neox PRIVATE src/gl.c src/gl_ctx_egl.c src/gl_load.c)
+    target_compile_definitions(neox PUBLIC NEOX_ENABLE_GL=1)
+    target_link_libraries(neox PRIVATE ${CMAKE_DL_LIBS})
+    set(NEOX_GL_ENABLED 1)
+  else()
+    message(FATAL_ERROR "NEOX_BACKEND_GL is not implemented on this platform")
+  endif()
 else()
   set(NEOX_GL_ENABLED 0)
 endif()
@@ -77,6 +90,10 @@ if(NEOX_GL_ENABLED)
   set_target_properties(test_gpu_consistency PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
   add_test(NAME gpu_consistency COMMAND test_gpu_consistency)
+  # 关掉 dual-source，强制 ping-pong 回退（与 Metal 的 NEOX_MTL_FORCE_NO_DUAL 同款）
+  add_test(NAME gpu_consistency_nodual COMMAND test_gpu_consistency)
+  set_tests_properties(gpu_consistency_nodual PROPERTIES
+    ENVIRONMENT "NEOX_GL_FORCE_NO_DUAL=1")
 
   add_executable(ex02_gpuscene examples/ex02_gpuscene.c)
   target_link_libraries(ex02_gpuscene PRIVATE neox m)

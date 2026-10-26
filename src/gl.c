@@ -1,5 +1,9 @@
 /* ===========================================================================
- * gl.c — NeoX GPU 后端：macOS CGL 离屏上下文 + OpenGL 4.1 Core Profile
+ * gl.c — NeoX GPU 后端：OpenGL 4.1 Core Profile
+ *
+ * 上下文不在本文件创建：平台编译单元实现 gl_ctx.h（macOS 离屏 / Linux
+ * 无头 surfaceless），本文件只经该接口触碰上下文。Linux 的 GL 入口由
+ * gl_load.c 在上下文 current 之后填充；macOS 保持框架静态链接。
  *
  * 定位：链路验证后端（docs/semantics-v0.md §11 实施顺序说明）。验证"同一套
  * 语义描述（SD）可被两个差异明显的后端执行"：本后端与 Soft 共享全部上层
@@ -19,10 +23,12 @@
  *     nx_premul_linear_to_srgb8 逐步对齐）。GL_FRAMEBUFFER_SRGB 恒关闭。
  *   - Porter-Duff 13 模式 + §6.1 覆盖率插值：绘制走 gl_blend_cov 因子表
  *     （fragment alpha 按模式编码 oa，使 1−oa 展开出 cov·Fb₀+(1−cov)，
- *     与 soft.c nx_blend_pixel_cov 逐项同式）；PLUS 的 clamp 非线性由
- *     ping-pong 手动混合精确实现（fill/glyph 读 dst 算插值式写临时层
- *     再拷回；tex 覆盖二值，折源 + 整层 clamp）；组合成（§7）走
- *     gl_blend_plain 真实 Porter-Duff。
+ *     与 soft.c nx_blend_pixel_cov 逐项同式）。SRC/SRC_IN/SRC_OUT/DST_ATOP
+ *     需要 dual-source blending；初始化时探测，不支持或设置了
+ *     NEOX_GL_FORCE_NO_DUAL 时这四模式改走 ping-pong 手动混合（与 Metal
+ *     ADR 0005 同款）。PLUS 的 clamp 非线性始终走 ping-pong（fill/glyph
+ *     读 dst 算插值式写临时层再拷回；tex 覆盖二值，折源 + 整层 clamp）。
+ *     组合成（§7）走 gl_blend_plain 真实 Porter-Duff。
  *   - 组不透明度：PUSH owns_layer → 渲染到离屏层纹理（RGBA32F SS），POP 时
  *     以 opacity × 裁剪掩码整体合成回父层（§7 隔离合成）。
  *   - 裁剪：掩码在 push 期经 geom.c 急切光栅化（与 Soft 同一 CPU 覆盖率），
@@ -48,22 +54,9 @@
  * =========================================================================*/
 #include "internal.h"
 #include "neox_gl.h"
+#include "gl_api.h"
 
-
-#include <OpenGL/gl3.h>
-#include <OpenGL/CGLTypes.h>
-#include <OpenGL/CGLCurrent.h>
-#include <OpenGL/CGLContext.h>
-
-/* CGLChoosePixelFormat/CGLCreateContext 一族在 <OpenGL/OpenGL.h> 中声明，但该头
- * 会连带引入 gl.h，与上面的 gl3.h（Core Profile）冲突。这几个入口是 10.0 起
- * 稳定的纯 C ABI，此处按 CGLTypes.h 的类型自行声明。 */
-extern CGLError CGLChoosePixelFormat(const CGLPixelFormatAttribute *attribs,
-                                     CGLPixelFormatObj *pix, GLint *npix);
-extern void CGLReleasePixelFormat(CGLPixelFormatObj pix);
-extern CGLError CGLCreateContext(CGLPixelFormatObj pix, CGLContextObj share,
-                                 CGLContextObj *ctx);
-extern void CGLReleaseContext(CGLContextObj ctx);
+#include <stdio.h>
 
 /* 超采样倍数（规范 §9 修订记录：GPU 超采样盒滤波 4×4 网格 = 1/16 步长） */
 /* 超采样倍数。§9 容差要求跨后端覆盖率一致，因此路径覆盖率直接复用 Soft 的
@@ -80,15 +73,20 @@ static const char *NX_GLSL_VS =
     "layout(location = 0) in vec2 a_pos;\n"
     "void main(void) { gl_Position = vec4(a_pos * u_scale - 1.0, 0.0, 1.0); }\n";
 
+/* #version 与 NX_DUAL 由 gl_prog_build 前置。index=1 才是 dual-source 的
+ * SRC1（layout location=1 是第二条颜色附件，Mesa 不会把它送进混合单元）。 */
 static const char *NX_GLSL_FS_FILL =
-    "#version 410 core\n"
     "uniform sampler2D u_mask;\n"        /* R32F 设备尺寸覆盖率（geom.c 光栅化） */
     "uniform sampler2D u_premul;\n"      /* RGBA32F paint×cov（CPU 预乘，与参照逐位一致） */
     "uniform float u_ss;\n"
     "uniform int u_mode;\n"
     "uniform float u_paint_a;\n"
-    "layout(location = 0) out vec4 o_color;\n"
-    "layout(location = 1) out vec4 o_color1;\n"
+    "#if NX_DUAL\n"
+    "layout(location = 0, index = 0) out vec4 o_color;\n"
+    "layout(location = 0, index = 1) out vec4 o_color1;\n"
+    "#else\n"
+    "out vec4 o_color;\n"
+    "#endif\n"
     "void main(void)\n"
     "{\n"
     /* cov==0 时 out = dst：整体跳过（§6.1 插值在 cov=0 处的退化） */
@@ -101,15 +99,16 @@ static const char *NX_GLSL_FS_FILL =
     "    if (u_mode == 1) oa = cov;\n"
     "    else if (u_mode == 6) oa = cov * (1.0 - u_paint_a);\n"
     "    else oa = p.a;\n"
+    "    o_color = vec4(p.rgb, oa);\n"
+    "#if NX_DUAL\n"
     "    float o1a = 0.0;\n"
     "    if (u_mode == 2 || u_mode == 5 || u_mode == 7) o1a = cov;\n"
     "    else if (u_mode == 10) o1a = cov * (1.0 - u_paint_a);\n"
-    "    o_color = vec4(p.rgb, oa);\n"
     "    o_color1 = vec4(0.0, 0.0, 0.0, o1a);\n"
+    "#endif\n"
     "}\n";
 
 static const char *NX_GLSL_FS_TEX =
-    "#version 410 core\n"
     "uniform sampler2D u_tex;\n"        /* RGBA32F 预乘线性 */
     "uniform ivec2 u_tex_size;\n"
     "uniform int u_linear;\n"
@@ -119,8 +118,12 @@ static const char *NX_GLSL_FS_TEX =
     "uniform float u_ss;\n"
     "uniform float u_opacity;\n"
     "uniform int u_mode;\n"
-    "layout(location = 0) out vec4 o_color;\n"
-    "layout(location = 1) out vec4 o_color1;\n"
+    "#if NX_DUAL\n"
+    "layout(location = 0, index = 0) out vec4 o_color;\n"
+    "layout(location = 0, index = 1) out vec4 o_color1;\n"
+    "#else\n"
+    "out vec4 o_color;\n"
+    "#endif\n"
     "void main(void)\n"
     "{\n"
     /* 采样位置取设备像素中心（floor(frag/ss)+0.5），与参照后端的像素中心采样对齐 */
@@ -157,15 +160,16 @@ static const char *NX_GLSL_FS_TEX =
     "    if (u_mode == 1) oa = 1.0;\n"
     "    else if (u_mode == 6) oa = 1.0 - sa;\n"
     "    else oa = sa;\n"
+    "    o_color = vec4(c.rgb * u_opacity, oa);\n"
+    "#if NX_DUAL\n"
     "    float o1a = 0.0;\n"
     "    if (u_mode == 2 || u_mode == 5 || u_mode == 7) o1a = 1.0;\n"
     "    else if (u_mode == 10) o1a = 1.0 - sa;\n"
-    "    o_color = vec4(c.rgb * u_opacity, oa);\n"
     "    o_color1 = vec4(0.0, 0.0, 0.0, o1a);\n"
+    "#endif\n"
     "}\n";
 
 static const char *NX_GLSL_FS_GLYPH =
-    "#version 410 core\n"
     "uniform sampler2D u_atlas;\n"       /* A8（R 通道 = 覆盖率） */
     "uniform vec4 u_color;\n"            /* 预乘线性 paint */
     "uniform mat3 u_inv;\n"
@@ -173,8 +177,12 @@ static const char *NX_GLSL_FS_GLYPH =
     "uniform vec4 u_atlas_rect;\n"       /* sx,sy,sw,sh */
     "uniform float u_ss;\n"
     "uniform int u_mode;\n"
-    "layout(location = 0) out vec4 o_color;\n"
-    "layout(location = 1) out vec4 o_color1;\n"
+    "#if NX_DUAL\n"
+    "layout(location = 0, index = 0) out vec4 o_color;\n"
+    "layout(location = 0, index = 1) out vec4 o_color1;\n"
+    "#else\n"
+    "out vec4 o_color;\n"
+    "#endif\n"
     "void main(void)\n"
     "{\n"
     "    vec2 devc = floor(gl_FragCoord.xy / u_ss) + 0.5;\n"
@@ -200,11 +208,13 @@ static const char *NX_GLSL_FS_GLYPH =
     "    if (u_mode == 1) oa = cov;\n"
     "    else if (u_mode == 6) oa = cov * (1.0 - u_color.a);\n"
     "    else oa = u_color.a * cov;\n"
+    "    o_color = vec4(u_color.rgb * cov, oa);\n"
+    "#if NX_DUAL\n"
     "    float o1a = 0.0;\n"
     "    if (u_mode == 2 || u_mode == 5 || u_mode == 7) o1a = cov;\n"
     "    else if (u_mode == 10) o1a = cov * (1.0 - u_color.a);\n"
-    "    o_color = vec4(u_color.rgb * cov, oa);\n"
     "    o_color1 = vec4(0.0, 0.0, 0.0, o1a);\n"
+    "#endif\n"
     "}\n";
 
 static const char *NX_GLSL_FS_CLAMP =
@@ -273,6 +283,128 @@ static const char *NX_GLSL_FS_PLUSGLYPH =
     "    o_color = min(sc + cov * dst, vec4(cov)) + (1.0 - cov) * dst;\n"
     "}\n";
 
+/* dual-source 不可用时的回退（仅 SRC=2 / SRC_IN=5 / SRC_OUT=7 / DST_ATOP=10）。
+ * 直接用 sc = s·cov，避免 sc/cov 再乘回去的舍入。与 soft.c nx_blend_pixel_cov
+ * 同一展开：out = sc·Fa + dst·Fb，Fb 已含 (1−cov)。 */
+static const char *NX_GLSL_FS_MANUALFILL =
+    "#version 410 core\n"
+    "uniform sampler2D u_premul;\n"
+    "uniform sampler2D u_mask;\n"
+    "uniform sampler2D u_layer;\n"
+    "uniform float u_ss;\n"
+    "uniform int u_mode;\n"
+    "out vec4 o_color;\n"
+    "void main(void)\n"
+    "{\n"
+    "    ivec2 dp = ivec2(gl_FragCoord.xy / u_ss);\n"
+    "    vec4 dst = texelFetch(u_layer, dp, 0);\n"
+    "    float cov = texelFetch(u_mask, dp, 0).r;\n"
+    "    if (cov <= 0.0) { o_color = dst; return; }\n"
+    "    vec4 sc = texelFetch(u_premul, dp, 0);\n"
+    "    float ic = 1.0 - cov;\n"
+    "    if (u_mode == 2) o_color = sc + ic * dst;\n"
+    "    else if (u_mode == 5) o_color = sc * dst.a + ic * dst;\n"
+    "    else if (u_mode == 7) o_color = sc * (1.0 - dst.a) + ic * dst;\n"
+    "    else o_color = sc * (1.0 - dst.a) + dst * (sc.a + ic);\n"
+    "}\n";
+
+static const char *NX_GLSL_FS_MANUALGLYPH =
+    "#version 410 core\n"
+    "uniform sampler2D u_atlas;\n"
+    "uniform sampler2D u_layer;\n"
+    "uniform vec4 u_color;\n"
+    "uniform mat3 u_inv;\n"
+    "uniform vec4 u_glyph;\n"
+    "uniform vec4 u_atlas_rect;\n"
+    "uniform float u_ss;\n"
+    "uniform int u_mode;\n"
+    "out vec4 o_color;\n"
+    "void main(void)\n"
+    "{\n"
+    "    ivec2 dp = ivec2(gl_FragCoord.xy / u_ss);\n"
+    "    vec4 dst = texelFetch(u_layer, dp, 0);\n"
+    "    vec2 devc = floor(gl_FragCoord.xy / u_ss) + 0.5;\n"
+    "    vec3 l = u_inv * vec3(devc, 1.0);\n"
+    "    if (l.x < u_glyph.x || l.x > u_glyph.x + u_glyph.z ||\n"
+    "        l.y < u_glyph.y || l.y > u_glyph.y + u_glyph.w) {\n"
+    "        o_color = dst; return;\n"
+    "    }\n"
+    "    float u = u_atlas_rect.x + (l.x - u_glyph.x);\n"
+    "    float v = u_atlas_rect.y + (l.y - u_glyph.y);\n"
+    "    float x = u - 0.5, y = v - 0.5;\n"
+    "    float fx = x - floor(x), fy = y - floor(y);\n"
+    "    ivec2 sz = textureSize(u_atlas, 0);\n"
+    "    int i0 = clamp(int(floor(x)), 0, sz.x - 1);\n"
+    "    int i1 = clamp(int(floor(x)) + 1, 0, sz.x - 1);\n"
+    "    int j0 = clamp(int(floor(y)), 0, sz.y - 1);\n"
+    "    int j1 = clamp(int(floor(y)) + 1, 0, sz.y - 1);\n"
+    "    float cov = texelFetch(u_atlas, ivec2(i0, j0), 0).a * ((1.0 - fx) * (1.0 - fy))\n"
+    "              + texelFetch(u_atlas, ivec2(i1, j0), 0).a * (fx * (1.0 - fy))\n"
+    "              + texelFetch(u_atlas, ivec2(i0, j1), 0).a * ((1.0 - fx) * fy)\n"
+    "              + texelFetch(u_atlas, ivec2(i1, j1), 0).a * (fx * fy);\n"
+    "    if (cov <= 0.0) { o_color = dst; return; }\n"
+    "    vec4 sc = u_color * cov;\n"
+    "    float ic = 1.0 - cov;\n"
+    "    if (u_mode == 2) o_color = sc + ic * dst;\n"
+    "    else if (u_mode == 5) o_color = sc * dst.a + ic * dst;\n"
+    "    else if (u_mode == 7) o_color = sc * (1.0 - dst.a) + ic * dst;\n"
+    "    else o_color = sc * (1.0 - dst.a) + dst * (sc.a + ic);\n"
+    "}\n";
+
+/* 纹理覆盖是像素中心二值（cov=1）。矩形外写回 dst，供 ping-pong 的
+ * AABB 角点保持原内容。 */
+static const char *NX_GLSL_FS_MANUALTEX =
+    "#version 410 core\n"
+    "uniform sampler2D u_tex;\n"
+    "uniform sampler2D u_layer;\n"
+    "uniform ivec2 u_tex_size;\n"
+    "uniform int u_linear;\n"
+    "uniform mat3 u_inv;\n"
+    "uniform vec4 u_src;\n"
+    "uniform vec4 u_dst;\n"
+    "uniform float u_ss;\n"
+    "uniform float u_opacity;\n"
+    "uniform int u_mode;\n"
+    "out vec4 o_color;\n"
+    "void main(void)\n"
+    "{\n"
+    "    ivec2 dp = ivec2(gl_FragCoord.xy / u_ss);\n"
+    "    vec4 dst = texelFetch(u_layer, dp, 0);\n"
+    "    vec2 devc = floor(gl_FragCoord.xy / u_ss) + 0.5;\n"
+    "    vec3 l = u_inv * vec3(devc, 1.0);\n"
+    "    float tu = (l.x - u_dst.x) / u_dst[2];\n"
+    "    float tv = (l.y - u_dst.y) / u_dst[3];\n"
+    "    if (tu < 0.0 || tu > 1.0 || tv < 0.0 || tv > 1.0) {\n"
+    "        o_color = dst; return;\n"
+    "    }\n"
+    "    float u = u_src.x + tu * u_src[2];\n"
+    "    float v = u_src.y + tv * u_src[3];\n"
+    "    vec4 c;\n"
+    "    if (u_linear == 0) {\n"
+    "        int i = clamp(int(floor(u)), 0, u_tex_size.x - 1);\n"
+    "        int j = clamp(int(floor(v)), 0, u_tex_size.y - 1);\n"
+    "        c = texelFetch(u_tex, ivec2(i, j), 0);\n"
+    "    } else {\n"
+    "        float x = u - 0.5, y = v - 0.5;\n"
+    "        float fx = x - floor(x), fy = y - floor(y);\n"
+    "        int i0 = clamp(int(floor(x)), 0, u_tex_size.x - 1);\n"
+    "        int i1 = clamp(int(floor(x)) + 1, 0, u_tex_size.x - 1);\n"
+    "        int j0 = clamp(int(floor(y)), 0, u_tex_size.y - 1);\n"
+    "        int j1 = clamp(int(floor(y)) + 1, 0, u_tex_size.y - 1);\n"
+    "        vec4 p00 = texelFetch(u_tex, ivec2(i0, j0), 0);\n"
+    "        vec4 p10 = texelFetch(u_tex, ivec2(i1, j0), 0);\n"
+    "        vec4 p01 = texelFetch(u_tex, ivec2(i0, j1), 0);\n"
+    "        vec4 p11 = texelFetch(u_tex, ivec2(i1, j1), 0);\n"
+    "        c = p00 * ((1.0 - fx) * (1.0 - fy)) + p10 * (fx * (1.0 - fy))\n"
+    "          + p01 * ((1.0 - fx) * fy) + p11 * (fx * fy);\n"
+    "    }\n"
+    "    vec4 sc = vec4(c.rgb * u_opacity, c.a * u_opacity);\n"
+    "    if (u_mode == 2) o_color = sc;\n"
+    "    else if (u_mode == 5) o_color = sc * dst.a;\n"
+    "    else if (u_mode == 7) o_color = sc * (1.0 - dst.a);\n"
+    "    else o_color = sc * (1.0 - dst.a) + dst * sc.a;\n"
+    "}\n";
+
 static const char *NX_GLSL_FS_COMP =
     "#version 410 core\n"
     "uniform sampler2D u_layer;\n"       /* RGBA32F 超采样层 */
@@ -331,9 +463,12 @@ struct neox_gl_surface {
 };
 
 typedef struct nx_gl_dev {
-    CGLContextObj ctx;          /* 本后端自建的上下文（shared_context 仅共享组） */
+    nx_gl_ctx *ctx;             /* 平台上下文；shared_context 只加入共享组 */
+    int gl_ready;               /* 入口已解析，销毁时可以发 GL 调用 */
+    int dual_ok;                /* GL_MAX_DUAL_SOURCE_DRAW_BUFFERS >= 1 且探测链接成功 */
     GLuint vao, vbo;
     nx_gl_prog p_fill, p_tex, p_glyph, p_comp, p_blit, p_clamp, p_plusfill, p_plusglyph;
+    nx_gl_prog p_manualfill, p_manualglyph, p_manualtex;
     nx_gl_rt *rts;              /* 层池（is_layer=1）与裁剪纹理池（is_layer=0） */
     uint32_t nrts, caprts;
     nx_gl_texent *texs;         /* 并行于 textures 槽位表 */
@@ -354,7 +489,14 @@ typedef struct nx_gl_dev {
 
 static int gl_make_current(nx_gl_dev *g)
 {
-    return CGLSetCurrentContext(g->ctx) == kCGLNoError;
+    return g->ctx && nx_gl_ctx_make_current(g->ctx);
+}
+
+/* SRC/SRC_IN/SRC_OUT/DST_ATOP 的 dst 因子要用 SRC1，单源混合表达不了。 */
+static int gl_mode_needs_dual(neox_blend m)
+{
+    return m == NEOX_BLEND_SRC || m == NEOX_BLEND_SRC_IN ||
+           m == NEOX_BLEND_SRC_OUT || m == NEOX_BLEND_DST_ATOP;
 }
 
 static void gl_prog_free(nx_gl_prog *p)
@@ -369,14 +511,26 @@ static GLint gl_ul(GLuint prog, const char *name)
 }
 
 /* 编译 + 链接；失败返回 NEOX_ERROR_BACKEND 并留静态错误细节 */
+/* dual < 0：fs_src 自带 #version。dual 为 0/1：前置 #version 与 NX_DUAL。 */
 static neox_result gl_prog_build(neox_context *ctx, GLuint vs,
                                  const char *fs_src, const char *what,
-                                 nx_gl_prog *out)
+                                 nx_gl_prog *out, int dual)
 {
     GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
     GLuint p;
     GLint ok = GL_FALSE;
-    glShaderSource(fs, 1, &fs_src, NULL);
+    const char *srcs[2];
+    char hdr[80];
+    GLsizei nsrc = 1;
+    srcs[0] = fs_src;
+    if (dual >= 0) {
+        snprintf(hdr, sizeof hdr, "#version 410 core\n#define NX_DUAL %d\n",
+                 dual ? 1 : 0);
+        srcs[0] = hdr;
+        srcs[1] = fs_src;
+        nsrc = 2;
+    }
+    glShaderSource(fs, nsrc, srcs, NULL);
     glCompileShader(fs);
     glGetShaderiv(fs, GL_COMPILE_STATUS, &ok);
     if (ok != GL_TRUE) {
@@ -701,27 +855,31 @@ static neox_result gl_tex_ensure(neox_context *ctx, nx_gl_dev *g,
 static void gl_state_destroy(neox_context *ctx, nx_gl_dev *g)
 {
     uint32_t i;
+    if (g->ctx && g->gl_ready && gl_make_current(g)) {
+        gl_prog_free(&g->p_fill);
+        gl_prog_free(&g->p_clamp);
+        gl_prog_free(&g->p_plusfill);
+        gl_prog_free(&g->p_plusglyph);
+        gl_prog_free(&g->p_manualfill);
+        gl_prog_free(&g->p_manualglyph);
+        gl_prog_free(&g->p_manualtex);
+        gl_prog_free(&g->p_tex);
+        gl_prog_free(&g->p_glyph);
+        gl_prog_free(&g->p_comp);
+        gl_prog_free(&g->p_blit);
+        if (g->vao) glDeleteVertexArrays(1, &g->vao);
+        if (g->vbo) glDeleteBuffers(1, &g->vbo);
+        if (g->snap_tex) glDeleteTextures(1, &g->snap_tex);
+        for (i = 0; i < g->nrts; i++) gl_rt_destroy(&g->rts[i]);
+        for (i = 0; i < g->ntexs; i++)
+            if (g->texs[i].id) glDeleteTextures(1, &g->texs[i].id);
+        /* 表面注册表中仍存活的表面：GL 对象随上下文销毁，这里仅回收结构 */
+        for (i = 0; i < g->nsurfs; i++)
+            nx_free(ctx, g->surfs[i], sizeof(neox_gl_surface), 16);
+    }
     if (g->ctx) {
-        if (gl_make_current(g)) {
-            gl_prog_free(&g->p_fill);
-            gl_prog_free(&g->p_clamp);
-            gl_prog_free(&g->p_plusfill);
-            gl_prog_free(&g->p_plusglyph);
-            gl_prog_free(&g->p_tex);
-            gl_prog_free(&g->p_glyph);
-            gl_prog_free(&g->p_comp);
-            gl_prog_free(&g->p_blit);
-            if (g->vao) glDeleteVertexArrays(1, &g->vao);
-            if (g->vbo) glDeleteBuffers(1, &g->vbo);
-            if (g->snap_tex) glDeleteTextures(1, &g->snap_tex);
-            for (i = 0; i < g->nrts; i++) gl_rt_destroy(&g->rts[i]);
-            for (i = 0; i < g->ntexs; i++)
-                if (g->texs[i].id) glDeleteTextures(1, &g->texs[i].id);
-            /* 表面注册表中仍存活的表面：GL 对象随上下文销毁，这里仅回收结构 */
-            for (i = 0; i < g->nsurfs; i++)
-                nx_free(ctx, g->surfs[i], sizeof(neox_gl_surface), 16);
-        }
-        CGLReleaseContext(g->ctx);
+        nx_gl_ctx_destroy(g->ctx);
+        g->ctx = NULL;
     }
     if (g->mask) nx_free(ctx, g->mask, (size_t)g->mask_w * g->mask_h * 4, 16);
     if (g->premul) nx_free(ctx, g->premul, (size_t)g->premul_w * g->premul_h * 16, 16);
@@ -755,22 +913,49 @@ static int gl_probe_float_fbo(void)
     return ok;
 }
 
+/* 链接一个写出 index=1 的最小程序。查询值不够：有的驱动报了 dual-source
+ * 上限，着色器仍链不上。失败不是设备错误，只是关掉 dual 路径。 */
+static int gl_probe_dual(void)
+{
+    const char *vs_src =
+        "#version 410 core\n"
+        "void main(void) { gl_Position = vec4(0.0); }\n";
+    const char *fs_src =
+        "#version 410 core\n"
+        "layout(location = 0, index = 0) out vec4 a;\n"
+        "layout(location = 0, index = 1) out vec4 b;\n"
+        "void main(void) { a = vec4(1.0); b = vec4(0.0, 0.0, 0.0, 1.0); }\n";
+    const char *vss = vs_src, *fss = fs_src;
+    GLint n = 0, ok = GL_FALSE;
+    GLuint vs, fs, p;
+    glGetError();
+    glGetIntegerv(GL_MAX_DUAL_SOURCE_DRAW_BUFFERS, &n);
+    if (glGetError() != GL_NO_ERROR || n < 1) return 0;
+    vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &vss, NULL);
+    glCompileShader(vs);
+    fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &fss, NULL);
+    glCompileShader(fs);
+    p = glCreateProgram();
+    glAttachShader(p, vs);
+    glAttachShader(p, fs);
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    glDeleteProgram(p);
+    glGetError();
+    return ok == GL_TRUE;
+}
+
 static neox_result gl_device_init(neox_device *dev, const void *platform,
                                   size_t plat_size)
 {
     neox_context *ctx = dev->ctx;
     nx_gl_dev *g;
     neox_gl_device_desc gld;
-    CGLPixelFormatAttribute attrs[] = {
-        kCGLPFAAccelerated,
-        kCGLPFANoRecovery,
-        kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)kCGLOGLPVersion_GL4_Core,
-        (CGLPixelFormatAttribute)0
-    };
-    CGLPixelFormatObj pf = NULL;
-    CGLContextObj share = NULL;
-    GLint npix = 0, major = 0, minor = 0;
-    CGLError cerr;
+    GLint major = 0, minor = 0;
     GLuint vs;
     neox_result r;
 
@@ -809,26 +994,26 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
                NEOX_ERROR_INVALID_ARGUMENT);
     }
 
-    cerr = CGLChoosePixelFormat(attrs, &pf, &npix);
-    if (cerr != kCGLNoError || pf == NULL || npix == 0)
-        NX_ERR(ctx, "CGL: no OpenGL 4.1 Core pixel format", NEOX_ERROR_BACKEND);
-    share = (CGLContextObj)gld.shared_context;
     g = (nx_gl_dev *)nx_alloc(ctx, sizeof(nx_gl_dev), 16);
-    if (!g) {
-        CGLReleasePixelFormat(pf);
-        NX_ERR(ctx, "GL backend state allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
-    }
+    if (!g) NX_ERR(ctx, "GL backend state allocation failed",
+                   NEOX_ERROR_OUT_OF_MEMORY);
     memset(g, 0, sizeof(*g));
-    cerr = CGLCreateContext(pf, share, &g->ctx);
-    CGLReleasePixelFormat(pf);
-    if (cerr != kCGLNoError || g->ctx == NULL) {
-        nx_free(ctx, g, sizeof(nx_gl_dev), 16);
-        NX_ERR(ctx, "CGL: context creation failed", NEOX_ERROR_BACKEND);
+    g->ctx = nx_gl_ctx_create(platform ? &gld : NULL);
+    if (!g->ctx) {
+        const char *e = nx_gl_ctx_last_error();
+        gl_state_destroy(ctx, g);
+        NX_ERR(ctx, e ? e : "GL context creation failed", NEOX_ERROR_BACKEND);
     }
     if (!gl_make_current(g)) {
         gl_state_destroy(ctx, g);
-        NX_ERR(ctx, "CGL: could not make context current", NEOX_ERROR_BACKEND);
+        NX_ERR(ctx, "GL: could not make context current", NEOX_ERROR_BACKEND);
     }
+    if (!nx_gl_load(g->ctx)) {
+        const char *e = nx_gl_load_last_error();
+        gl_state_destroy(ctx, g);
+        NX_ERR(ctx, e ? e : "GL entry point load failed", NEOX_ERROR_BACKEND);
+    }
+    g->gl_ready = 1;
     /* 版本确认（GL 3.0+ 提供 GL_MAJOR/MINOR_VERSION） */
     glGetIntegerv(GL_MAJOR_VERSION, &major);
     glGetIntegerv(GL_MINOR_VERSION, &minor);
@@ -841,8 +1026,19 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
         NX_ERR(ctx, "GL_RGBA32F framebuffer not renderable",
                NEOX_ERROR_BACKEND);
     }
+    g->dual_ok = gl_probe_dual();
+    if (getenv("NEOX_GL_FORCE_NO_DUAL")) g->dual_ok = 0;
+    if (getenv("NEOX_GL_LOG")) {
+        const GLubyte *rend = glGetString(GL_RENDERER);
+        const GLubyte *ver = glGetString(GL_VERSION);
+        fprintf(stderr, "neox gl: kind=%s renderer=%s version=%s dual_source=%d\n",
+                nx_gl_ctx_kind(),
+                rend ? (const char *)rend : "?",
+                ver ? (const char *)ver : "?",
+                g->dual_ok);
+    }
 
-    /* 共享顶点着色器 + 六个片段程序 */
+    /* 共享顶点着色器 + 片段程序。fill/tex/glyph 按 dual_ok 选输出声明。 */
     vs = glCreateShader(GL_VERTEX_SHADER);
     glShaderSource(vs, 1, &NX_GLSL_VS, NULL);
     glCompileShader(vs);
@@ -855,19 +1051,26 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
             NX_ERR(ctx, "GL vertex shader compile failed", NEOX_ERROR_BACKEND);
         }
     }
-#define NX_BUILD(prog, src, what) do { \
-        r = gl_prog_build(ctx, vs, src, what, &(prog)); \
+#define NX_BUILD_MODE(prog, src, what, dual) do { \
+        r = gl_prog_build(ctx, vs, src, what, &(prog), (dual)); \
         if (r != NEOX_OK) { glDeleteShader(vs); gl_state_destroy(ctx, g); return r; } \
     } while (0)
-    NX_BUILD(g->p_fill, NX_GLSL_FS_FILL, "fill");
+#define NX_BUILD(prog, src, what) NX_BUILD_MODE(prog, src, what, -1)
+#define NX_BUILD_FS(prog, src, what) NX_BUILD_MODE(prog, src, what, g->dual_ok)
+    NX_BUILD_FS(g->p_fill, NX_GLSL_FS_FILL, "fill");
     NX_BUILD(g->p_clamp, NX_GLSL_FS_CLAMP, "clamp");
     NX_BUILD(g->p_plusfill, NX_GLSL_FS_PLUSFILL, "plusfill");
     NX_BUILD(g->p_plusglyph, NX_GLSL_FS_PLUSGLYPH, "plusglyph");
-    NX_BUILD(g->p_tex, NX_GLSL_FS_TEX, "tex");
-    NX_BUILD(g->p_glyph, NX_GLSL_FS_GLYPH, "glyph");
+    NX_BUILD(g->p_manualfill, NX_GLSL_FS_MANUALFILL, "manualfill");
+    NX_BUILD(g->p_manualglyph, NX_GLSL_FS_MANUALGLYPH, "manualglyph");
+    NX_BUILD(g->p_manualtex, NX_GLSL_FS_MANUALTEX, "manualtex");
+    NX_BUILD_FS(g->p_tex, NX_GLSL_FS_TEX, "tex");
+    NX_BUILD_FS(g->p_glyph, NX_GLSL_FS_GLYPH, "glyph");
     NX_BUILD(g->p_comp, NX_GLSL_FS_COMP, "comp");
     NX_BUILD(g->p_blit, NX_GLSL_FS_BLIT, "blit");
+#undef NX_BUILD_FS
 #undef NX_BUILD
+#undef NX_BUILD_MODE
     glDeleteShader(vs);
     if (glGetError() != GL_NO_ERROR) {
         gl_state_destroy(ctx, g);
@@ -889,6 +1092,7 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_BLEND);
+    glDisable(GL_DITHER);          /* 浮点目标上本应是空操作；关掉以免量化抖动 */
     glDisable(GL_FRAMEBUFFER_SRGB); /* sRGB 编码由 resolve shader 手工完成 */
     dev->bstate = g;
     return NEOX_OK;
@@ -929,7 +1133,7 @@ static neox_result gl_begin_target(neox_frame *fr,
         NX_ERR(ctx, "surface belongs to another device",
                NEOX_ERROR_OWNERSHIP_VIOLATION);
     if (!gl_make_current(g))
-        NX_ERR(ctx, "CGL: could not make context current", NEOX_ERROR_BACKEND);
+        NX_ERR(ctx, "GL: could not make context current", NEOX_ERROR_BACKEND);
     fr->surface = surf;
     fr->width = surf->w;
     fr->height = surf->h;
@@ -1126,9 +1330,12 @@ static neox_result gl_fill_path(neox_device *dev, nx_gl_dev *g,
         float x1 = ceilf(maxx) * NEOX_GL_SS, y1 = ceilf(maxy) * NEOX_GL_SS;
         q[0] = x0; q[1]  = y0;  q[2]  = x1; q[3]  = y0;  q[4]  = x1; q[5]  = y1;
         q[6] = x0; q[7]  = y0;  q[8]  = x1; q[9]  = y1;  q[10] = x0; q[11] = y1;
-        if (blend == NEOX_BLEND_PLUS) {
-            /* ping-pong 手动混合：读 dst 计算插值式写入临时层，再拷回（限 bbox） */
+        {
+            int manual = !g->dual_ok && gl_mode_needs_dual(blend);
+            if (blend == NEOX_BLEND_PLUS || manual) {
+            /* ping-pong：PLUS 或无 dual-source 的四模式。读 dst 写入临时层再拷回。 */
             nx_gl_rt *tmp;
+            const nx_gl_prog *prog = manual ? &g->p_manualfill : &g->p_plusfill;
             r = gl_rt_acquire(ctx, g, SSW, SSH, 1, &tmp);
             if (r != NEOX_OK) {
                 gl_rt_release(mrt);
@@ -1137,18 +1344,19 @@ static neox_result gl_fill_path(neox_device *dev, nx_gl_dev *g,
             }
             glBindFramebuffer(GL_FRAMEBUFFER, tmp->fbo);
             glViewport(0, 0, (GLsizei)SSW, (GLsizei)SSH);
-            gl_use(&g->p_plusfill, 2.0f / (float)SSW, 2.0f / (float)SSH);
+            gl_use(prog, 2.0f / (float)SSW, 2.0f / (float)SSH);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, prt->tex);
-            glUniform1i(g->p_plusfill.u_premul, 0);
+            glUniform1i(prog->u_premul, 0);
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, mrt->tex);
-            glUniform1i(g->p_plusfill.u_mask, 1);
+            glUniform1i(prog->u_mask, 1);
             glActiveTexture(GL_TEXTURE2);
             glBindTexture(GL_TEXTURE_2D, layer->tex);
-            glUniform1i(g->p_plusfill.u_layer, 2);
+            glUniform1i(prog->u_layer, 2);
             glActiveTexture(GL_TEXTURE0);
-            glUniform1f(g->p_plusfill.u_ss, (GLfloat)NEOX_GL_SS);
+            glUniform1f(prog->u_ss, (GLfloat)NEOX_GL_SS);
+            if (manual) glUniform1i(prog->u_mode, (GLint)blend);
             glDisable(GL_BLEND);
             gl_draw(g, q, 6);
             /* 拷回（限 bbox 像素区域，临时层在包围盒外是池内陈旧内容） */
@@ -1170,12 +1378,14 @@ static neox_result gl_fill_path(neox_device *dev, nx_gl_dev *g,
             if (glGetError() != GL_NO_ERROR) {
                 gl_rt_release(mrt);
                 gl_rt_release(prt);
-                ctx->last_error = "GL PLUS fill failed";
+                ctx->last_error = manual ? "GL manual fill failed"
+                                         : "GL PLUS fill failed";
                 return NEOX_ERROR_BACKEND;
             }
-        } else {
-            gl_blend_cov(blend);
-            gl_draw(g, q, 6);
+            } else {
+                gl_blend_cov(blend);
+                gl_draw(g, q, 6);
+            }
         }
     }
     gl_rt_release(mrt);
@@ -1245,8 +1455,67 @@ static neox_result gl_draw_tex(neox_device *dev, nx_gl_dev *g,
     glUniform1f(g->p_tex.u_ss, (GLfloat)NEOX_GL_SS);
     glUniform1f(g->p_tex.u_opacity, cmd->tex_opacity);
     glUniform1i(g->p_tex.u_mode, (GLint)blend);
-    gl_blend_cov(blend);   /* PLUS: cov=1 折源 + 整层 clamp（下方） */
-    gl_draw(g, q, 6);
+    if (!g->dual_ok && gl_mode_needs_dual(blend)) {
+        /* 无 dual-source：AABB 矩形覆盖 scissor，矩形外着色器写回 dst。 */
+        float bx0 = ix[0], by0 = iy[0], bx1 = ix[0], by1 = iy[0];
+        float rq[12], rx0, ry0, rx1, ry1;
+        nx_gl_rt *tmp;
+        neox_result tr;
+        int ti;
+        GLuint tex_id = 0;
+        for (ti = 1; ti < 4; ti++) {
+            if (ix[ti] < bx0) bx0 = ix[ti];
+            if (ix[ti] > bx1) bx1 = ix[ti];
+            if (iy[ti] < by0) by0 = iy[ti];
+            if (iy[ti] > by1) by1 = iy[ti];
+        }
+        rx0 = floorf(bx0); ry0 = floorf(by0);
+        rx1 = ceilf(bx1);  ry1 = ceilf(by1);
+        rq[0] = rx0; rq[1] = ry0; rq[2] = rx1; rq[3] = ry0; rq[4] = rx1; rq[5] = ry1;
+        rq[6] = rx0; rq[7] = ry0; rq[8] = rx1; rq[9] = ry1; rq[10] = rx0; rq[11] = ry1;
+        tr = gl_rt_acquire(dev->ctx, g, SSW, SSH, 1, &tmp);
+        if (tr != NEOX_OK) return tr;
+        tex_id = (GLuint)g->texs[(uint32_t)(tx - (const nx_tex_slot *)dev->textures.slots)].id;
+        glBindFramebuffer(GL_FRAMEBUFFER, tmp->fbo);
+        glViewport(0, 0, (GLsizei)SSW, (GLsizei)SSH);
+        gl_use(&g->p_manualtex, 2.0f / (float)SSW, 2.0f / (float)SSH);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex_id);
+        glUniform1i(g->p_manualtex.u_tex, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, layer->tex);
+        glUniform1i(g->p_manualtex.u_layer, 1);
+        glActiveTexture(GL_TEXTURE0);
+        glUniform2i(g->p_manualtex.u_tex_size, (GLint)tx->width, (GLint)tx->height);
+        glUniform1i(g->p_manualtex.u_linear, cmd->filter == NEOX_FILTER_LINEAR ? 1 : 0);
+        glUniformMatrix3fv(g->p_manualtex.u_inv, 1, GL_FALSE, m3);
+        glUniform4f(g->p_manualtex.u_src, cmd->src.x, cmd->src.y, cmd->src.w, cmd->src.h);
+        glUniform4f(g->p_manualtex.u_dst, cmd->dst.x, cmd->dst.y, cmd->dst.w, cmd->dst.h);
+        glUniform1f(g->p_manualtex.u_ss, (GLfloat)NEOX_GL_SS);
+        glUniform1f(g->p_manualtex.u_opacity, cmd->tex_opacity);
+        glUniform1i(g->p_manualtex.u_mode, (GLint)blend);
+        glDisable(GL_BLEND);
+        gl_draw(g, rq, 6);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor((GLint)rx0, (GLint)ry0, (GLsizei)(rx1 - rx0), (GLsizei)(ry1 - ry0));
+        glBindFramebuffer(GL_FRAMEBUFFER, layer->fbo);
+        glViewport(0, 0, (GLsizei)SSW, (GLsizei)SSH);
+        gl_use(&g->p_blit, 2.0f / (float)SSW, 2.0f / (float)SSH);
+        glBindTexture(GL_TEXTURE_2D, tmp->tex);
+        glUniform1i(g->p_blit.u_tex, 0);
+        glUniform1f(g->p_blit.u_ss, (GLfloat)NEOX_GL_SS);
+        gl_draw_full(g, &g->p_blit, (float)SSW, (float)SSH,
+                     2.0f / (float)SSW, 2.0f / (float)SSH);
+        glDisable(GL_SCISSOR_TEST);
+        gl_rt_release(tmp);
+        if (glGetError() != GL_NO_ERROR) {
+            dev->ctx->last_error = "GL manual texture draw failed";
+            return NEOX_ERROR_BACKEND;
+        }
+    } else {
+        gl_blend_cov(blend);   /* PLUS: cov=1 折源 + 整层 clamp（下方） */
+        gl_draw(g, q, 6);
+    }
     }
     if (blend == NEOX_BLEND_PLUS)
         return gl_clamp_layer(dev->ctx, g, layer, w, h);
@@ -1283,7 +1552,8 @@ static neox_result gl_draw_glyphs(neox_device *dev, nx_gl_dev *g,
     glUniformMatrix3fv(g->p_glyph.u_inv, 1, GL_FALSE, m3);
     glUniform1f(g->p_glyph.u_ss, (GLfloat)NEOX_GL_SS);
     glUniform1i(g->p_glyph.u_mode, (GLint)blend);
-    if (blend != NEOX_BLEND_PLUS) gl_blend_cov(blend);
+    if (blend != NEOX_BLEND_PLUS && !(!g->dual_ok && gl_mode_needs_dual(blend)))
+        gl_blend_cov(blend);
     for (gi = 0; gi < cmd->glyph_count; gi++) {
         const neox_glyph *gl2 = &cmd->glyphs[gi];
         float gw = (float)gl2->sw, gh = (float)gl2->sh;
@@ -1321,29 +1591,43 @@ static neox_result gl_draw_glyphs(neox_device *dev, nx_gl_dev *g,
         q[6]  = ix[0]; q[7]  = iy[0];
         q[8]  = ix[2]; q[9]  = iy[2];
         q[10] = ix[3]; q[11] = iy[3];
-        if (blend == NEOX_BLEND_PLUS) {
-            /* ping-pong 手动插值混合（同 fill 的 PLUS 路径），限字形 bbox 拷回 */
+        if (blend == NEOX_BLEND_PLUS ||
+            (!g->dual_ok && gl_mode_needs_dual(blend))) {
+            /* ping-pong：PLUS，或无 dual-source 时的四模式。manual 画 AABB，
+             * 字形外写回 dst，避免 scissor 角点拷到陈旧内容。 */
             nx_gl_rt *tmp;
+            int manual = blend != NEOX_BLEND_PLUS;
+            const nx_gl_prog *prog = manual ? &g->p_manualglyph : &g->p_plusglyph;
+            float rq[12];
+            const float *dv = q;
             r = gl_rt_acquire(dev->ctx, g, SSW, SSH, 1, &tmp);
             if (r != NEOX_OK) return r;
+            if (manual) {
+                float rx0 = gx0 * (float)NEOX_GL_SS, ry0 = gy0 * (float)NEOX_GL_SS;
+                float rx1 = gx1 * (float)NEOX_GL_SS, ry1 = gy1 * (float)NEOX_GL_SS;
+                rq[0] = rx0; rq[1] = ry0; rq[2] = rx1; rq[3] = ry0; rq[4] = rx1; rq[5] = ry1;
+                rq[6] = rx0; rq[7] = ry0; rq[8] = rx1; rq[9] = ry1; rq[10] = rx0; rq[11] = ry1;
+                dv = rq;
+            }
             glBindFramebuffer(GL_FRAMEBUFFER, tmp->fbo);
             glViewport(0, 0, (GLsizei)SSW, (GLsizei)SSH);
-            gl_use(&g->p_plusglyph, 2.0f / (float)SSW, 2.0f / (float)SSH);
+            gl_use(prog, 2.0f / (float)SSW, 2.0f / (float)SSH);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, g->texs[idx].id);
-            glUniform1i(g->p_plusglyph.u_atlas, 0);
+            glUniform1i(prog->u_atlas, 0);
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, layer->tex);
-            glUniform1i(g->p_plusglyph.u_layer, 1);
+            glUniform1i(prog->u_layer, 1);
             glActiveTexture(GL_TEXTURE0);
-            glUniform4f(g->p_plusglyph.u_color, paint[0], paint[1], paint[2], paint[3]);
-            glUniformMatrix3fv(g->p_plusglyph.u_inv, 1, GL_FALSE, m3);
-            glUniform4f(g->p_plusglyph.u_glyph, gl2->x, gl2->y, gw, gh);
-            glUniform4f(g->p_plusglyph.u_atlas_rect, (GLfloat)gl2->sx,
+            glUniform4f(prog->u_color, paint[0], paint[1], paint[2], paint[3]);
+            glUniformMatrix3fv(prog->u_inv, 1, GL_FALSE, m3);
+            glUniform4f(prog->u_glyph, gl2->x, gl2->y, gw, gh);
+            glUniform4f(prog->u_atlas_rect, (GLfloat)gl2->sx,
                         (GLfloat)gl2->sy, gw, gh);
-            glUniform1f(g->p_plusglyph.u_ss, (GLfloat)NEOX_GL_SS);
+            glUniform1f(prog->u_ss, (GLfloat)NEOX_GL_SS);
+            if (manual) glUniform1i(prog->u_mode, (GLint)blend);
             glDisable(GL_BLEND);
-            gl_draw(g, q, 6);
+            gl_draw(g, dv, 6);
             glEnable(GL_SCISSOR_TEST);
             glScissor((GLsizei)gx0 * NEOX_GL_SS, (GLsizei)gy0 * NEOX_GL_SS,
                       (GLsizei)(gx1 - gx0) * NEOX_GL_SS,
@@ -1359,7 +1643,8 @@ static neox_result gl_draw_glyphs(neox_device *dev, nx_gl_dev *g,
             glDisable(GL_SCISSOR_TEST);
             gl_rt_release(tmp);
             if (glGetError() != GL_NO_ERROR) {
-                dev->ctx->last_error = "GL PLUS glyph failed";
+                dev->ctx->last_error = manual ? "GL manual glyph failed"
+                                              : "GL PLUS glyph failed";
                 return NEOX_ERROR_BACKEND;
             }
         } else {
@@ -1536,7 +1821,7 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
         return NEOX_ERROR_BACKEND;
     }
     if (!gl_make_current(g)) {
-        ctx->last_error = "CGL: could not make context current";
+        ctx->last_error = "GL: could not make context current";
         return NEOX_ERROR_BACKEND;
     }
     glGetError(); /* 清粘滞错误 */
@@ -1747,7 +2032,7 @@ neox_result neox_gl_surface_create(neox_device *dev,
     if (width == 0 || height == 0 || width > g->max_tex || height > g->max_tex)
         NX_ERR(ctx, "invalid surface size", NEOX_ERROR_INVALID_ARGUMENT);
     if (!gl_make_current(g))
-        NX_ERR(ctx, "CGL: could not make context current", NEOX_ERROR_BACKEND);
+        NX_ERR(ctx, "GL: could not make context current", NEOX_ERROR_BACKEND);
     s = (neox_gl_surface *)nx_alloc(ctx, sizeof(neox_gl_surface), 16);
     if (!s) NX_ERR(ctx, "surface allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
     memset(s, 0, sizeof(*s));

@@ -42,3 +42,22 @@ jobs:
         run: cmake --build build
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  ubuntu-gl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install EGL + Mesa software rasterizer + fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dri fonts-dejavu-core
+          sudo apt-get install -y libegl1 libegl-mesa0 || sudo apt-get install -y libegl1-mesa
+      - name: Configure
+        run: cmake -S . -B build -DNEOX_BACKEND_GL=ON -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build
+      - name: Test (Soft + GL, fail if GL is skipped)
+        env:
+          NEOX_REQUIRE_GL: "1"
+          NEOX_GL_LOG: "1"
+        run: ctest --test-dir build --output-on-failure

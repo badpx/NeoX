@@ -22,7 +22,7 @@ NeoX 是一个以**图形语义契约**为中心的跨平台 2D 图形库：矢�
 |---|---|
 | 语义规范 v0（最小子集） | 三后端验证通过，草案冻结 |
 | Soft 后端（软件光栅） | 完成，参照实现 |
-| GL 后端（OpenGL 4.1/CGL，macOS） | 完成，链路验证定位 |
+| GL 后端（OpenGL 4.1 Core；macOS CGL / Linux EGL surfaceless） | 完成，链路验证定位 |
 | Metal 后端（macOS，真异步） | 完成，首个验证"提交后存活期"契约的后端 |
 | 保留模式场景树 | 完成（脏区追踪为粗粒度，增量执行在第二阶段） |
 | CAP 捕获/回放（最小版） | 完成，含跨后端回放 |
@@ -41,9 +41,16 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-- 依赖：C11 编译器 + CMake；无第三方库。
-- macOS 上默认启用 GL 与 Metal 后端（`NEOX_BACKEND_GL` / `NEOX_BACKEND_METAL`）；其他平台当前自动退回 Soft-only。
-- 示例：`build/ex01_scene`（Soft）、`build/ex02_gpuscene`（GL）、`build/ex03_mtlscene`（Metal）、`build/ex04_text`（中英混排文字，三后端）输出 BMP 到 build 目录；`ex03_compare.bmp` / `ex04_compare.bmp` 为并排对比图。
+- 依赖：C11 编译器 + CMake；无第三方库。Linux GL 后端运行期 `dlopen("libEGL.so.1")`，另需 Mesa 的软件光栅驱动（无显示器也可跑，不需要 X11/Wayland）。Ubuntu 24.04：
+
+```sh
+sudo apt-get install -y build-essential cmake libgl1-mesa-dri fonts-dejavu-core
+sudo apt-get install -y libegl1 libegl-mesa0 || sudo apt-get install -y libegl1-mesa
+```
+
+- macOS 上默认启用 GL 与 Metal（`NEOX_BACKEND_GL` / `NEOX_BACKEND_METAL`）。Linux 默认启用 GL（EGL surfaceless + GL 4.1 Core），Metal 关闭。`-DNEOX_BACKEND_GL=OFF` 仍可只编 Soft。
+- 示例：`build/ex01_scene`（Soft）、`build/ex02_gpuscene`（GL）、`build/ex03_mtlscene`（Metal，仅 macOS）、`build/ex04_text`（中英混排；Linux 需上述字体或文泉驿）输出 BMP 到 build 目录。`NEOX_GL_LOG=1` 打印 EGL 路径与渲染器；`NEOX_GL_FORCE_NO_DUAL=1` 强制关掉 dual-source，走 ping-pong 回退。
+- 方案与已知限制见 [docs/linux-port.md](docs/linux-port.md)。
 
 ## 许可证
 

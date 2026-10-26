@@ -13,10 +13,13 @@
  *       立即模式等价性（两后端各自逐位 + 跨后端容差）、CAP 跨后端回放。
  *
  * 无 GL 环境（CI 无显示 / 未启用 NEOX_BACKEND_GL）时打印 SKIP 并返回 0。
+ * 设置 NEOX_REQUIRE_GL（任意非空）时，GL 不可用改为失败，供 ubuntu-gl CI 使用。
  * =========================================================================*/
 #include "neox.h"
 #include "neox_gl.h"
+#if NEOX_ENABLE_METAL
 #include "neox_mtl.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -868,6 +871,7 @@ static void test_device_semantics(void)
     }
     neox_gl_surface_destroy(g_gpu, surf);
 
+#if NEOX_ENABLE_METAL
     if (!g_mtl_ok) return;
     /* ---------------- Metal 设备语义 ---------------- */
     CHECK(neox_device_is_lost(g_mtl) == 0);
@@ -933,6 +937,7 @@ static void test_device_semantics(void)
         CHECK(tmp[3] == 255); /* 清屏色不透明 */
         neox_mtl_surface_destroy(g_mtl, msurf);
     }
+#endif
 }
 
 static void test_blend_matrix(void)
@@ -1132,6 +1137,14 @@ int main(void)
         dd.platform = &gld;
         dd.platform_size = sizeof(gld);
         if (neox_device_create(g_ctx, &dd, &g_gpu) != NEOX_OK) {
+            const char *req = getenv("NEOX_REQUIRE_GL");
+            if (req && req[0]) {
+                fprintf(stderr, "FAIL: GL backend required but unavailable (%s)\n",
+                        neox_get_error_detail(g_ctx));
+                neox_device_destroy(g_soft);
+                neox_context_destroy(g_ctx);
+                return 1;
+            }
             printf("SKIP: GL backend unavailable (%s)\n",
                    neox_get_error_detail(g_ctx));
             neox_device_destroy(g_soft);
@@ -1150,6 +1163,7 @@ int main(void)
     g_gl_api.surface_read =
         (neox_result (*)(void *, uint8_t *)) neox_gl_surface_read_pixels;
 
+#if NEOX_ENABLE_METAL
     /* Metal 设备（真异步后端；失败仅跳过 Metal 比较，不 SKIP 全部） */
     {
         neox_mtl_device_desc mtd;
@@ -1178,6 +1192,7 @@ int main(void)
         (void (*)(neox_device *, void *)) neox_mtl_surface_destroy;
     g_mtl_api.surface_read =
         (neox_result (*)(void *, uint8_t *)) neox_mtl_surface_read_pixels;
+#endif
 
     res_create(g_soft, &g_res_soft);
     res_create(g_gpu, &g_res_gpu);

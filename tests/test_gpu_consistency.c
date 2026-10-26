@@ -68,6 +68,9 @@ typedef struct t_res {
     neox_path clip_oct;    /* 八边形（旋转/场景测试用） */
     neox_texture tex2x2;   /* sRGB 2×2 */
     neox_texture atlas;    /* A8 8×8 伪字形 */
+    neox_texture atlas_sdf;   /* A8 32×32 圆盘 SDF（dr=8） */
+    neox_texture atlas_msdf;  /* RGBA8_LINEAR 32×32 圆盘 MSDF（r=g=b） */
+    neox_texture atlas_cov;   /* A8 32×32 圆盘硬覆盖率（4x 质量对照） */
 } t_res;
 
 static neox_path mk_path(neox_device *dev, const uint8_t *verbs, uint32_t nv,
@@ -172,6 +175,41 @@ static void res_create(neox_device *dev, t_res *r)
     td.pixels = apx;
     td.row_stride = 8;
     if (neox_texture_create(dev, &td, &r->atlas) != NEOX_OK) exit(2);
+
+    /* 32×32 圆盘（半径 10，中心 16,16）：SDF/MSDF（dr=8，§8.2 编码
+     * v = 128 − d·255/8）与硬覆盖率对照。三后端同一程序生成源。 */
+    {
+        uint8_t sdf[32 * 32], cov[32 * 32], msdf[32 * 32 * 4];
+        for (i = 0; i < 32 * 32; i++) {
+            float dxc = (float)(i % 32) + 0.5f - 16.0f;
+            float dyc = (float)(i / 32) + 0.5f - 16.0f;
+            float d = 10.0f - sqrtf(dxc * dxc + dyc * dyc);
+            float v = 128.0f - d * (255.0f / 8.0f);
+            int iv = (int)(v + 0.5f);
+            if (iv < 0) iv = 0;
+            else if (iv > 255) iv = 255;
+            sdf[i] = (uint8_t)iv;
+            cov[i] = d >= 0.0f ? 255 : 0;
+            msdf[i * 4 + 0] = sdf[i];
+            msdf[i * 4 + 1] = sdf[i];
+            msdf[i * 4 + 2] = sdf[i];
+            msdf[i * 4 + 3] = 255;
+        }
+        memset(&td, 0, sizeof(td));
+        td.width = 32; td.height = 32;
+        td.format = NEOX_FORMAT_A8;
+        td.pixels = sdf;
+        td.row_stride = 32;
+        if (neox_texture_create(dev, &td, &r->atlas_sdf) != NEOX_OK) exit(2);
+        td.format = NEOX_FORMAT_RGBA8_LINEAR;
+        td.pixels = msdf;
+        td.row_stride = 32 * 4;
+        if (neox_texture_create(dev, &td, &r->atlas_msdf) != NEOX_OK) exit(2);
+        td.format = NEOX_FORMAT_A8;
+        td.pixels = cov;
+        td.row_stride = 32;
+        if (neox_texture_create(dev, &td, &r->atlas_cov) != NEOX_OK) exit(2);
+    }
 }
 
 static void res_destroy(neox_device *dev, t_res *r)
@@ -186,6 +224,9 @@ static void res_destroy(neox_device *dev, t_res *r)
     neox_path_release(dev, r->clip_oct);
     neox_texture_release(dev, r->tex2x2);
     neox_texture_release(dev, r->atlas);
+    neox_texture_release(dev, r->atlas_sdf);
+    neox_texture_release(dev, r->atlas_msdf);
+    neox_texture_release(dev, r->atlas_cov);
     neox_device_pump(dev);
 }
 
@@ -616,6 +657,145 @@ static void sc_glyphs(neox_device *dev, neox_frame *fr, const t_res *r)
          NEOX_BLEND_SRC_OVER, NULL);
     neox_draw_glyphs(fr, r->atlas, gl_, 2, &pt);
     pop(fr);
+}
+
+/* 距离场场景（§8.2）：程序生成圆盘图集；1x 平移 + 各向异性变换。
+ * 实心内部（场饱和区）跨后端须精确一致，过渡带走 §9 容差（≤32 且单调） */
+static void sc_glyphs_sdf(neox_device *dev, neox_frame *fr, const t_res *r)
+{
+    neox_glyph gl_[2];
+    neox_paint pt;
+    neox_glyph_style st = { NEOX_ATLAS_SDF, 8.0f, 0.0f };
+    (void)dev;
+    gl_[0].x = 8;  gl_[0].y = 6;  gl_[0].sx = 0; gl_[0].sy = 0;
+    gl_[0].sw = 32; gl_[0].sh = 32;
+    gl_[1].x = 46; gl_[1].y = 22; gl_[1].sx = 0; gl_[1].sy = 0;
+    gl_[1].sw = 32; gl_[1].sh = 32;
+    pt.color = (neox_color){ 0.2f, 0.55f, 0.75f, 0.9f };
+    push(fr, (neox_affine){ 1, 0, 0, 1, 6, 4 }, 1.0f, NEOX_BLEND_SRC_OVER, NULL);
+    neox_draw_glyphs_ex(fr, r->atlas_sdf, gl_, 2, &pt, &st);
+    pop(fr);
+    pt.color = (neox_color){ 0.75f, 0.35f, 0.6f, 0.8f };
+    push(fr, (neox_affine){ 1.3f, 0.25f, -0.15f, 1.1f, 30, 40 }, 1.0f,
+         NEOX_BLEND_SRC_OVER, NULL);
+    neox_draw_glyphs_ex(fr, r->atlas_sdf, gl_, 1, &pt, &st);
+    pop(fr);
+}
+
+static void sc_glyphs_msdf(neox_device *dev, neox_frame *fr, const t_res *r)
+{
+    neox_glyph gl_[2];
+    neox_paint pt;
+    neox_glyph_style st = { NEOX_ATLAS_MSDF, 8.0f, 0.0f };
+    (void)dev;
+    gl_[0].x = 8;  gl_[0].y = 6;  gl_[0].sx = 0; gl_[0].sy = 0;
+    gl_[0].sw = 32; gl_[0].sh = 32;
+    gl_[1].x = 46; gl_[1].y = 22; gl_[1].sx = 0; gl_[1].sy = 0;
+    gl_[1].sw = 32; gl_[1].sh = 32;
+    pt.color = (neox_color){ 0.2f, 0.55f, 0.75f, 0.9f };
+    push(fr, (neox_affine){ 1, 0, 0, 1, 6, 4 }, 1.0f, NEOX_BLEND_SRC_OVER, NULL);
+    neox_draw_glyphs_ex(fr, r->atlas_msdf, gl_, 2, &pt, &st);
+    pop(fr);
+    pt.color = (neox_color){ 0.75f, 0.35f, 0.6f, 0.8f };
+    push(fr, (neox_affine){ 1.3f, 0.25f, -0.15f, 1.1f, 30, 40 }, 1.0f,
+         NEOX_BLEND_SRC_OVER, NULL);
+    neox_draw_glyphs_ex(fr, r->atlas_msdf, gl_, 1, &pt, &st);
+    pop(fr);
+}
+
+/* 4x 放大（质量断言用）：SDF 用 softness=16 控制边缘过渡宽度（输出像素），
+ * COVERAGE 对照为同一圆盘的硬覆盖率图集 */
+static void sc_glyphs_sdf_4x(neox_device *dev, neox_frame *fr, const t_res *r)
+{
+    neox_glyph gl;
+    neox_paint pt;
+    neox_glyph_style st = { NEOX_ATLAS_SDF, 8.0f, 16.0f };
+    (void)dev;
+    memset(&gl, 0, sizeof(gl));
+    gl.sw = 32; gl.sh = 32;
+    pt.color = (neox_color){ 0.2f, 0.25f, 0.28f, 1.0f };
+    push(fr, (neox_affine){ 4, 0, 0, 4, 8, 0 }, 1.0f, NEOX_BLEND_SRC_OVER, NULL);
+    neox_draw_glyphs_ex(fr, r->atlas_sdf, &gl, 1, &pt, &st);
+    pop(fr);
+}
+
+static void sc_glyphs_cov_4x(neox_device *dev, neox_frame *fr, const t_res *r)
+{
+    neox_glyph gl;
+    neox_paint pt;
+    (void)dev;
+    memset(&gl, 0, sizeof(gl));
+    gl.sw = 32; gl.sh = 32;
+    pt.color = (neox_color){ 0.2f, 0.25f, 0.28f, 1.0f };
+    push(fr, (neox_affine){ 4, 0, 0, 4, 8, 0 }, 1.0f, NEOX_BLEND_SRC_OVER, NULL);
+    neox_draw_glyphs(fr, r->atlas_cov, &gl, 1, &pt);
+    pop(fr);
+}
+
+/* 过边缘相邻像素最大阶跃（4 邻域、全通道；扫描整幅） */
+static int edge_step_max(const uint8_t *img, uint32_t w, uint32_t h)
+{
+    int m = 0;
+    uint32_t x, y;
+    int c, d;
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            const uint8_t *p = &img[((size_t)y * w + x) * 4];
+            for (d = 0; d < 2; d++) {
+                uint32_t nx = d ? x : x + 1;
+                uint32_t ny = d ? y + 1 : y;
+                const uint8_t *q;
+                if (nx >= w || ny >= h) continue;
+                q = &img[(ny * w + nx) * 4];
+                for (c = 0; c < 4; c++) {
+                    int dd = (int)p[c] - (int)q[c];
+                    if (dd < 0) dd = -dd;
+                    if (dd > m) m = dd;
+                }
+            }
+        }
+    }
+    return m;
+}
+
+/* 质量断言：4x 放大下 SDF 边缘阶跃显著小于 COVERAGE（§8.2 距离场的
+ * 可控过渡 vs 覆盖率图集的固定 texel 量化）。各可用后端分别断言。 */
+static void check_sdf_quality_backend(const gpu_api *api, const t_res *res,
+                                      const char *name)
+{
+    uint8_t *img = (uint8_t *)malloc((size_t)96 * 64 * 4);
+    int cov_s, sdf_s;
+    int rc = 0;
+    if (!img) exit(2);
+    if (api) {
+        if (render_gpu(api, res, sc_glyphs_cov_4x, 96, 64,
+                       &CLEAR_GRAY, img) != 0) rc = 1;
+        cov_s = edge_step_max(img, 96, 64);
+        if (render_gpu(api, res, sc_glyphs_sdf_4x, 96, 64,
+                       &CLEAR_GRAY, img) != 0) rc = 1;
+        sdf_s = edge_step_max(img, 96, 64);
+    } else {
+        if (render_soft(&g_res_soft, sc_glyphs_cov_4x, 96, 64,
+                        &CLEAR_GRAY, img) != 0) rc = 1;
+        cov_s = edge_step_max(img, 96, 64);
+        if (render_soft(&g_res_soft, sc_glyphs_sdf_4x, 96, 64,
+                        &CLEAR_GRAY, img) != 0) rc = 1;
+        sdf_s = edge_step_max(img, 96, 64);
+    }
+    printf("  [sdf-quality %-4s] coverage_step=%d sdf_step=%d (softness 16 @4x)\n",
+           name, cov_s, sdf_s);
+    CHECK(rc == 0);
+    CHECK(cov_s >= 32);        /* 对照组非平凡（硬边经 4x 双线性实测 49） */
+    CHECK(sdf_s <= 40);        /* 255·1.5/16 + 量化余量（实测 17） */
+    CHECK(sdf_s < cov_s / 2);  /* 显著小于：严格一半以下 */
+    free(img);
+}
+
+static void check_sdf_quality(void)
+{
+    check_sdf_quality_backend(NULL, &g_res_soft, "soft");
+    if (g_gpu_ok) check_sdf_quality_backend(&g_gl_api, &g_res_gpu, "gl");
+    if (g_mtl_ok) check_sdf_quality_backend(&g_mtl_api, &g_res_mtl, "mtl");
 }
 
 /* 综合场景：组 + 八边形裁剪 + 旋转 + 混合 + 纹理 + 字形 */
@@ -1209,6 +1389,11 @@ int main(void)
     check_pair("tex-linear", sc_tex_linear, 96, 64, &CLEAR_GRAY);
     check_pair("tex-mirror", sc_tex_mirror, 96, 64, &CLEAR_GRAY);
     check_pair("glyphs", sc_glyphs, 96, 64, &CLEAR_GRAY);
+    check_pair("glyphs-sdf", sc_glyphs_sdf, 96, 64, &CLEAR_GRAY);
+    check_pair("glyphs-msdf", sc_glyphs_msdf, 96, 64, &CLEAR_GRAY);
+    check_pair("glyphs-sdf-4x", sc_glyphs_sdf_4x, 96, 64, &CLEAR_GRAY);
+    check_pair("glyphs-cov-4x", sc_glyphs_cov_4x, 96, 64, &CLEAR_GRAY);
+    check_sdf_quality();
     check_pair("blend-clear-partial", sc_clear_partial, 96, 64, &CLEAR_GRAY);
     check_pair("deep-nesting", sc_deep_nesting, 96, 64, &CLEAR_GRAY);
     check_pair("blend-dst-partial", sc_dst_partial, 96, 64, &CLEAR_GRAY);

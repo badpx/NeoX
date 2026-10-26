@@ -1,9 +1,11 @@
 /* ===========================================================================
  * neox_text.h — NeoX-Text 模块 v0：字体加载、简化排版、动态 A8 图集
  *
- * 职责划分（design-v0.2.md §8）：核心只接受已定位字形（neox_glyph + A8
- * 图集纹理）；本模块负责字体解析、简化排版（LTR、贪心断行、无复杂整形）、
- * 动态图集缓存与绘制桥。MSDF/SDF 字形表示属下一迭代（需要核心扩展）。
+ * 职责划分（design-v0.2.md §8）：核心只接受已定位字形（neox_glyph + 图集
+ * 纹理，三模式见 neox_atlas_mode）；本模块负责字体解析、简化排版（LTR、
+ * 贪心断行、无复杂整形）、动态图集缓存与绘制桥。SDF/MSDF 图集经
+ * nx_atlas_create_ex 创建（stb 后端：SDF 用 stbtt_GetGlyphSDF，MSDF 为
+ * 简化版自实现——真距离、拐角 >60° 边着色，尖角内侧可略圆，ADR 0006）。
  *
  * 范围边界（v0 明确不做）：
  *   - 复杂文字整形（阿拉伯语形变、印地语等）；拉丁连字仅预留开关位
@@ -72,6 +74,17 @@ typedef struct nx_font_backend {
                                    float size_px, uint8_t **out_bmp,
                                    int32_t *out_w, int32_t *out_h,
                                    float *out_bear_x, float *out_bear_y);
+    /* 可选：SDF/MSDF 距离场光栅化。NULL → 该字体的 SDF/MSDF 图集返回
+     * NEOX_ERROR_UNSUPPORTED（COVERAGE 不受影响）。编码契约（§8.2）：
+     * 距离 d（图集像素，形内为正）→ v = 128 − d·255/dist_range，截断
+     * [0,255]（±0.5 LSB 常量偏移，容差内）；SDF 输出单通道 w×h，
+     * MSDF 输出 RGBA w×h×4（alpha=255）。bear_x/bear_y 同
+     * glyph_rasterize（位图左上角相对基线原点；位图已含 dist_range 边距） */
+    neox_result (*glyph_rasterize_sdf)(void *user, uint32_t glyph_index,
+                                       float size_px, neox_atlas_mode mode,
+                                       float dist_range, uint8_t **out_bmp,
+                                       int32_t *out_w, int32_t *out_h,
+                                       float *out_bear_x, float *out_bear_y);
     void (*glyph_free_bitmap)(void *user, uint8_t *bmp);
     void (*destroy)(void *user);
     float ascent, descent, line_gap; /* size_px = 1 时的归一化度量 */
@@ -122,19 +135,31 @@ void nx_layout_destroy(nx_layout *layout);
 neox_result nx_text_measure(const nx_layout *layout, float out_bbox[4]);
 
 /* ------------------------------------------------------------------ 动态图集
- * 一张 A8 neox_texture（创建时建立，可经 nx_atlas_texture 取得用于其他
+ * 一张图集 neox_texture（创建时建立，可经 nx_atlas_texture 取得用于其他
  * 核心绘制）。shelf/row 装箱；缓存键 (font, glyph, size 量化 0.25px)。
  * 未命中即光栅化写入并记脏矩形，nx_atlas_flush 经 neox_texture_update
  * 增量上传。容量满返回 NEOX_ERROR_OUT_OF_MEMORY（v0 不做 LRU 驱逐，
- * 结构保留）。 */
+ * 结构保留）。
+ *
+ * 图集模式创建时固定（COVERAGE/SDF → A8 纹理，MSDF → RGBA8_LINEAR）；
+ * 缓存天然按图集隔离，即同名字形在不同模式图集中各自光栅化。SDF/MSDF
+ * 位图已含 dist_range 边距（编码见 nx_font_backend.glyph_rasterize_sdf）。 */
 
 typedef struct nx_atlas nx_atlas;
 typedef struct nx_atlas_rect { uint16_t x, y, w, h; } nx_atlas_rect;
 
 neox_result nx_atlas_create(nx_text_context *tctx, neox_device *dev,
                             uint32_t width, uint32_t height, nx_atlas **out);
+/* dist_range_px <= 0 取默认 4。MSDF 需要字体后端支持
+ * glyph_rasterize_sdf，否则 nx_atlas_glyph 返回 NEOX_ERROR_UNSUPPORTED */
+neox_result nx_atlas_create_ex(nx_text_context *tctx, neox_device *dev,
+                               uint32_t width, uint32_t height,
+                               neox_atlas_mode mode, float dist_range_px,
+                               nx_atlas **out);
 void        nx_atlas_destroy(nx_atlas *atlas);
 neox_texture nx_atlas_texture(const nx_atlas *atlas);
+neox_atlas_mode nx_atlas_get_mode(const nx_atlas *atlas);
+float       nx_atlas_get_dist_range(const nx_atlas *atlas);
 
 /* 取字形图集矩形（未命中即光栅化装箱；容量满返回 OUT_OF_MEMORY） */
 neox_result nx_atlas_glyph(nx_atlas *atlas, nx_font *font, uint32_t glyph_index,
@@ -148,11 +173,16 @@ void nx_atlas_stats(const nx_atlas *atlas, uint64_t *out_hits, uint64_t *out_mis
 
 /* ------------------------------------------------------------------ 绘制桥 */
 
-/* 排版结果 → neox_glyph 数组 → neox_draw_glyphs。
+/* 排版结果 → neox_glyph 数组 → neox_draw_glyphs(_ex)。
  * 图集自动 flush；缺失字形（未映射 codepoint → glyph 0）由字体后端渲染
- * .notdef（stb 字形 0 依字体而定，通常为空或方框），不跳过。 */
+ * .notdef（stb 字形 0 依字体而定，通常为空或方框），不跳过。
+ * softness 为 §8.2 边缘过渡宽度（输出像素，0 = 默认 1）；图集模式与
+ * dist_range 由图集自身携带（nx_atlas_create_ex），两处恒成对。 */
 neox_result nx_text_draw(neox_frame *frame, nx_atlas *atlas,
                          const nx_layout *layout, const neox_paint *paint);
+neox_result nx_text_draw_ex(neox_frame *frame, nx_atlas *atlas,
+                            const nx_layout *layout, const neox_paint *paint,
+                            float softness);
 
 #ifdef __cplusplus
 } /* extern "C" */

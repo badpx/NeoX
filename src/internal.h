@@ -197,6 +197,10 @@ typedef struct nx_cmd {
     float       tex_opacity;
     neox_glyph *glyphs;     /* 创建时深拷贝 */
     uint32_t    glyph_count;
+    /* 字形图集语义（neox_draw_glyphs_ex；0/0/0 = COVERAGE 默认，规范 §8.2） */
+    neox_atlas_mode atlas_mode;
+    float           dist_range;   /* 距离场编码范围（图集像素） */
+    float           softness;     /* 边缘过渡宽度（输出像素，0=默认 1） */
 } nx_cmd;
 
 /* ------------------------------------------------------------------ 帧（立即模式） */
@@ -470,6 +474,44 @@ neox_result nx_flatten_path(neox_context *ctx, const nx_path_slot *path,
 neox_result nx_rasterize_path(neox_context *ctx, const nx_path_slot *path,
                               neox_affine ctm, uint32_t w, uint32_t h,
                               float *mask);
+
+/* ------------------------------------------------------------------ 距离场重建（规范 §8.2，三后端共用）
+ *
+ * 编码：d = (0.5 − v) · dist_range（v ∈ [0,1] 为归一化采样值，正 = 字形内）。
+ * 重建：cov = smoothstep(+w/2, −w/2, d·s)。GLSL 的 smoothstep 要求
+ * edge0 < edge1，规范式为反向书写；此处用等价正向实现：
+ *   t = clamp(d·s / w + 0.5, 0, 1)；cov = t·t·(3 − 2t)
+ * （d·s ≤ −w/2 → 0，≥ +w/2 → 1，三次 Hermite 过渡，与规范一致）。 */
+static inline float nx_sdf_reconstruct(float v_norm, float dist_range,
+                                       float softness, float s)
+{
+    float w = softness > 0.0f ? softness : 1.0f;
+    float d = (0.5f - v_norm) * dist_range * s;
+    float t = d / w + 0.5f;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return t * t * (3.0f - 2.0f * t);
+}
+static inline float nx_median3(float a, float b, float c)
+{
+    return fmaxf(fminf(a, b), fminf(fmaxf(a, b), c));
+}
+
+/* 局部→输出缩放因子 s（规范 §8.2：线性部分奇异值平均）。
+ * 2×2 矩阵的奇异值有闭式解；各向同性时退化为公共缩放。 */
+static inline float nx_glyph_scale_factor(neox_affine m)
+{
+    float aa = m.a * m.a + m.b * m.b;   /* 第一列模方 */
+    float bb = m.c * m.c + m.d * m.d;   /* 第二列模方 */
+    float cc = m.a * m.c + m.b * m.d;   /* 列间相关 */
+    float tr = aa + bb;
+    float df = aa - bb;
+    float disc = sqrtf(df * df + 4.0f * cc * cc);
+    float s0 = sqrtf((tr + disc) * 0.5f);
+    float s1 = sqrtf((tr - disc) * 0.5f);
+    if (s0 <= 0.0f) return 0.0f;        /* 退化变换：无输出（§3） */
+    return (s0 + s1) * 0.5f;
+}
 
 /* ------------------------------------------------------------------ 句柄解析（core.c 实现） */
 

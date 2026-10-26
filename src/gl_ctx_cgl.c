@@ -9,6 +9,9 @@
 
 #include <OpenGL/CGLCurrent.h>
 #include <OpenGL/CGLTypes.h>
+/* GLint 等标量类型；gltypes.h 仅 typedef，不引入 gl.h 的函数声明，
+ * 与"避开 gl.h"的既定策略兼容（gl3.h 亦经此头取 GLint）。 */
+#include <OpenGL/gltypes.h>
 
 #include <dlfcn.h>
 #include <stdlib.h>

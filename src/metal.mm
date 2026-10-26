@@ -160,9 +160,38 @@ static const char *NX_MSL_SRC =
     "    return o;\n"
     "}\n"
     "\n"
-    "struct NxUGlyph { float4 a, b, c, d, e, f, g; };\n"
+    "float nx_median3(float a, float b, float c) {\n"
+    "    return max(min(a, b), min(max(a, b), c));\n"
+    "}\n"
+    /* f = {mode, dist_range, softness, sdf_scale}；重建（§8.2，与 soft.c/GLSL 同式） */
+    "float nx_recon_cov(float v, float4 f) {\n"
+    "    float w = f.z > 0.0f ? f.z : 1.0f;\n"
+    "    float t = clamp((0.5f - v) * f.y * f.w / w + 0.5f, 0.0f, 1.0f);\n"
+    "    return t * t * (3.0f - 2.0f * t);\n"
+    "}\n"
+    /* 双线性采样 + 三模式重建（uv 为图集像素坐标；§8.2） */
+    "float nx_glyph_cov(float2 uv, float4 f, texture2d<float> atlas) {\n"
+    "    float x = uv.x - 0.5f, y = uv.y - 0.5f;\n"
+    "    float fx = x - floor(x), fy = y - floor(y);\n"
+    "    uint2 sz = uint2(atlas.get_width(), atlas.get_height());\n"
+    "    int i0 = clamp(int(floor(x)), 0, int(sz.x) - 1);\n"
+    "    int i1 = clamp(int(floor(x)) + 1, 0, int(sz.x) - 1);\n"
+    "    int j0 = clamp(int(floor(y)), 0, int(sz.y) - 1);\n"
+    "    int j1 = clamp(int(floor(y)) + 1, 0, int(sz.y) - 1);\n"
+    "    float4 p00 = atlas.read(uint2(i0, j0));\n"
+    "    float4 p10 = atlas.read(uint2(i1, j0));\n"
+    "    float4 p01 = atlas.read(uint2(i0, j1));\n"
+    "    float4 p11 = atlas.read(uint2(i1, j1));\n"
+    "    float4 pm = p00 * ((1.0f - fx) * (1.0f - fy)) + p10 * (fx * (1.0f - fy))\n"
+    "              + p01 * ((1.0f - fx) * fy) + p11 * (fx * fy);\n"
+    "    if (int(f.x) == 1) return nx_recon_cov(pm.a, f);\n"
+    "    else if (int(f.x) == 2) return nx_recon_cov(nx_median3(pm.r, pm.g, pm.b), f);\n"
+    "    else return pm.a;\n"
+    "}\n"
+    "\n"
+    "struct NxUGlyph { float4 a, b, c, d, e, f, g, h; };\n"
     "/* a = {ss, mode, 0, 0}；b = paint；c = glyph.xywh；d = atlas_rect.xywh\n"
-    " * e/f/g = u_inv 三列 */\n"
+    " * e/f/g = u_inv 三列；h = {atlas_mode, dist_range, softness, sdf_scale} */\n"
     "\n"
     "float4 nx_glyph_core(NxVsOut in, constant NxUGlyph &u, texture2d<float> atlas,\n"
     "                     thread float &o1a) {\n"
@@ -170,19 +199,8 @@ static const char *NX_MSL_SRC =
     "    float3 l = u.e.xyz * devc.x + u.f.xyz * devc.y + u.g.xyz;\n"
     "    if (l.x < u.c.x || l.x > u.c.x + u.c.z ||\n"
     "        l.y < u.c.y || l.y > u.c.y + u.c.w) discard_fragment();\n"
-    "    float uu = u.d.x + (l.x - u.c.x);\n"
-    "    float vv = u.d.y + (l.y - u.c.y);\n"
-    "    float x = uu - 0.5f, y = vv - 0.5f;\n"
-    "    float fx = x - floor(x), fy = y - floor(y);\n"
-    "    uint2 sz = uint2(atlas.get_width(), atlas.get_height());\n"
-    "    int i0 = clamp(int(floor(x)), 0, int(sz.x) - 1);\n"
-    "    int i1 = clamp(int(floor(x)) + 1, 0, int(sz.x) - 1);\n"
-    "    int j0 = clamp(int(floor(y)), 0, int(sz.y) - 1);\n"
-    "    int j1 = clamp(int(floor(y)) + 1, 0, int(sz.y) - 1);\n"
-    "    float cov = atlas.read(uint2(i0, j0)).a * ((1.0f - fx) * (1.0f - fy))\n"
-    "              + atlas.read(uint2(i1, j0)).a * (fx * (1.0f - fy))\n"
-    "              + atlas.read(uint2(i0, j1)).a * ((1.0f - fx) * fy)\n"
-    "              + atlas.read(uint2(i1, j1)).a * (fx * fy);\n"
+    "    float cov = nx_glyph_cov(float2(u.d.x + (l.x - u.c.x),\n"
+    "                                    u.d.y + (l.y - u.c.y)), u.h, atlas);\n"
     "    int m = int(u.a.y);\n"
     "    float pa = u.b.a;\n"
     "    o1a = NX_O1A(m, cov, pa);\n"
@@ -253,17 +271,7 @@ static const char *NX_MSL_SRC =
     "        l.y < u.c.y || l.y > u.c.y + u.c.w) discard_fragment();\n"
     "    float uu = u.d.x + (l.x - u.c.x);\n"
     "    float vv = u.d.y + (l.y - u.c.y);\n"
-    "    float x = uu - 0.5f, y = vv - 0.5f;\n"
-    "    float fx = x - floor(x), fy = y - floor(y);\n"
-    "    uint2 sz = uint2(atlas.get_width(), atlas.get_height());\n"
-    "    int i0 = clamp(int(floor(x)), 0, int(sz.x) - 1);\n"
-    "    int i1 = clamp(int(floor(x)) + 1, 0, int(sz.x) - 1);\n"
-    "    int j0 = clamp(int(floor(y)), 0, int(sz.y) - 1);\n"
-    "    int j1 = clamp(int(floor(y)) + 1, 0, int(sz.y) - 1);\n"
-    "    float cov = atlas.read(uint2(i0, j0)).a * ((1.0f - fx) * (1.0f - fy))\n"
-    "              + atlas.read(uint2(i1, j0)).a * (fx * (1.0f - fy))\n"
-    "              + atlas.read(uint2(i0, j1)).a * ((1.0f - fx) * fy)\n"
-    "              + atlas.read(uint2(i1, j1)).a * (fx * fy);\n"
+    "    float cov = nx_glyph_cov(float2(uu, vv), u.h, atlas);\n"
     "    uint2 dp = uint2(in.p.xy / u.a.x);\n"
     "    float4 dst = layer.read(dp);\n"
     "    if (cov <= 0.0f) return dst;\n"
@@ -283,17 +291,7 @@ static const char *NX_MSL_SRC =
     "        l.y < u.c.y || l.y > u.c.y + u.c.w) discard_fragment();\n"
     "    float uu = u.d.x + (l.x - u.c.x);\n"
     "    float vv = u.d.y + (l.y - u.c.y);\n"
-    "    float x = uu - 0.5f, y = vv - 0.5f;\n"
-    "    float fx = x - floor(x), fy = y - floor(y);\n"
-    "    uint2 sz = uint2(atlas.get_width(), atlas.get_height());\n"
-    "    int i0 = clamp(int(floor(x)), 0, int(sz.x) - 1);\n"
-    "    int i1 = clamp(int(floor(x)) + 1, 0, int(sz.x) - 1);\n"
-    "    int j0 = clamp(int(floor(y)), 0, int(sz.y) - 1);\n"
-    "    int j1 = clamp(int(floor(y)) + 1, 0, int(sz.y) - 1);\n"
-    "    float cov = atlas.read(uint2(i0, j0)).a * ((1.0f - fx) * (1.0f - fy))\n"
-    "              + atlas.read(uint2(i1, j0)).a * (fx * (1.0f - fy))\n"
-    "              + atlas.read(uint2(i0, j1)).a * ((1.0f - fx) * fy)\n"
-    "              + atlas.read(uint2(i1, j1)).a * (fx * fy);\n"
+    "    float cov = nx_glyph_cov(float2(uu, vv), u.h, atlas);\n"
     "    uint2 dp = uint2(in.p.xy / u.a.x);\n"
     "    float4 dst = layer.read(dp);\n"
     "    if (cov <= 0.0f) return dst;\n"
@@ -1254,7 +1252,8 @@ static neox_result mtl_draw_glyphs(neox_device *dev, nx_mtl_dev *g, nx_mtl_enc *
     for (gi = 0; gi < cmd->glyph_count; gi++) {
         const neox_glyph *gl2 = &cmd->glyphs[gi];
         float gw = (float)gl2->sw, gh = (float)gl2->sh;
-        float xc[4], yc[4], q[12], ix[4], iy[4], ug[28], bx0, by0, bx1, by1;
+        float xc[4], yc[4], q[12], ix[4], iy[4], ug[32], bx0, by0, bx1, by1;
+        float s_fac = 1.0f;
         int k;
         id<MTLRenderCommandEncoder> enc;
         NSUInteger off;
@@ -1282,6 +1281,14 @@ static neox_result mtl_draw_glyphs(neox_device *dev, nx_mtl_dev *g, nx_mtl_enc *
         ug[16] = inv.a; ug[17] = inv.b; ug[18] = 0; ug[19] = 0;
         ug[20] = inv.c; ug[21] = inv.d; ug[22] = 0; ug[23] = 0;
         ug[24] = inv.tx; ug[25] = inv.ty; ug[26] = 1; ug[27] = 0;
+        /* 图集语义（§8.2）：s 因子与 soft.c/gl.c 同式（线性部分奇异值平均） */
+        if (cmd->atlas_mode == NEOX_ATLAS_SDF ||
+            cmd->atlas_mode == NEOX_ATLAS_MSDF)
+            s_fac = nx_glyph_scale_factor(ctm);
+        ug[28] = (float)cmd->atlas_mode;
+        ug[29] = cmd->dist_range;
+        ug[30] = cmd->softness;
+        ug[31] = s_fac;
         if (blend == NEOX_BLEND_PLUS) {
             r = mtl_draw_pingpong(dev->ctx, g, e, layer, g->ps_plusglyph,
                                   g->texs[idx].tex, layer->tex, nil,

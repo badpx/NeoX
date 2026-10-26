@@ -694,7 +694,7 @@ static neox_result emit_tex(neox_frame *fr, int32_t tex_idx, uint64_t tex_id,
 /* glyphs 深拷贝进命令（借用语义 → 帧拥有快照） */
 static neox_result emit_glyphs(neox_frame *fr, int32_t atlas_idx, uint64_t atlas_id,
                                const neox_glyph *glyphs, uint32_t count,
-                               neox_color color)
+                               neox_color color, const neox_glyph_style *style)
 {
     neox_device *dev = fr->dev;
     neox_context *ctx = dev->ctx;
@@ -710,6 +710,12 @@ static neox_result emit_glyphs(neox_frame *fr, int32_t atlas_idx, uint64_t atlas
     c.glyphs = copy;
     c.glyph_count = count;
     c.color = color;
+    if (style) {   /* NULL = COVERAGE 默认 */
+        c.atlas_mode = style->atlas_mode;
+        /* dist_range 0 = 契约缺省 4；命令流存生效值，三后端与 CAP 一致 */
+        c.dist_range = style->dist_range_px > 0.0f ? style->dist_range_px : 4.0f;
+        c.softness = style->softness;
+    }
     {
         neox_result r = frame_append_cmd(fr, &c);
         if (r != NEOX_OK) {
@@ -893,9 +899,19 @@ neox_result neox_draw_glyphs(neox_frame *frame, neox_texture atlas,
                              const neox_glyph *glyphs, uint32_t count,
                              const neox_paint *paint)
 {
+    /* COVERAGE 默认转发（行为与 v0 前完全一致） */
+    return neox_draw_glyphs_ex(frame, atlas, glyphs, count, paint, NULL);
+}
+
+neox_result neox_draw_glyphs_ex(neox_frame *frame, neox_texture atlas,
+                                const neox_glyph *glyphs, uint32_t count,
+                                const neox_paint *paint,
+                                const neox_glyph_style *style)
+{
     neox_context *ctx;
     uint32_t idx;
     neox_result r;
+    neox_atlas_mode mode = NEOX_ATLAS_COVERAGE;
     if (!frame) return NEOX_ERROR_INVALID_ARGUMENT;
     ctx = frame->dev->ctx;
     if (!paint || (!glyphs && count))
@@ -904,8 +920,35 @@ neox_result neox_draw_glyphs(neox_frame *frame, neox_texture atlas,
         NX_ERR(ctx, "paint color contains NaN/Inf", NEOX_ERROR_INVALID_ARGUMENT);
     r = nx_resolve(frame->dev, atlas.id, NX_TYPE_TEXTURE, &idx);
     if (r != NEOX_OK) return r;
+    if (style) {
+        const nx_tex_slot *ts;
+        if (style->atlas_mode > NEOX_ATLAS_MSDF)
+            NX_ERR(ctx, "invalid atlas mode", NEOX_ERROR_INVALID_ARGUMENT);
+        if (nx_float_bad(style->dist_range_px) || style->dist_range_px < 0.0f)
+            NX_ERR(ctx, "dist_range out of range or NaN",
+                   NEOX_ERROR_INVALID_ARGUMENT);
+        if (nx_float_bad(style->softness) || style->softness < 0.0f)
+            NX_ERR(ctx, "softness out of range or NaN",
+                   NEOX_ERROR_INVALID_ARGUMENT);
+        /* 格式匹配契约（§8.2）：COVERAGE/SDF → A8；MSDF → RGBA8_LINEAR */
+        ts = &((const nx_tex_slot *)frame->dev->textures.slots)[idx];
+        if (style->atlas_mode == NEOX_ATLAS_MSDF) {
+            if (ts->format != NEOX_FORMAT_RGBA8_LINEAR)
+                NX_ERR(ctx, "MSDF atlas must be RGBA8_LINEAR",
+                       NEOX_ERROR_INVALID_ARGUMENT);
+        } else if (ts->format != NEOX_FORMAT_A8) {
+            NX_ERR(ctx, "COVERAGE/SDF atlas must be A8",
+                   NEOX_ERROR_INVALID_ARGUMENT);
+        }
+        mode = style->atlas_mode;
+    } else {
+        /* style == NULL 的 COVERAGE 默认不强制格式检查（v0 前行为零变化） */
+        mode = NEOX_ATLAS_COVERAGE;
+    }
+    (void)mode;   /* 模式随 style 进入命令流；execute 期重建 */
     if (count == 0) return NEOX_OK;
-    return emit_glyphs(frame, (int32_t)idx, atlas.id, glyphs, count, paint->color);
+    return emit_glyphs(frame, (int32_t)idx, atlas.id, glyphs, count,
+                       paint->color, style);
 }
 
 /* ------------------------------------------------------------------ submission 组装与执行 */
@@ -1140,7 +1183,13 @@ static neox_result ex_draw_glyphs(neox_device *dev, nx_sub_slot *sub,
     neox_affine inv;
     float base[4];
     uint32_t g;
+    float s_fac = 0.0f;
+    if (cmd->atlas_mode == NEOX_ATLAS_SDF || cmd->atlas_mode == NEOX_ATLAS_MSDF)
+        s_fac = nx_glyph_scale_factor(top->ctm);  /* §8.2：奇异值平均 */
     if (!nx_affine_invert(top->ctm, &inv)) return NEOX_OK; /* §3 退化变换 */
+    if ((cmd->atlas_mode == NEOX_ATLAS_SDF || cmd->atlas_mode == NEOX_ATLAS_MSDF) &&
+        s_fac <= 0.0f)
+        return NEOX_OK;
     nx_paint_to_premul_linear(cmd->color, base);
     for (g = 0; g < cmd->glyph_count; g++) {
         const neox_glyph *gl = &cmd->glyphs[g];
@@ -1174,8 +1223,19 @@ static neox_result ex_draw_glyphs(neox_device *dev, nx_sub_slot *sub,
                 au = (float)gl->sx + (lx - gl->x);
                 av = (float)gl->sy + (ly - gl->y);
                 sample_linear(at, au, av, smp);
-                cov = smp[3];
-                if (cov == 0.0f) continue;
+                if (cmd->atlas_mode == NEOX_ATLAS_SDF) {
+                    /* A8 距离场：槽内 .a = v/255，§8.2 重建 */
+                    cov = nx_sdf_reconstruct(smp[3], cmd->dist_range,
+                                             cmd->softness, s_fac);
+                } else if (cmd->atlas_mode == NEOX_ATLAS_MSDF) {
+                    /* RGBA8_LINEAR 三通道：median 重建（§8.2 中位数规则） */
+                    cov = nx_sdf_reconstruct(nx_median3(smp[0], smp[1], smp[2]),
+                                             cmd->dist_range, cmd->softness,
+                                             s_fac);
+                } else {
+                    cov = smp[3];
+                }
+                if (cov <= 0.0f) continue;
                 nx_blend_pixel_cov(&layer[((size_t)py * sub->width + (size_t)px) * 4],
                                    base, top->blend, cov);
             }
@@ -1982,7 +2042,7 @@ static neox_result scene_emit(neox_frame *fr, uint32_t idx, neox_affine parent_c
         r = nx_resolve(dev, n->u.glyphs.atlas_id, NX_TYPE_TEXTURE, &t);
         if (r != NEOX_OK) return r;
         r = emit_glyphs(fr, (int32_t)t, n->u.glyphs.atlas_id, n->u.glyphs.glyphs,
-                        n->u.glyphs.count, n->u.glyphs.paint.color);
+                        n->u.glyphs.count, n->u.glyphs.paint.color, NULL);
         break;
     }
     default:
@@ -2032,7 +2092,7 @@ neox_result neox_scene_render(neox_frame *frame, neox_scene scene, neox_node roo
  *             GLYPHS: res cap_id u32 | color 4×f32 | count u32 | glyphs (x,y f32; sx,sy,sw,sh u16)
  * 多字节整数为原生小端（第一阶段目标平台约定；CAP 稳定格式属 Phase 2）。
  * CAP 内 ID → 本地句柄的映射在 replay 时经会话内映射表重建（neox.h 契约）。 */
-#define NX_CAP_VERSION 1u
+#define NX_CAP_VERSION 2u
 #define NX_CAP_NO_RES  0xFFFFFFFFu
 
 typedef struct nx_cap_res {
@@ -2281,7 +2341,10 @@ neox_result neox_capture_end(neox_capture *cap, uint8_t **out_data, size_t *out_
                 cap_put_f32(ctx, &b, c->color.g) != NEOX_OK ||
                 cap_put_f32(ctx, &b, c->color.b) != NEOX_OK ||
                 cap_put_f32(ctx, &b, c->color.a) != NEOX_OK ||
-                cap_put_u32(ctx, &b, c->glyph_count) != NEOX_OK)
+                cap_put_u32(ctx, &b, c->glyph_count) != NEOX_OK ||
+                cap_put_u32(ctx, &b, (uint32_t)c->atlas_mode) != NEOX_OK ||
+                cap_put_f32(ctx, &b, c->dist_range) != NEOX_OK ||
+                cap_put_f32(ctx, &b, c->softness) != NEOX_OK)
                 goto oom;
             for (j = 0; j < c->glyph_count; j++) {
                 const neox_glyph *g = &c->glyphs[j];
@@ -2378,7 +2441,8 @@ neox_result neox_capture_replay(neox_frame *frame, const uint8_t *data, size_t s
     r.p = data; r.len = size; r.ctx = ctx;
     if (!rd_bytes(&r, magic, 4) || memcmp(magic, "NXCA", 4) != 0)
         NX_ERR(ctx, "not a CAP buffer", NEOX_ERROR_UNSUPPORTED);
-    if (!rd_u32(&r, &version) || version != NX_CAP_VERSION)
+    if (!rd_u32(&r, &version) ||
+        (version != NX_CAP_VERSION && version != NX_CAP_VERSION - 1u))
         NX_ERR(ctx, "CAP version mismatch", NEOX_ERROR_UNSUPPORTED);
     if (!rd_u32(&r, &res_count) || !rd_u32(&r, &cmd_count))
         NX_ERR(ctx, "CAP header truncated", NEOX_ERROR_UNSUPPORTED);
@@ -2525,9 +2589,18 @@ neox_result neox_capture_replay(neox_frame *frame, const uint8_t *data, size_t s
             neox_color col;
             neox_glyph *gl;
             int32_t idx = -1;
+            neox_glyph_style gst;
+            memset(&gst, 0, sizeof(gst));   /* v1：COVERAGE 默认 */
             if (!rd_u32(&r, &rc) || !rd_f32(&r, &col.r) || !rd_f32(&r, &col.g) ||
                 !rd_f32(&r, &col.b) || !rd_f32(&r, &col.a) || !rd_u32(&r, &count))
                 goto truncated;
+            if (version >= 2u) {
+                uint32_t amode;
+                if (!rd_u32(&r, &amode) || !rd_f32(&r, &gst.dist_range_px) ||
+                    !rd_f32(&r, &gst.softness))
+                    goto truncated;
+                gst.atlas_mode = (neox_atlas_mode)amode;
+            }
             gl = (neox_glyph *)nx_alloc(ctx,
                      ((size_t)count * sizeof(neox_glyph)) ? (size_t)count * sizeof(neox_glyph) : 16, 16);
             if (!gl) { result = NEOX_ERROR_OUT_OF_MEMORY; goto done; }
@@ -2545,7 +2618,14 @@ neox_result neox_capture_replay(neox_frame *frame, const uint8_t *data, size_t s
                 nx_free(ctx, gl, (size_t)count * sizeof(neox_glyph), 16);
                 goto missing;
             }
-            result = emit_glyphs(frame, idx, 0, gl, count, col);
+            {
+                const neox_glyph_style *gp = NULL;
+                if (version >= 2u &&
+                    (gst.atlas_mode != NEOX_ATLAS_COVERAGE ||
+                     gst.dist_range_px != 0.0f || gst.softness != 0.0f))
+                    gp = &gst;
+                result = emit_glyphs(frame, idx, 0, gl, count, col, gp);
+            }
             nx_free(ctx, gl, (size_t)count * sizeof(neox_glyph), 16);
             if (result != NEOX_OK) goto done;
             break;

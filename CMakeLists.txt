@@ -163,7 +163,17 @@ if(NEOX_WITH_TEXT)
   set_tests_properties(ex04_smoke PROPERTIES
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
-  list(APPEND NEOX_TARGETS neox_text test_text ex04_text)
+  # SDF/MSDF 距离场文字演示（Soft 单后端；三模式分区 + 2.5x 缩放演示）
+  add_executable(ex06_sdftext examples/ex06_sdftext.c)
+  target_link_libraries(ex06_sdftext PRIVATE neox_text m)
+  target_compile_options(ex06_sdftext PRIVATE -Wall -Wextra)
+  set_target_properties(ex06_sdftext PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+  add_test(NAME ex06_smoke COMMAND ex06_sdftext)
+  set_tests_properties(ex06_smoke PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+  list(APPEND NEOX_TARGETS neox_text test_text ex04_text ex06_sdftext)
 endif()
 
 if(NEOX_PRESENT)
@@ -180,7 +190,7 @@ if(NEOX_PRESENT)
   set_target_properties(ex05_window PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
   add_test(NAME ex05_smoke COMMAND ex05_window)
-  set_tests_properties(ex05_smoke PROPERTIES
+  set_tests_properties(ex06_smoke PROPERTIES
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     ENVIRONMENT "NEOX_PRESENT_FRAMES=2")
 

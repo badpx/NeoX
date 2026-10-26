@@ -53,6 +53,8 @@
  *     仅当结果恰落在 sRGB 量化 ties 边界时表现为 1 LSB（测试场景未发现）。
  * =========================================================================*/
 #include "internal.h"
+
+#include <stdio.h>
 #include "neox_gl.h"
 #include "gl_api.h"
 
@@ -169,6 +171,24 @@ static const char *NX_GLSL_FS_TEX =
     "#endif\n"
     "}\n";
 
+/* 距离场重建（§8.2；u_scale 为 CPU 计算的奇异值平均，与 soft.c 同式）。
+ * 宏而非变量：需参与相邻字符串字面量拼接。 */
+#define NX_GLSL_SDF_COMMON \
+    "uniform int u_atlas_mode;\n"       /* 0=COVERAGE 1=SDF 2=MSDF */ \
+    "uniform float u_dist_range;\n" \
+    "uniform float u_softness;\n" \
+    "uniform float u_sdf_scale;\n" \
+    "float nx_recon_cov(float v)\n" \
+    "{\n" \
+    "    float w = u_softness > 0.0 ? u_softness : 1.0;\n" \
+    "    float t = clamp((0.5 - v) * u_dist_range * u_sdf_scale / w + 0.5, 0.0, 1.0);\n" \
+    "    return t * t * (3.0 - 2.0 * t);\n" \
+    "}\n" \
+    "float nx_median3(float a, float b, float c)\n" \
+    "{\n" \
+    "    return max(min(a, b), min(max(a, b), c));\n" \
+    "}\n"
+
 static const char *NX_GLSL_FS_GLYPH =
     "uniform sampler2D u_atlas;\n"       /* A8（R 通道 = 覆盖率） */
     "uniform vec4 u_color;\n"            /* 预乘线性 paint */
@@ -177,6 +197,7 @@ static const char *NX_GLSL_FS_GLYPH =
     "uniform vec4 u_atlas_rect;\n"       /* sx,sy,sw,sh */
     "uniform float u_ss;\n"
     "uniform int u_mode;\n"
+    NX_GLSL_SDF_COMMON
     "#if NX_DUAL\n"
     "layout(location = 0, index = 0) out vec4 o_color;\n"
     "layout(location = 0, index = 1) out vec4 o_color1;\n"
@@ -199,10 +220,17 @@ static const char *NX_GLSL_FS_GLYPH =
     "    int i1 = clamp(int(floor(x)) + 1, 0, sz.x - 1);\n"
     "    int j0 = clamp(int(floor(y)), 0, sz.y - 1);\n"
     "    int j1 = clamp(int(floor(y)) + 1, 0, sz.y - 1);\n"
-    "    float cov = texelFetch(u_atlas, ivec2(i0, j0), 0).a * ((1.0 - fx) * (1.0 - fy))\n"
-    "              + texelFetch(u_atlas, ivec2(i1, j0), 0).a * (fx * (1.0 - fy))\n"
-    "              + texelFetch(u_atlas, ivec2(i0, j1), 0).a * ((1.0 - fx) * fy)\n"
-    "              + texelFetch(u_atlas, ivec2(i1, j1), 0).a * (fx * fy);\n"
+    "    vec4 p00 = texelFetch(u_atlas, ivec2(i0, j0), 0);\n"
+    "    vec4 p10 = texelFetch(u_atlas, ivec2(i1, j0), 0);\n"
+    "    vec4 p01 = texelFetch(u_atlas, ivec2(i0, j1), 0);\n"
+    "    vec4 p11 = texelFetch(u_atlas, ivec2(i1, j1), 0);\n"
+    "    vec4 pm = p00 * ((1.0 - fx) * (1.0 - fy)) + p10 * (fx * (1.0 - fy))\n"
+    "            + p01 * ((1.0 - fx) * fy) + p11 * (fx * fy);\n"
+    /* COVERAGE：.a；SDF：.a 距离场重建；MSDF：RGB median 重建（§8.2） */
+    "    float cov;\n"
+    "    if (u_atlas_mode == 1) cov = nx_recon_cov(pm.a);\n"
+    "    else if (u_atlas_mode == 2) cov = nx_recon_cov(nx_median3(pm.r, pm.g, pm.b));\n"
+    "    else cov = pm.a;\n"
     /* oa/o1a 编码与 soft.c nx_blend_pixel_cov 同式（sa = u_color.a） */
     "    float oa;\n"
     "    if (u_mode == 1) oa = cov;\n"
@@ -271,6 +299,7 @@ static const char *NX_GLSL_FS_PLUSGLYPH =
     "uniform vec4 u_glyph;\n"
     "uniform vec4 u_atlas_rect;\n"
     "uniform float u_ss;\n"
+    NX_GLSL_SDF_COMMON
     "out vec4 o_color;\n"
     "void main(void)\n"
     "{\n"
@@ -287,10 +316,17 @@ static const char *NX_GLSL_FS_PLUSGLYPH =
     "    int i1 = clamp(int(floor(x)) + 1, 0, sz.x - 1);\n"
     "    int j0 = clamp(int(floor(y)), 0, sz.y - 1);\n"
     "    int j1 = clamp(int(floor(y)) + 1, 0, sz.y - 1);\n"
-    "    float cov = texelFetch(u_atlas, ivec2(i0, j0), 0).a * ((1.0 - fx) * (1.0 - fy))\n"
-    "              + texelFetch(u_atlas, ivec2(i1, j0), 0).a * (fx * (1.0 - fy))\n"
-    "              + texelFetch(u_atlas, ivec2(i0, j1), 0).a * ((1.0 - fx) * fy)\n"
-    "              + texelFetch(u_atlas, ivec2(i1, j1), 0).a * (fx * fy);\n"
+    "    vec4 p00 = texelFetch(u_atlas, ivec2(i0, j0), 0);\n"
+    "    vec4 p10 = texelFetch(u_atlas, ivec2(i1, j0), 0);\n"
+    "    vec4 p01 = texelFetch(u_atlas, ivec2(i0, j1), 0);\n"
+    "    vec4 p11 = texelFetch(u_atlas, ivec2(i1, j1), 0);\n"
+    "    vec4 pm = p00 * ((1.0 - fx) * (1.0 - fy)) + p10 * (fx * (1.0 - fy))\n"
+    "            + p01 * ((1.0 - fx) * fy) + p11 * (fx * fy);\n"
+    /* COVERAGE：.a；SDF：.a 距离场重建；MSDF：RGB median 重建（§8.2） */
+    "    float cov;\n"
+    "    if (u_atlas_mode == 1) cov = nx_recon_cov(pm.a);\n"
+    "    else if (u_atlas_mode == 2) cov = nx_recon_cov(nx_median3(pm.r, pm.g, pm.b));\n"
+    "    else cov = pm.a;\n"
     "    vec4 dst = texelFetch(u_layer, ivec2(gl_FragCoord.xy / u_ss), 0);\n"
     "    if (cov <= 0.0) { o_color = dst; return; }\n"
     "    vec4 sc = u_color * cov;\n"
@@ -332,6 +368,7 @@ static const char *NX_GLSL_FS_MANUALGLYPH =
     "uniform vec4 u_atlas_rect;\n"
     "uniform float u_ss;\n"
     "uniform int u_mode;\n"
+    NX_GLSL_SDF_COMMON
     "out vec4 o_color;\n"
     "void main(void)\n"
     "{\n"
@@ -352,10 +389,17 @@ static const char *NX_GLSL_FS_MANUALGLYPH =
     "    int i1 = clamp(int(floor(x)) + 1, 0, sz.x - 1);\n"
     "    int j0 = clamp(int(floor(y)), 0, sz.y - 1);\n"
     "    int j1 = clamp(int(floor(y)) + 1, 0, sz.y - 1);\n"
-    "    float cov = texelFetch(u_atlas, ivec2(i0, j0), 0).a * ((1.0 - fx) * (1.0 - fy))\n"
-    "              + texelFetch(u_atlas, ivec2(i1, j0), 0).a * (fx * (1.0 - fy))\n"
-    "              + texelFetch(u_atlas, ivec2(i0, j1), 0).a * ((1.0 - fx) * fy)\n"
-    "              + texelFetch(u_atlas, ivec2(i1, j1), 0).a * (fx * fy);\n"
+    "    vec4 p00 = texelFetch(u_atlas, ivec2(i0, j0), 0);\n"
+    "    vec4 p10 = texelFetch(u_atlas, ivec2(i1, j0), 0);\n"
+    "    vec4 p01 = texelFetch(u_atlas, ivec2(i0, j1), 0);\n"
+    "    vec4 p11 = texelFetch(u_atlas, ivec2(i1, j1), 0);\n"
+    "    vec4 pm = p00 * ((1.0 - fx) * (1.0 - fy)) + p10 * (fx * (1.0 - fy))\n"
+    "            + p01 * ((1.0 - fx) * fy) + p11 * (fx * fy);\n"
+    /* COVERAGE：.a；SDF：.a 距离场重建；MSDF：RGB median 重建（§8.2） */
+    "    float cov;\n"
+    "    if (u_atlas_mode == 1) cov = nx_recon_cov(pm.a);\n"
+    "    else if (u_atlas_mode == 2) cov = nx_recon_cov(nx_median3(pm.r, pm.g, pm.b));\n"
+    "    else cov = pm.a;\n"
     "    if (cov <= 0.0) { o_color = dst; return; }\n"
     "    vec4 sc = u_color * cov;\n"
     "    float ic = 1.0 - cov;\n"
@@ -455,7 +499,8 @@ typedef struct nx_gl_prog {
     GLuint id;
     GLint u_scale, u_color, u_opacity, u_tex, u_tex_size, u_linear, u_inv,
           u_src, u_dst, u_ss, u_layer, u_clip, u_has_clip, u_glyph,
-          u_atlas_rect, u_atlas, u_premul, u_mode, u_paint_a, u_mask;
+          u_atlas_rect, u_atlas, u_premul, u_mode, u_paint_a, u_mask,
+          u_atlas_mode, u_dist_range, u_softness, u_sdf_scale;
 } nx_gl_prog;
 
 typedef struct nx_gl_rt {       /* 渲染目标池项（层 / 裁剪掩码纹理） */
@@ -590,6 +635,10 @@ static neox_result gl_prog_build(neox_context *ctx, GLuint vs,
     out->u_mode       = gl_ul(p, "u_mode");
     out->u_paint_a    = gl_ul(p, "u_paint_a");
     out->u_mask       = gl_ul(p, "u_mask");
+    out->u_atlas_mode = gl_ul(p, "u_atlas_mode");
+    out->u_dist_range = gl_ul(p, "u_dist_range");
+    out->u_softness   = gl_ul(p, "u_softness");
+    out->u_sdf_scale  = gl_ul(p, "u_sdf_scale");
     return NEOX_OK;
 }
 
@@ -1334,7 +1383,6 @@ static neox_result gl_fill_path(neox_device *dev, nx_gl_dev *g,
     glBindTexture(GL_TEXTURE_2D, prt->tex);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h,
                     GL_RGBA, GL_FLOAT, g->premul);
-
     glBindFramebuffer(GL_FRAMEBUFFER, layer->fbo);
     glViewport(0, 0, (GLsizei)SSW, (GLsizei)SSH);
     gl_use(&g->p_fill, 2.0f / (float)SSW, 2.0f / (float)SSH);
@@ -1576,6 +1624,17 @@ static neox_result gl_draw_glyphs(neox_device *dev, nx_gl_dev *g,
     glUniform1i(g->p_glyph.u_atlas, 0);
     glUniform4f(g->p_glyph.u_color, paint[0], paint[1], paint[2], paint[3]);
     glUniformMatrix3fv(g->p_glyph.u_inv, 1, GL_FALSE, m3);
+    {
+        /* 图集语义（§8.2）：s 因子与 soft.c 同式（线性部分奇异值平均） */
+        float s_fac = 1.0f;
+        if (cmd->atlas_mode == NEOX_ATLAS_SDF ||
+            cmd->atlas_mode == NEOX_ATLAS_MSDF)
+            s_fac = nx_glyph_scale_factor(ctm);
+        glUniform1i(g->p_glyph.u_atlas_mode, (GLint)cmd->atlas_mode);
+        glUniform1f(g->p_glyph.u_dist_range, cmd->dist_range);
+        glUniform1f(g->p_glyph.u_softness, cmd->softness);
+        glUniform1f(g->p_glyph.u_sdf_scale, s_fac);
+    }
     glUniform1f(g->p_glyph.u_ss, (GLfloat)NEOX_GL_SS);
     glUniform1i(g->p_glyph.u_mode, (GLint)blend);
     if (blend != NEOX_BLEND_PLUS && !(!g->dual_ok && gl_mode_needs_dual(blend)))
@@ -1652,6 +1711,17 @@ static neox_result gl_draw_glyphs(neox_device *dev, nx_gl_dev *g,
                         (GLfloat)gl2->sy, gw, gh);
             glUniform1f(prog->u_ss, (GLfloat)NEOX_GL_SS);
             if (manual) glUniform1i(prog->u_mode, (GLint)blend);
+            {
+                /* 图集语义（§8.2）：与 p_glyph 同参（s 因子 = 奇异值平均） */
+                float s_fac = 1.0f;
+                if (cmd->atlas_mode == NEOX_ATLAS_SDF ||
+                    cmd->atlas_mode == NEOX_ATLAS_MSDF)
+                    s_fac = nx_glyph_scale_factor(ctm);
+                glUniform1i(prog->u_atlas_mode, (GLint)cmd->atlas_mode);
+                glUniform1f(prog->u_dist_range, cmd->dist_range);
+                glUniform1f(prog->u_softness, cmd->softness);
+                glUniform1f(prog->u_sdf_scale, s_fac);
+            }
             glDisable(GL_BLEND);
             gl_draw(g, dv, 6);
             glEnable(GL_SCISSOR_TEST);

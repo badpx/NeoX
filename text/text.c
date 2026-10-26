@@ -284,6 +284,252 @@ static void stb_free_bitmap(void *user, uint8_t *bmp)
     if (bmp) stbtt_FreeBitmap(bmp, NULL);
 }
 
+/* ------------------------------------------------------------------ 距离场
+ * 编码（§8.2，三后端共用同一重建公式）：距离 d（图集像素，形内为正）→
+ * v = 128 − d·255/dist_range，截断 [0,255]（±0.5 LSB 常量偏移，§9 容差内）。
+ * SDF：stbtt_GetGlyphSDF（真距离）。MSDF：简化版自实现（ADR 0006 范围的
+ * 允许简化）：真距离 + 拐角方向差 > 60° 边着色循环 R/G/B + 二次/三次
+ * 曲线细分 16 段；尖角内侧可略圆。alpha 恒 255（防核心预乘破坏数值）。
+ * 位图已含 dist_range 边距（pad = ceil(dr)+1），bear 相应外扩。 */
+
+#define NX_MSDF_SUBDIV 16        /* 曲线细分数（简化版，§9 容差内） */
+#define NX_MSDF_CORNER_COS 0.5f  /* cos(60°)：方向差阈值（余弦比较，免 acos） */
+
+typedef struct nx_msdf_seg {
+    float x0, y0, x1, y1;   /* 像素空间（y 向下） */
+    int color;              /* 0=R 1=G 2=B */
+} nx_msdf_seg;
+
+static float nx_msdf_seg_dist2(float px, float py,
+                               float x0, float y0, float x1, float y1)
+{
+    float dx = x1 - x0, dy = y1 - y0;
+    float l2 = dx * dx + dy * dy;
+    float t = l2 > 0.0f ? ((px - x0) * dx + (py - y0) * dy) / l2 : 0.0f;
+    if (t < 0.0f) t = 0.0f;
+    else if (t > 1.0f) t = 1.0f;
+    dx = px - (x0 + t * dx);
+    dy = py - (y0 + t * dy);
+    return dx * dx + dy * dy;
+}
+
+static int nx_msdf_push_seg(nx_msdf_seg **segs, int *n, int *cap,
+                            float x0, float y0, float x1, float y1, int color)
+{
+    if (*n == *cap) {
+        int nc = *cap ? *cap * 2 : 64;
+        nx_msdf_seg *ns = (nx_msdf_seg *)STBTT_malloc(
+            (size_t)nc * sizeof(nx_msdf_seg), NULL);
+        if (!ns) return 0;
+        memcpy(ns, *segs, (size_t)*n * sizeof(nx_msdf_seg));
+        if (*segs) STBTT_free(*segs, NULL);
+        *segs = ns;
+        *cap = nc;
+    }
+    (*segs)[*n].x0 = x0; (*segs)[*n].y0 = y0;
+    (*segs)[*n].x1 = x1; (*segs)[*n].y1 = y1;
+    (*segs)[*n].color = color;
+    (*n)++;
+    return 1;
+}
+
+/* stb 轮廓 → 着色线段表（像素空间，y 向下）。拐角方向差 > 60° 换色，
+ * 逐轮廓从 R 起循环 R→G→B；轮廓闭合边补上。失败返回 NULL。 */
+static nx_msdf_seg *nx_msdf_build_segs(int nv,
+                                       stbtt_vertex *verts, float scale,
+                                       int *out_n)
+{
+    nx_msdf_seg *segs = NULL;
+    int n = 0, cap = 0, i;
+    int color = 0, open = 0, have_prev = 0;
+    float sx = 0, sy = 0, cx = 0, cy = 0;   /* 轮廓起点 / 当前点 */
+    float pdx = 0, pdy = 0;                 /* 上一条边方向（单位化前） */
+    #define NX_PX(vx) ((float)(vx) * scale)
+    #define NX_PY(vy) (-(float)(vy) * scale)
+    for (i = 0; i < nv; i++) {
+        stbtt_vertex *v = &verts[i];
+        if (v->type == STBTT_vmove) {
+            if (open)   /* 闭合上一轮廓 */
+                if (!nx_msdf_push_seg(&segs, &n, &cap, cx, cy, sx, sy, color))
+                    goto oom;
+            sx = cx = NX_PX(v->x);
+            sy = cy = NX_PY(v->y);
+            color = 0;
+            open = 1;
+            have_prev = 0;
+        } else if (v->type == STBTT_vline || v->type == STBTT_vcurve ||
+                   v->type == STBTT_vcubic) {
+            float ex, ey, dirx, diry, l;
+            int c;
+            if (!open) continue;
+            ex = NX_PX(v->x);
+            ey = NX_PY(v->y);
+            dirx = ex - cx;
+            diry = ey - cy;
+            l = sqrtf(dirx * dirx + diry * diry);
+            c = color;
+            if (have_prev && l > 0.0f) {
+                float pl = sqrtf(pdx * pdx + pdy * pdy);
+                if (pl > 0.0f) {
+                    float cosv = (pdx * dirx + pdy * diry) / (pl * l);
+                    /* 方向差（取锐角侧）：cos < 0.5 即 > 60° */
+                    if (cosv < NX_MSDF_CORNER_COS)
+                        c = color = (color + 1) % 3;
+                }
+            }
+            if (v->type == STBTT_vline) {
+                if (!nx_msdf_push_seg(&segs, &n, &cap, cx, cy, ex, ey, c))
+                    goto oom;
+            } else if (v->type == STBTT_vcurve) {
+                float mx = NX_PX(v->cx), my = NX_PY(v->cy);
+                float px2 = cx, py2 = cy;
+                int k;
+                for (k = 1; k <= NX_MSDF_SUBDIV; k++) {
+                    float t = (float)k / (float)NX_MSDF_SUBDIV;
+                    float it = 1.0f - t;
+                    float qx = it * it * cx + 2.0f * it * t * mx + t * t * ex;
+                    float qy = it * it * cy + 2.0f * it * t * my + t * t * ey;
+                    if (!nx_msdf_push_seg(&segs, &n, &cap, px2, py2, qx, qy, c))
+                        goto oom;
+                    px2 = qx; py2 = qy;
+                }
+            } else {  /* vcubic（CFF）：de Casteljau 细分 */
+                float m1x = NX_PX(v->cx), m1y = NX_PY(v->cy);
+                float m2x = NX_PX(v->cx1), m2y = NX_PY(v->cy1);
+                float px2 = cx, py2 = cy;
+                int k;
+                for (k = 1; k <= NX_MSDF_SUBDIV; k++) {
+                    float t = (float)k / (float)NX_MSDF_SUBDIV;
+                    float it = 1.0f - t;
+                    float q01x = it * cx + t * m1x, q01y = it * cy + t * m1y;
+                    float q12x = it * m1x + t * m2x, q12y = it * m1y + t * m2y;
+                    float q23x = it * m2x + t * ex, q23y = it * m2y + t * ey;
+                    float q012x = it * q01x + t * q12x, q012y = it * q01y + t * q12y;
+                    float q123x = it * q12x + t * q23x, q123y = it * q12y + t * q23y;
+                    float qx = it * q012x + t * q123x;
+                    float qy = it * q012y + t * q123y;
+                    if (!nx_msdf_push_seg(&segs, &n, &cap, px2, py2, qx, qy, c))
+                        goto oom;
+                    px2 = qx; py2 = qy;
+                }
+            }
+            if (l > 0.0f) { pdx = dirx; pdy = diry; have_prev = 1; }
+            cx = ex; cy = ey;
+        }
+    }
+    if (open)
+        if (!nx_msdf_push_seg(&segs, &n, &cap, cx, cy, sx, sy, color))
+            goto oom;
+    #undef NX_PX
+    #undef NX_PY
+    *out_n = n;
+    return segs;
+oom:
+    if (segs) STBTT_free(segs, NULL);
+    return NULL;
+}
+
+/* 单字形 MSDF（RGBA，alpha=255）。空字形返回 NULL（同 GetGlyphBitmap 约定） */
+static uint8_t *nx_msdf_glyph(stbtt_fontinfo *stb, int glyph, float scale,
+                              float dr, int *out_w, int *out_h,
+                              int *out_xoff, int *out_yoff)
+{
+    int ix0, iy0, ix1, iy1, pad, W, H, x, y, i;
+    int nv, nseg = 0, cw, ch;
+    stbtt_vertex *verts = NULL;
+    nx_msdf_seg *segs = NULL;
+    uint8_t *cov = NULL, *out = NULL;
+    float pds = -255.0f / dr;
+
+    stbtt_GetGlyphBitmapBox(stb, glyph, scale, scale, &ix0, &iy0, &ix1, &iy1);
+    if (ix0 == ix1 || iy0 == iy1) return NULL;   /* 空字形 */
+    nv = stbtt_GetGlyphShape(stb, glyph, &verts);
+    if (nv <= 0) {
+        if (verts) STBTT_free(verts, stb->userdata);
+        return NULL;
+    }
+    pad = (int)ceilf(dr) + 1;
+    W = (ix1 - ix0) + pad * 2;
+    H = (iy1 - iy0) + pad * 2;
+    cw = ix1 - ix0;
+    ch = iy1 - iy0;
+    segs = nx_msdf_build_segs(nv, verts, scale, &nseg);
+    STBTT_free(verts, stb->userdata);
+    if (!segs || nseg == 0) goto done;
+    cov = (uint8_t *)STBTT_malloc((size_t)cw * ch, stb->userdata);
+    if (!cov) goto done;
+    stbtt_MakeGlyphBitmap(stb, cov, cw, ch, cw, scale, scale, glyph);
+    out = (uint8_t *)STBTT_malloc((size_t)W * H * 4, stb->userdata);
+    if (!out) goto done;
+    for (y = 0; y < H; y++) {
+        for (x = 0; x < W; x++) {
+            /* 像素中心（stbtt_GetGlyphSDF 同款坐标约定） */
+            float px = (float)(ix0 - pad + x) + 0.5f;
+            float py = (float)(iy0 - pad + y) + 0.5f;
+            float best[3] = { 1e30f, 1e30f, 1e30f }, best_all = 1e30f;
+            int inside = 0;
+            for (i = 0; i < nseg; i++) {
+                float d2 = nx_msdf_seg_dist2(px, py, segs[i].x0, segs[i].y0,
+                                             segs[i].x1, segs[i].y1);
+                if (d2 < best_all) best_all = d2;
+                if (d2 < best[segs[i].color]) best[segs[i].color] = d2;
+            }
+            if ((unsigned)(x - pad) < (unsigned)cw &&
+                (unsigned)(y - pad) < (unsigned)ch)
+                inside = cov[(size_t)(y - pad) * cw + (x - pad)] >= 128;
+            {
+                uint8_t *q = out + ((size_t)y * W + x) * 4;
+                int ch2;
+                for (ch2 = 0; ch2 < 3; ch2++) {
+                    float d, v;
+                    if (best[ch2] > 1e29f) best[ch2] = best_all; /* 该色无边 */
+                    d = inside ? sqrtf(best[ch2]) : -sqrtf(best[ch2]);
+                    v = 128.0f + pds * d;
+                    if (v < 0.0f) v = 0.0f;
+                    else if (v > 255.0f) v = 255.0f;
+                    q[ch2] = (uint8_t)v;
+                }
+                q[3] = 255;
+            }
+        }
+    }
+done:
+    if (segs) STBTT_free(segs, NULL);
+    if (cov) STBTT_free(cov, stb->userdata);
+    if (out) {
+        *out_w = W;
+        *out_h = H;
+        *out_xoff = ix0 - pad;
+        *out_yoff = iy0 - pad;
+    }
+    return out;
+}
+
+static neox_result stb_rasterize_sdf(void *user, uint32_t glyph, float size_px,
+                                     neox_atlas_mode mode, float dist_range,
+                                     uint8_t **out_bmp, int32_t *out_w,
+                                     int32_t *out_h, float *out_bx,
+                                     float *out_by)
+{
+    nx_font *f = (nx_font *)user;
+    float scale = stbtt_ScaleForPixelHeight(&f->stb, size_px);
+    int pad = (int)ceilf(dist_range) + 1;
+    int w = 0, h = 0, ox = 0, oy = 0;
+    unsigned char *bmp;
+    if (mode == NEOX_ATLAS_SDF) {
+        bmp = stbtt_GetGlyphSDF(&f->stb, scale, (int)glyph, pad, 128,
+                                -255.0f / dist_range, &w, &h, &ox, &oy);
+    } else {
+        bmp = nx_msdf_glyph(&f->stb, (int)glyph, scale, dist_range,
+                            &w, &h, &ox, &oy);
+    }
+    *out_bmp = bmp;               /* 可能为 NULL（空字形） */
+    *out_w = w; *out_h = h;
+    *out_bx = (float)ox;
+    *out_by = (float)oy;
+    return NEOX_OK;
+}
+
 static uint32_t font_glyph_index(nx_font *f, uint32_t codepoint)
 {
     if (f->is_custom) return codepoint;  /* 恒等映射（文档化） */
@@ -319,6 +565,7 @@ static neox_result font_load(nx_text_context *t, const void *data, size_t size,
     f->be.glyph_advance = stb_advance;
     f->be.glyph_kerning = stb_kerning;
     f->be.glyph_rasterize = stb_rasterize;
+    f->be.glyph_rasterize_sdf = stb_rasterize_sdf;
     f->be.glyph_free_bitmap = stb_free_bitmap;
     {
         int a, d, g;
@@ -710,9 +957,12 @@ struct nx_atlas {
     nx_text_context *tctx;
     nx_atlas *next;             /* tctx 级联链 */
     neox_device *dev;
-    neox_texture tex;           /* 图集即一张 A8 neox_texture */
+    neox_texture tex;           /* 图集纹理（COVERAGE/SDF → A8；MSDF → RGBA8_LINEAR） */
+    neox_atlas_mode mode;       /* 创建时固定；缓存天然按图集（模式）隔离 */
+    float dist_range;           /* 距离场编码范围（图集像素；COVERAGE 下无意义） */
+    uint32_t bpp;               /* 纹理/镜像每像素字节（1 或 4） */
     uint32_t w, h;
-    uint8_t *shadow;            /* [own] CPU 侧 A8 镜像 */
+    uint8_t *shadow;            /* [own] CPU 侧镜像（A8 或 RGBA8） */
     nx_shelf *shelves;
     uint32_t nshelves, capshelves;
     uint32_t shelf_y;           /* 下一条新 shelf 的 y */
@@ -744,11 +994,25 @@ static void atlas_unlink(nx_atlas *a)
 neox_result nx_atlas_create(nx_text_context *t, neox_device *dev,
                             uint32_t width, uint32_t height, nx_atlas **out)
 {
+    /* 现行行为 = COVERAGE 覆盖率图集（dist_range 缺省 4，模式下行无关） */
+    return nx_atlas_create_ex(t, dev, width, height, NEOX_ATLAS_COVERAGE, 0.0f,
+                              out);
+}
+
+neox_result nx_atlas_create_ex(nx_text_context *t, neox_device *dev,
+                               uint32_t width, uint32_t height,
+                               neox_atlas_mode mode, float dist_range_px,
+                               nx_atlas **out)
+{
     nx_atlas *a;
     neox_texture_desc td;
     uint8_t *zero;
-    if (!t || !dev || !out || width == 0 || height == 0)
+    if (!t || !dev || !out || width == 0 || height == 0 ||
+        mode > NEOX_ATLAS_MSDF)
         return NEOX_ERROR_INVALID_ARGUMENT;
+    if (dist_range_px < 0.0f)
+        TX_ERR(t, "dist_range_px must be >= 0", NEOX_ERROR_INVALID_ARGUMENT);
+    if (dist_range_px == 0.0f) dist_range_px = 4.0f;   /* 契约缺省 */
     *out = NULL;
     a = (nx_atlas *)tx_alloc(t, sizeof(*a), 16);
     if (!a) TX_ERR(t, "atlas allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
@@ -757,44 +1021,48 @@ neox_result nx_atlas_create(nx_text_context *t, neox_device *dev,
     a->dev = dev;
     a->w = width;
     a->h = height;
-    a->shadow = (uint8_t *)tx_alloc(t, (size_t)width * height, 16);
+    a->mode = mode;
+    a->dist_range = dist_range_px;
+    a->bpp = (mode == NEOX_ATLAS_MSDF) ? 4u : 1u;
+    a->shadow = (uint8_t *)tx_alloc(t, (size_t)width * height * a->bpp, 16);
     if (!a->shadow) {
         tx_free(t, a, sizeof(*a), 16);
         TX_ERR(t, "atlas shadow buffer allocation failed",
                NEOX_ERROR_OUT_OF_MEMORY);
     }
-    memset(a->shadow, 0, (size_t)width * height);
+    memset(a->shadow, 0, (size_t)width * height * a->bpp);
     a->cache = (nx_atlas_entry *)tx_alloc(t, NX_ATLAS_CACHE_CAP * sizeof(nx_atlas_entry), 16);
     if (!a->cache) {
-        tx_free(t, a->shadow, (size_t)width * height, 16);
+        tx_free(t, a->shadow, (size_t)width * height * a->bpp, 16);
         tx_free(t, a, sizeof(*a), 16);
         TX_ERR(t, "atlas cache allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
     }
     memset(a->cache, 0, NX_ATLAS_CACHE_CAP * sizeof(nx_atlas_entry));
-    /* 图集纹理：初始全零 A8 */
-    zero = (uint8_t *)tx_alloc(t, (size_t)width * height, 16);
+    /* 图集纹理：初始全零（MSDF 含 alpha=0；绘制端忽略 alpha 仅用于核心预乘） */
+    zero = (uint8_t *)tx_alloc(t, (size_t)width * height * a->bpp, 16);
     if (!zero) {
         tx_free(t, a->cache, NX_ATLAS_CACHE_CAP * sizeof(nx_atlas_entry), 16);
-        tx_free(t, a->shadow, (size_t)width * height, 16);
+        tx_free(t, a->shadow, (size_t)width * height * a->bpp, 16);
         tx_free(t, a, sizeof(*a), 16);
         TX_ERR(t, "atlas texture staging allocation failed",
                NEOX_ERROR_OUT_OF_MEMORY);
     }
-    memset(zero, 0, (size_t)width * height);
+    memset(zero, 0, (size_t)width * height * a->bpp);
     memset(&td, 0, sizeof(td));
     td.width = width;
     td.height = height;
-    td.format = NEOX_FORMAT_A8;
+    td.format = (mode == NEOX_ATLAS_MSDF) ? NEOX_FORMAT_RGBA8_LINEAR
+                                          : NEOX_FORMAT_A8;
     td.pixels = zero;
-    td.row_stride = width;
+    td.row_stride = (size_t)width * a->bpp;
     if (neox_texture_create(dev, &td, &a->tex) != NEOX_OK) {
-        tx_free(t, zero, (size_t)width * height, 16);
+        tx_free(t, zero, (size_t)width * height * a->bpp, 16);
         tx_free(t, a->cache, NX_ATLAS_CACHE_CAP * sizeof(nx_atlas_entry), 16);
-        tx_free(t, a->shadow, (size_t)width * height, 16);
+        tx_free(t, a->shadow, (size_t)width * height * a->bpp, 16);
         tx_free(t, a, sizeof(*a), 16);
         TX_ERR(t, "atlas texture creation failed", NEOX_ERROR_BACKEND);
     }
-    tx_free(t, zero, (size_t)width * height, 16);
+    tx_free(t, zero, (size_t)width * height * a->bpp, 16);
     a->next = t->atlases;
     t->atlases = a;
     *out = a;
@@ -808,7 +1076,7 @@ void nx_atlas_destroy(nx_atlas *a)
     t = a->tctx;
     atlas_unlink(a);
     if (a->tex.id) neox_texture_release(a->dev, a->tex);
-    if (a->shadow) tx_free(t, a->shadow, (size_t)a->w * a->h, 16);
+    if (a->shadow) tx_free(t, a->shadow, (size_t)a->w * a->h * a->bpp, 16);
     if (a->shelves) tx_free(t, a->shelves, (size_t)a->capshelves * sizeof(nx_shelf), 16);
     if (a->cache) tx_free(t, a->cache, NX_ATLAS_CACHE_CAP * sizeof(nx_atlas_entry), 16);
     tx_free(t, a, sizeof(*a), 16);
@@ -818,6 +1086,16 @@ neox_texture nx_atlas_texture(const nx_atlas *a)
 {
     neox_texture z = { 0 };
     return a ? a->tex : z;
+}
+
+neox_atlas_mode nx_atlas_get_mode(const nx_atlas *a)
+{
+    return a ? a->mode : NEOX_ATLAS_COVERAGE;
+}
+
+float nx_atlas_get_dist_range(const nx_atlas *a)
+{
+    return a ? a->dist_range : 0.0f;
 }
 
 void nx_atlas_stats(const nx_atlas *a, uint64_t *out_hits, uint64_t *out_misses)
@@ -888,8 +1166,8 @@ neox_result nx_atlas_flush(nx_atlas *a)
     region.y = (float)a->dy0;
     region.w = (float)(a->dx1 - a->dx0);
     region.h = (float)(a->dy1 - a->dy0);
-    src = a->shadow + (size_t)a->dy0 * a->w + a->dx0;
-    r = neox_texture_update(a->dev, a->tex, region, src, a->w);
+    src = a->shadow + ((size_t)a->dy0 * a->w + a->dx0) * a->bpp;
+    r = neox_texture_update(a->dev, a->tex, region, src, a->w * a->bpp);
     if (r == NEOX_OK) a->dirty = 0;
     return r;
 }
@@ -916,15 +1194,27 @@ static neox_result atlas_lookup(nx_atlas *a, nx_font *font, uint32_t glyph,
             return NEOX_OK;
         }
     }
-    /* 未命中：光栅化 + 装箱（量化后的字号，保证缓存键与位图一致） */
+    /* 未命中：光栅化（按图集模式）+ 装箱（量化后的字号，保证缓存键与位图一致） */
     {
         float size_qf = (float)size_q * 0.25f;
         uint8_t *bmp = NULL;
         int32_t bw = 0, bh = 0;
         float bx = 0.0f, by = 0.0f;
         nx_atlas_rect rc;
-        neox_result r = font->be.glyph_rasterize(font->be.user, glyph, size_qf,
-                                                 &bmp, &bw, &bh, &bx, &by);
+        neox_result r;
+        if (a->mode == NEOX_ATLAS_COVERAGE) {
+            r = font->be.glyph_rasterize(font->be.user, glyph, size_qf,
+                                         &bmp, &bw, &bh, &bx, &by);
+        } else {
+            if (!font->be.glyph_rasterize_sdf) {
+                a->tctx->last_error =
+                    "font backend does not support SDF/MSDF rasterization";
+                return NEOX_ERROR_UNSUPPORTED;
+            }
+            r = font->be.glyph_rasterize_sdf(font->be.user, glyph, size_qf,
+                                             a->mode, a->dist_range,
+                                             &bmp, &bw, &bh, &bx, &by);
+        }
         if (r != NEOX_OK) {
             a->tctx->last_error = "glyph rasterization failed";
             return r;
@@ -939,9 +1229,10 @@ static neox_result atlas_lookup(nx_atlas *a, nx_font *font, uint32_t glyph,
                     "atlas capacity exhausted (v0 不做 LRU 驱逐)";
                 return NEOX_ERROR_OUT_OF_MEMORY;
             }
+            /* SDF/MSDF 位图已含 dist_range 边距，整块拷贝（行字节 bw×bpp） */
             for (y = 0; y < (uint32_t)bh; y++)
-                memcpy(a->shadow + (size_t)(rc.y + y) * a->w + rc.x,
-                       bmp + (size_t)y * bw, (size_t)bw);
+                memcpy(a->shadow + ((size_t)(rc.y + y) * a->w + rc.x) * a->bpp,
+                       bmp + (size_t)y * bw * a->bpp, (size_t)bw * a->bpp);
             atlas_dirty(a, rc.x, rc.y, rc.x + (uint32_t)bw, rc.y + (uint32_t)bh);
         }
         if (bmp) font->be.glyph_free_bitmap(font->be.user, bmp);
@@ -988,14 +1279,16 @@ neox_result nx_atlas_glyph(nx_atlas *a, nx_font *font, uint32_t glyph_index,
 
 /* ------------------------------------------------------------------ 绘制桥 */
 
-neox_result nx_text_draw(neox_frame *frame, nx_atlas *a,
-                         const nx_layout *layout, const neox_paint *paint)
+static neox_result text_draw_impl(neox_frame *frame, nx_atlas *a,
+                                  const nx_layout *layout,
+                                  const neox_paint *paint,
+                                  const neox_glyph_style *style)
 {
     neox_result r;
     neox_glyph *arr;
     uint32_t i;
     float bx, by;
-    if (!frame || !a || !layout || !paint)
+    if (!frame || !a || !layout || !paint || !style)
         return NEOX_ERROR_INVALID_ARGUMENT;
     if (layout->glyph_count == 0) return NEOX_OK;
     arr = (neox_glyph *)tx_alloc(a->tctx,
@@ -1017,7 +1310,8 @@ neox_result nx_text_draw(neox_frame *frame, nx_atlas *a,
                     (size_t)layout->glyph_count * sizeof(neox_glyph), 16);
             return r;
         }
-        /* 位图左上角 = 基线原点 + bearing（bear_y <= 0 在基线上方） */
+        /* 位图左上角 = 基线原点 + bearing（bear_y <= 0 在基线上方）；
+         * SDF/MSDF 位图含边距，bear 已外扩，同一放置公式成立 */
         arr[i].x = lg->x + bx;
         arr[i].y = lg->y + by;
         arr[i].sx = rc.x;
@@ -1027,7 +1321,27 @@ neox_result nx_text_draw(neox_frame *frame, nx_atlas *a,
     }
     r = nx_atlas_flush(a);
     if (r == NEOX_OK)
-        r = neox_draw_glyphs(frame, a->tex, arr, layout->glyph_count, paint);
+        r = neox_draw_glyphs_ex(frame, a->tex, arr, layout->glyph_count,
+                                paint, style);
     tx_free(a->tctx, arr, (size_t)layout->glyph_count * sizeof(neox_glyph), 16);
     return r;
+}
+
+neox_result nx_text_draw(neox_frame *frame, nx_atlas *a,
+                         const nx_layout *layout, const neox_paint *paint)
+{
+    return nx_text_draw_ex(frame, a, layout, paint, 0.0f);
+}
+
+neox_result nx_text_draw_ex(neox_frame *frame, nx_atlas *a,
+                            const nx_layout *layout, const neox_paint *paint,
+                            float softness)
+{
+    neox_glyph_style style;
+    if (!a) return NEOX_ERROR_INVALID_ARGUMENT;
+    /* 图集模式与 dist_range 成对携带（§8.2：两处一致由模块保证） */
+    style.atlas_mode = a->mode;
+    style.dist_range_px = a->dist_range;
+    style.softness = softness;
+    return text_draw_impl(frame, a, layout, paint, &style);
 }

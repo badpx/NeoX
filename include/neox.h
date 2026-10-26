@@ -248,11 +248,33 @@ neox_result neox_draw_texture(neox_frame *frame, neox_texture tex,
 /* 字形 = 图集纹理中的带位置矩形；shaping/布局不在核心（NeoX-Text 职责） */
 typedef struct neox_glyph {
     float x, y;                          /* 目标位置（局部坐标） */
-    uint16_t sx, sy, sw, sh;             /* 图集源矩形（A8 遮罩） */
+    uint16_t sx, sy, sw, sh;             /* 图集源矩形 */
 } neox_glyph;
+
+/* 图集语义（neox_draw_glyphs_ex 的 style；缺省为 COVERAGE 即现行行为） */
+typedef enum neox_atlas_mode {
+    NEOX_ATLAS_COVERAGE = 0,  /* A8 覆盖率遮罩 */
+    NEOX_ATLAS_SDF,           /* A8 单通道有向距离场 */
+    NEOX_ATLAS_MSDF           /* RGBA8_LINEAR 三通道距离场（median 重建） */
+} neox_atlas_mode;
+
+typedef struct neox_glyph_style {
+    neox_atlas_mode atlas_mode;
+    float dist_range_px;   /* 距离场编码范围（图集像素）；0 = 默认 4。
+                              须与图集生成侧一致，不匹配为契约错误 */
+    float softness;        /* 边缘过渡宽度（输出像素）；0 = 默认 1 */
+} neox_glyph_style;
+
 neox_result neox_draw_glyphs(neox_frame *frame, neox_texture atlas,
                              const neox_glyph *glyphs, uint32_t count, /* [borrow] */
                              const neox_paint *paint);
+/* style == NULL 等价于 COVERAGE 默认。图集格式须匹配：COVERAGE/SDF → A8，
+   MSDF → NEOX_FORMAT_RGBA8_LINEAR（距离场是线性数据，禁止 sRGB 解码）；
+   不匹配返回 NEOX_ERROR_INVALID_ARGUMENT。语义见规范 §8.1。 */
+neox_result neox_draw_glyphs_ex(neox_frame *frame, neox_texture atlas,
+                                const neox_glyph *glyphs, uint32_t count,
+                                const neox_paint *paint,
+                                const neox_glyph_style *style);
 
 /* 提交。失败是原子的：target 内容与本帧引用的资源状态保持调用前一致。
  * 成功时 out_sub 可用于查询完成状态；frame 随提交销毁。 */

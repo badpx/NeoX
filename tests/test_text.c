@@ -7,6 +7,10 @@
  *   - 排版（mock 字体后端注入）：kerning、拉丁按词贪心断行、CJK 逐字断行、
  *     '\n' 强制断行、三对齐、度量包围盒
  *   - 动态图集：缓存命中/未命中统计、size 量化、容量满错误、flush 语义
+ *   - 距离场图集（§8.2）：create_ex 校验与缺省、SDF/MSDF 光栅化分发、
+ *     模式缓存隔离、后端缺 sdf 回调返回 UNSUPPORTED、重建数值（测试内
+ *     复制核心公式对拍：SDF 单通道 / MSDF median / dist_range 缺省 4 /
+ *     格式匹配契约与 style 校验）
  *   - 集成（系统字体存在时；否则 SKIP 段落）：度量合理性 +
  *     中英混排经 nx_text_draw 在同机已启用后端间逐位一致。
  *     候选含 macOS 系统字体与 Linux 常见路径（DejaVu / Liberation /
@@ -22,6 +26,7 @@
 #include "neox_mtl.h"
 #endif
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -106,6 +111,7 @@ typedef struct {
     int kern_pair[2];         /* 生效字距对（码点） */
     float kern_amount;        /* 相对 size 的比例 */
     uint32_t rasterize_calls;
+    uint32_t sdf_calls;       /* glyph_rasterize_sdf 调用计数 */
 } mock_font;
 
 static float mock_advance(void *user, uint32_t glyph, float size_px)
@@ -158,6 +164,34 @@ static void mock_free_bitmap(void *user, uint8_t *bmp)
 {
     (void)user;
     free(bmp);
+}
+
+/* 距离场光栅化 mock：SDF 单通道 / MSDF 四通道（alpha=255），字节模式可辨 */
+static neox_result mock_rasterize_sdf(void *user, uint32_t glyph, float size_px,
+                                      neox_atlas_mode mode, float dist_range,
+                                      uint8_t **out_bmp, int32_t *out_w,
+                                      int32_t *out_h, float *out_bx,
+                                      float *out_by)
+{
+    mock_font *m = (mock_font *)user;
+    int bpp = (mode == NEOX_ATLAS_MSDF) ? 4 : 1;
+    int32_t w = 4 + (int32_t)(glyph % 3u);
+    int32_t h = 6, x, y, c;
+    uint8_t *bmp;
+    (void)size_px; (void)dist_range;
+    m->sdf_calls++;
+    bmp = (uint8_t *)malloc((size_t)w * (size_t)h * (size_t)bpp);
+    if (!bmp) return NEOX_ERROR_OUT_OF_MEMORY;
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++)
+            for (c = 0; c < bpp; c++)
+                bmp[((size_t)y * w + x) * bpp + c] =
+                    (uint8_t)((x * 17 + y * 13 + glyph + c * 7) & 0xFF);
+    *out_bmp = bmp;
+    *out_w = w; *out_h = h;
+    *out_bx = -1.0f;
+    *out_by = (float)(1 - h);
+    return NEOX_OK;
 }
 
 /* 排版并返回字形序列（恒等映射：glyph_index == codepoint） */
@@ -477,7 +511,348 @@ static void test_atlas(void)
     neox_device_destroy(soft);
 }
 
-/* ------------------------------------------------------------------ 集成（系统字体） */
+/* ------------------------------------------------------------------ 距离场图集（§8.2） */
+
+static void test_sdf_atlas(void)
+{
+    nx_font_backend be;
+    mock_font mock;
+    nx_font *f = NULL, *f_plain = NULL;
+    nx_atlas *at = NULL;
+    neox_device_desc dd;
+    neox_device *soft = NULL;
+    nx_atlas_rect rc1, rc2;
+
+    memset(&mock, 0, sizeof(mock));
+    mock.adv_scale = 0.5f;
+    memset(&be, 0, sizeof(be));
+    be.user = &mock;
+    be.glyph_advance = mock_advance;
+    be.glyph_kerning = mock_kerning;
+    be.glyph_rasterize = mock_rasterize;
+    be.glyph_rasterize_sdf = mock_rasterize_sdf;
+    be.glyph_free_bitmap = mock_free_bitmap;
+    be.ascent = 0.8f; be.descent = -0.2f; be.line_gap = 0.1f;
+    CHECK_RES(nx_font_create_custom(g_tctx, &be, &f), NEOX_OK);
+    /* 无 sdf 回调的字体（UNSUPPORTED 路径） */
+    be.glyph_rasterize_sdf = NULL;
+    CHECK_RES(nx_font_create_custom(g_tctx, &be, &f_plain), NEOX_OK);
+    if (!f || !f_plain) return;
+
+    memset(&dd, 0, sizeof(dd));
+    dd.backend = NEOX_BACKEND_SOFT;
+    CHECK_RES(neox_device_create(g_ctx, &dd, &soft), NEOX_OK);
+    if (!soft) goto out;
+
+    /* create_ex 参数校验与缺省 */
+    CHECK_RES(nx_atlas_create_ex(g_tctx, soft, 64, 64,
+                                 (neox_atlas_mode)3, 4.0f, &at),
+              NEOX_ERROR_INVALID_ARGUMENT);
+    CHECK(at == NULL);
+    CHECK_RES(nx_atlas_create_ex(g_tctx, soft, 64, 64,
+                                 NEOX_ATLAS_SDF, -1.0f, &at),
+              NEOX_ERROR_INVALID_ARGUMENT);
+    CHECK(at == NULL);
+    CHECK_RES(nx_atlas_create_ex(g_tctx, soft, 64, 64,
+                                 NEOX_ATLAS_SDF, 0.0f, &at), NEOX_OK);
+    if (at) {
+        CHECK(nx_atlas_get_mode(at) == NEOX_ATLAS_SDF);
+        CHECK(nx_atlas_get_dist_range(at) == 4.0f);   /* 0 = 契约缺省 4 */
+        nx_atlas_destroy(at);
+        at = NULL;
+    }
+
+    /* SDF 图集：sdf 回调分发 + 缓存命中（量化键同 v0 规则） */
+    CHECK_RES(nx_atlas_create_ex(g_tctx, soft, 128, 128,
+                                 NEOX_ATLAS_SDF, 4.0f, &at), NEOX_OK);
+    if (at) {
+        CHECK_RES(nx_atlas_glyph(at, f, 'A', 16.0f, &rc1), NEOX_OK);
+        CHECK(rc1.w > 0 && rc1.h > 0);
+        CHECK(mock.sdf_calls == 1 && mock.rasterize_calls == 0);
+        CHECK_RES(nx_atlas_glyph(at, f, 'A', 16.0f, &rc2), NEOX_OK);
+        CHECK(rc2.x == rc1.x && rc2.y == rc1.y);
+        CHECK(mock.sdf_calls == 1);                   /* 命中，不再光栅化 */
+        nx_atlas_destroy(at);
+        at = NULL;
+    }
+
+    /* MSDF 图集：四通道路径 + 模式缓存隔离（coverage 不计 sdf_calls） */
+    CHECK_RES(nx_atlas_create_ex(g_tctx, soft, 128, 128,
+                                 NEOX_ATLAS_MSDF, 4.0f, &at), NEOX_OK);
+    if (at) {
+        CHECK(nx_atlas_get_mode(at) == NEOX_ATLAS_MSDF);
+        CHECK_RES(nx_atlas_glyph(at, f, 'A', 16.0f, &rc1), NEOX_OK);
+        CHECK(rc1.w > 0 && rc1.h > 0);
+        CHECK(mock.sdf_calls == 2 && mock.rasterize_calls == 0);
+        nx_atlas_destroy(at);
+        at = NULL;
+    }
+    CHECK_RES(nx_atlas_create(g_tctx, soft, 128, 128, &at), NEOX_OK);
+    if (at) {
+        CHECK_RES(nx_atlas_glyph(at, f, 'A', 16.0f, &rc2), NEOX_OK);
+        CHECK(mock.rasterize_calls == 1 && mock.sdf_calls == 2);
+        nx_atlas_destroy(at);
+        at = NULL;
+    }
+
+    /* 后端缺 sdf 回调：SDF/MSDF 图集报 UNSUPPORTED（COVERAGE 不受影响） */
+    CHECK_RES(nx_atlas_create_ex(g_tctx, soft, 64, 64,
+                                 NEOX_ATLAS_SDF, 4.0f, &at), NEOX_OK);
+    if (at) {
+        CHECK_RES(nx_atlas_glyph(at, f_plain, 'A', 16.0f, &rc1),
+                  NEOX_ERROR_UNSUPPORTED);
+        CHECK(nx_text_last_error(g_tctx) != NULL);
+        nx_atlas_destroy(at);
+        at = NULL;
+    }
+
+out:
+    if (at) nx_atlas_destroy(at);
+    nx_font_destroy(f_plain);
+    nx_font_destroy(f);
+    if (soft) neox_device_destroy(soft);
+}
+
+/* ------------------------------------------------------------------ 距离场重建数值（§8.2）
+ * 对拍：测试内复制核心 5 行重建公式（与 internal.h nx_sdf_reconstruct 同式），
+ * 经 Soft 后端整链（sRGB↔linear、量化）断言像素值。容差 ±3 字节：
+ * 编码 ±0.5 LSB 偏移 + 量化舍入。 */
+
+/* 测试内副本：cov = smoothstep 等价正向式（§8.2） */
+static float ref_reconstruct(float v_norm, float dist_range, float softness,
+                             float s)
+{
+    float w = softness > 0.0f ? softness : 1.0f;
+    float d = (0.5f - v_norm) * dist_range * s;
+    float t = d / w + 0.5f;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return t * t * (3.0f - 2.0f * t);
+}
+
+static float ref_linear_to_srgb(float c)
+{
+    if (c <= 0.0f) return 0.0f;
+    if (c >= 1.0f) return 1.0f;
+    return c <= 0.0031308f ? 12.92f * c
+                           : 1.055f * powf(c, 1.0f / 2.4f) - 0.055f;
+}
+
+/* 常数场图集（A8 v 或 RGBA r/g/b，alpha=255）画满 8×8，读中心像素。
+ * style 为 NULL 时用 neox_draw_glyphs（COVERAGE 默认路径）。 */
+static void draw_field(neox_device *soft, int msdf, float v0, float v1, float v2,
+                       const neox_glyph_style *style, uint8_t out_px[4])
+{
+    uint8_t texels[8 * 8 * 4];
+    neox_texture_desc td;
+    neox_texture tex = { 0 };
+    neox_glyph gl;
+    neox_frame *fr = NULL;
+    neox_submission sub;
+    neox_paint pt;
+    neox_color clear = { 1, 1, 1, 1 };
+    uint8_t fb[8 * 8 * 4];
+    neox_target_desc tgd;
+    int i;
+    for (i = 0; i < 64; i++) {
+        if (msdf) {
+            texels[i * 4 + 0] = (uint8_t)v0;
+            texels[i * 4 + 1] = (uint8_t)v1;
+            texels[i * 4 + 2] = (uint8_t)v2;
+            texels[i * 4 + 3] = 255;
+        } else {
+            texels[i * 4] = (uint8_t)v0;   /* 仅首字节有意义（A8 单通道） */
+        }
+    }
+    memset(&td, 0, sizeof(td));
+    td.width = 8;
+    td.height = 8;
+    td.format = msdf ? NEOX_FORMAT_RGBA8_LINEAR : NEOX_FORMAT_A8;
+    td.pixels = texels;
+    td.row_stride = (size_t)8 * (msdf ? 4 : 1);
+    if (neox_texture_create(soft, &td, &tex) != NEOX_OK) {
+        out_px[0] = out_px[1] = out_px[2] = out_px[3] = 0xAB;
+        return;
+    }
+    memset(&gl, 0, sizeof(gl));
+    gl.sw = 8; gl.sh = 8;
+    pt.color = (neox_color){ 1.0f, 0.0f, 0.0f, 1.0f };
+    memset(&tgd, 0, sizeof(tgd));
+    tgd.kind = NEOX_BACKEND_SOFT;
+    tgd.soft.pixels = fb;
+    tgd.soft.stride = sizeof(fb[0]) * 8 * 4;
+    tgd.soft.width = 8;
+    tgd.soft.height = 8;
+    tgd.clear = &clear;
+    if (neox_frame_begin(soft, &tgd, &fr) == NEOX_OK) {
+        neox_result r = style
+            ? neox_draw_glyphs_ex(fr, tex, &gl, 1, &pt, style)
+            : neox_draw_glyphs(fr, tex, &gl, 1, &pt);
+        /* emit 期校验失败不破坏帧：照常提交收尾（命令未追加） */
+        if (r == NEOX_OK) r = neox_frame_end(fr, &sub);
+        else (void)neox_frame_end(fr, &sub);
+        if (r == NEOX_OK) neox_device_pump(soft);
+        fr = NULL;
+    }
+    memcpy(out_px, fb + (4 * 8 + 4) * 4, 4);
+    neox_texture_release(soft, tex);
+}
+
+/* 期望：不透明白底上 SRC_OVER 纯红 paint，cov 已知 */
+static int expect_red_blend(float cov, int ch)
+{
+    float pl = ch == 0 ? 1.0f : 0.0f;          /* 红 paint 线性 */
+    float ol = cov * pl + (1.0f - cov) * 1.0f; /* dst = 白 */
+    return (int)(ref_linear_to_srgb(ol) * 255.0f + 0.5f);
+}
+
+static float fmedian3f(float a, float b, float c)
+{
+    float t = a > b ? a : b;
+    float u = a < b ? a : b;
+    return t > c ? (u > c ? u : c) : t;
+}
+
+static void check_field(neox_device *soft, int msdf,
+                        float v0, float v1, float v2,
+                        const neox_glyph_style *style,
+                        float dist_range, float softness,
+                        const char *what)
+{
+    uint8_t px[4];
+    float vn;
+    int ch;
+    draw_field(soft, msdf, v0, v1, v2, style, px);
+    /* style == NULL：COVERAGE 直接采样，无重建 */
+    vn = style ? ref_reconstruct(msdf ? fmedian3f(v0, v1, v2) / 255.0f
+                                      : v0 / 255.0f,
+                                 dist_range, softness, 1.0f)
+               : v0 / 255.0f;
+    for (ch = 0; ch < 3; ch++) {
+        int exp = expect_red_blend(vn, ch);
+        g_checks++;
+        if (abs((int)px[ch] - exp) > 3) {
+            fprintf(stderr, "FAIL %s:%d: %s ch%d got %d expect %d\n",
+                    __FILE__, __LINE__, what, ch, (int)px[ch], exp);
+            g_failures++;
+        }
+    }
+}
+
+/* 契约校验：返回 neox_draw_glyphs_ex 的 emit 期结果（帧照常收尾） */
+static neox_result try_style(neox_device *soft, int msdf,
+                             const neox_glyph_style *style)
+{
+    uint8_t texels[8 * 8 * 4];
+    neox_texture_desc td;
+    neox_texture tex = { 0 };
+    neox_glyph gl;
+    neox_frame *fr = NULL;
+    neox_submission sub;
+    neox_paint pt;
+    neox_color clear = { 1, 1, 1, 1 };
+    uint8_t fb[8 * 8 * 4];
+    neox_target_desc tgd;
+    int i;
+    neox_result r = NEOX_ERROR_BACKEND;
+    for (i = 0; i < 64; i++) {
+        texels[i * 4 + 0] = 128; texels[i * 4 + 1] = 128;
+        texels[i * 4 + 2] = 128; texels[i * 4 + 3] = 255;
+    }
+    memset(&td, 0, sizeof(td));
+    td.width = 8;
+    td.height = 8;
+    td.format = msdf ? NEOX_FORMAT_RGBA8_LINEAR : NEOX_FORMAT_A8;
+    td.pixels = texels;
+    td.row_stride = (size_t)8 * (msdf ? 4 : 1);
+    if (neox_texture_create(soft, &td, &tex) != NEOX_OK)
+        return NEOX_ERROR_BACKEND;
+    memset(&gl, 0, sizeof(gl));
+    gl.sw = 8; gl.sh = 8;
+    pt.color = (neox_color){ 1.0f, 0.0f, 0.0f, 1.0f };
+    memset(&tgd, 0, sizeof(tgd));
+    tgd.kind = NEOX_BACKEND_SOFT;
+    tgd.soft.pixels = fb;
+    tgd.soft.stride = sizeof(fb);
+    tgd.soft.width = 8;
+    tgd.soft.height = 8;
+    tgd.clear = &clear;
+    if (neox_frame_begin(soft, &tgd, &fr) == NEOX_OK) {
+        r = neox_draw_glyphs_ex(fr, tex, &gl, 1, &pt, style);
+        if (neox_frame_end(fr, &sub) != NEOX_OK && r == NEOX_OK)
+            r = NEOX_ERROR_BACKEND;
+        if (r == NEOX_OK) neox_device_pump(soft);
+    }
+    neox_texture_release(soft, tex);
+    return r;
+}
+
+static void test_sdf_reconstruct(void)
+{
+    neox_device_desc dd;
+    neox_device *soft = NULL;
+    neox_glyph_style st;
+    neox_glyph_style bad;
+
+    memset(&dd, 0, sizeof(dd));
+    dd.backend = NEOX_BACKEND_SOFT;
+    CHECK_RES(neox_device_create(g_ctx, &dd, &soft), NEOX_OK);
+    if (!soft) return;
+
+    memset(&st, 0, sizeof(st));
+
+    /* SDF：深内 / 深外 / 边缘（v=128 ≈ d≈0，cov≈0.5） */
+    st.atlas_mode = NEOX_ATLAS_SDF;
+    st.dist_range_px = 4.0f;
+    st.softness = 0.0f;
+    check_field(soft, 0, 0.0f, 0, 0, &st, 4.0f, 1.0f, "sdf inside");
+    check_field(soft, 0, 255.0f, 0, 0, &st, 4.0f, 1.0f, "sdf outside");
+    check_field(soft, 0, 128.0f, 0, 0, &st, 4.0f, 1.0f, "sdf edge");
+
+    /* dist_range 0 = 缺省 4（与 inside 组同期望） */
+    st.dist_range_px = 0.0f;
+    check_field(soft, 0, 0.0f, 0, 0, &st, 4.0f, 1.0f, "sdf default dr");
+
+    /* softness 生效：w=2 时同 d 的过渡减半（数值按公式对拍） */
+    st.dist_range_px = 4.0f;
+    st.softness = 2.0f;
+    check_field(soft, 0, 128.0f, 0, 0, &st, 4.0f, 2.0f, "sdf softness 2");
+
+    /* MSDF：median 规则（r/g/b 中位数；alpha 忽略） */
+    st.atlas_mode = NEOX_ATLAS_MSDF;
+    st.softness = 0.0f;
+    check_field(soft, 1, 0.0f, 0.0f, 255.0f, &st, 4.0f, 1.0f, "msdf median in");
+    check_field(soft, 1, 255.0f, 0.0f, 255.0f, &st, 4.0f, 1.0f,
+                "msdf median out");
+    check_field(soft, 1, 255.0f, 128.0f, 0.0f, &st, 4.0f, 1.0f,
+                "msdf median edge");
+
+    /* COVERAGE 默认路径：采样值直接作 cov，无重建（对照组） */
+    check_field(soft, 0, 128.0f, 0, 0, NULL, 0.0f, 0.0f, "coverage direct");
+
+    /* 格式匹配契约（§8.2）：模式与纹理格式不匹配 = INVALID_ARGUMENT */
+    memset(&bad, 0, sizeof(bad));
+    bad.atlas_mode = NEOX_ATLAS_SDF;
+    bad.dist_range_px = 4.0f;
+    CHECK_RES(try_style(soft, 1, &bad), NEOX_ERROR_INVALID_ARGUMENT); /* SDF+RGBA */
+    bad.atlas_mode = NEOX_ATLAS_MSDF;
+    CHECK_RES(try_style(soft, 0, &bad), NEOX_ERROR_INVALID_ARGUMENT); /* MSDF+A8 */
+    bad.atlas_mode = NEOX_ATLAS_COVERAGE;
+    CHECK_RES(try_style(soft, 1, &bad), NEOX_ERROR_INVALID_ARGUMENT); /* COV+RGBA */
+    /* style 校验：非法模式 / NaN */
+    bad.atlas_mode = (neox_atlas_mode)3;
+    CHECK_RES(try_style(soft, 0, &bad), NEOX_ERROR_INVALID_ARGUMENT);
+    bad.atlas_mode = NEOX_ATLAS_SDF;
+    bad.dist_range_px = NAN;
+    CHECK_RES(try_style(soft, 0, &bad), NEOX_ERROR_INVALID_ARGUMENT);
+    bad.dist_range_px = 4.0f;
+    bad.softness = NAN;
+    CHECK_RES(try_style(soft, 0, &bad), NEOX_ERROR_INVALID_ARGUMENT);
+
+    neox_device_destroy(soft);
+}
+
+
 
 typedef struct {
     neox_device *dev;
@@ -733,6 +1108,8 @@ int main(void)
     test_utf8_decode();
     test_layout();
     test_atlas();
+    test_sdf_atlas();
+    test_sdf_reconstruct();
     test_integration_real_fonts();
 
     nx_text_context_destroy(g_tctx);

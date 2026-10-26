@@ -113,6 +113,10 @@ typedef struct neox_context_desc {
 neox_result neox_context_create(const neox_context_desc *desc, /* [borrow] */
                                 neox_context **out_ctx);
 void        neox_context_destroy(neox_context *ctx);           /* [own] 销毁全部子对象 */
+/* 创建时注入的分配器（[borrow]，生命周期随 context）。
+ * 创建时传 NULL（系统默认分配器）则返回 NULL；ctx 为 NULL 返回 NULL。
+ * 模块（如 NeoX-Text）据此决定转发 malloc/free 还是直接使用调用方分配器。 */
+const neox_allocator *neox_context_get_allocator(neox_context *ctx);
 uint32_t    neox_version(void);                                /* 0xMMmmpp */
 /* 最近一次错误的静态描述串（英文 ASCII，进程内常量）；无错误返回 NULL */
 const char *neox_get_error_detail(neox_context *ctx);

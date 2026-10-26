@@ -103,6 +103,36 @@ if(NEOX_MTL_ENABLED)
   list(APPEND NEOX_TARGETS ex03_mtlscene)
 endif()
 
+# NeoX-Text 模块（字体加载/排版/动态 A8 图集；stb_truetype 单头文件 vendor）
+option(NEOX_WITH_TEXT "NeoX-Text module (font loading, layout, A8 atlas)" ON)
+if(NEOX_WITH_TEXT)
+  add_library(neox_text STATIC text/text.c)
+  target_include_directories(neox_text PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/text
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+  target_link_libraries(neox_text PUBLIC neox)
+  target_compile_options(neox_text PRIVATE -Wall -Wextra)
+
+  enable_testing()
+  add_executable(test_text tests/test_text.c)
+  target_link_libraries(test_text PRIVATE neox_text m)
+  target_compile_options(test_text PRIVATE -Wall -Wextra)
+  set_target_properties(test_text PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+  add_test(NAME text COMMAND test_text)
+
+  add_executable(ex04_text examples/ex04_text.c)
+  target_link_libraries(ex04_text PRIVATE neox_text m)
+  target_compile_options(ex04_text PRIVATE -Wall -Wextra)
+  set_target_properties(ex04_text PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+  add_test(NAME ex04_smoke COMMAND ex04_text)
+  set_tests_properties(ex04_smoke PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+  list(APPEND NEOX_TARGETS neox_text test_text ex04_text)
+endif()
+
 if(NEOX_SANITIZE)
   foreach(t ${NEOX_TARGETS})
     target_compile_options(${t} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)

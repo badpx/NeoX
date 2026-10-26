@@ -79,6 +79,8 @@ typedef struct nx_cmd     nx_cmd;
 
 struct neox_context {
     neox_allocator alloc;        /* 归一化后的分配器（NULL 输入替换为系统分配器） */
+    const neox_allocator *injected; /* 创建时注入的分配器原指针（NULL = 系统默认；
+                                     供 neox_context_get_allocator 返回） */
     uint64_t budget;             /* 0 = 不限 */
     uint64_t used;               /* 当前已分配字节 */
     uint64_t used_peak;          /* 历史峰值（执行报告用） */

@@ -225,6 +225,7 @@ neox_result neox_context_create(const neox_context_desc *desc, neox_context **ou
     if (!ctx) return NEOX_ERROR_OUT_OF_MEMORY;
     memset(ctx, 0, sizeof(*ctx));
     ctx->alloc = *al;
+    ctx->injected = (desc && desc->allocator) ? desc->allocator : NULL;
     if (desc) ctx->budget = desc->memory_budget;
     ctx->next_dev_id = 1;
     *out_ctx = ctx;
@@ -249,6 +250,14 @@ const char *neox_get_error_detail(neox_context *ctx)
 {
     if (!ctx) return NULL;
     return ctx->last_error;
+}
+
+const neox_allocator *neox_context_get_allocator(neox_context *ctx)
+{
+    if (!ctx) return NULL;
+    /* 创建时注入的原指针；未注入（系统默认）返回 NULL，
+     * 由调用方决定转发 malloc/free 的语义 */
+    return ctx->injected;
 }
 
 /* ------------------------------------------------------------------ 句柄解析 */

@@ -26,10 +26,12 @@ NeoX 是一个以**图形语义契约**为中心的跨平台 2D 图形库：矢�
 | Metal 后端（macOS，真异步） | 完成，首个验证"提交后存活期"契约的后端 |
 | 保留模式场景树 | 完成（脏区追踪为粗粒度，增量执行在第二阶段） |
 | CAP 捕获/回放（最小版） | 完成，含跨后端回放 |
-| NeoX-Text / GLES3 / WebGL2 / WASM | 第二阶段 |
+| NeoX-Text v0（A8 图集 + 简化排版，三后端逐位一致） | 完成；SDF/MSDF 属下一迭代（ADR 0006） |
+| GLES3 / WebGL2 / WASM | 第二阶段 |
 
-测试规模：679 项断言（255 语义 + 424 跨后端一致性），**三后端两两逐位一致**，
-ASan/UBSan 干净。
+测试规模：775 项断言（255 语义 + 424 跨后端一致性 + 96 文字模块），
+**三后端两两逐位一致**，ASan/UBSan 干净。第三方依赖：仅模块级 vendored
+stb_truetype（见 [docs/dependencies.md](docs/dependencies.md)），核心零依赖。
 
 ## 构建与测试
 
@@ -41,7 +43,7 @@ ctest --test-dir build --output-on-failure
 
 - 依赖：C11 编译器 + CMake；无第三方库。
 - macOS 上默认启用 GL 与 Metal 后端（`NEOX_BACKEND_GL` / `NEOX_BACKEND_METAL`）；其他平台当前自动退回 Soft-only。
-- 示例：`build/ex01_scene`（Soft）、`build/ex02_gpuscene`（GL）、`build/ex03_mtlscene`（Metal）输出 BMP 到 build 目录；`ex03_compare.bmp` 为三后端并排对比图。
+- 示例：`build/ex01_scene`（Soft）、`build/ex02_gpuscene`（GL）、`build/ex03_mtlscene`（Metal）、`build/ex04_text`（中英混排文字，三后端）输出 BMP 到 build 目录；`ex03_compare.bmp` / `ex04_compare.bmp` 为并排对比图。
 
 ## 许可证
 

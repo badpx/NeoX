@@ -1001,6 +1001,31 @@ static void test_capture_replay(void)
     neox_device_pump(g_dev);
 }
 
+/* ------------------------------------------------------------------ neox_context_get_allocator（公开查询：模块据此决定转发语义） */
+static void test_context_allocator_query(void)
+{
+    neox_context_desc cd;
+    neox_context *c1 = NULL, *c2 = NULL;
+
+    /* 注入路径：返回创建时的同一分配器指针 */
+    memset(&cd, 0, sizeof(cd));
+    {
+        static neox_allocator a;
+        a.user = &g_stat; a.alloc = t_alloc; a.free = t_free;
+        cd.allocator = &a;
+    }
+    CHECK_RES(neox_context_create(&cd, &c1), NEOX_OK);
+    CHECK(neox_context_get_allocator(c1) == cd.allocator);
+    /* 默认路径（系统分配器）：返回 NULL */
+    memset(&cd, 0, sizeof(cd));
+    CHECK_RES(neox_context_create(&cd, &c2), NEOX_OK);
+    CHECK(neox_context_get_allocator(c2) == NULL);
+    /* 参数 NULL */
+    CHECK(neox_context_get_allocator(NULL) == NULL);
+    neox_context_destroy(c1);
+    neox_context_destroy(c2);
+}
+
 /* ------------------------------------------------------------------ main */
 int main(void)
 {
@@ -1035,6 +1060,7 @@ int main(void)
     test_glyphs();
     test_blend_coverage_interpolation();
     test_platform_size_contract();
+    test_context_allocator_query();
     test_failure_semantics();
     test_handles();
     test_determinism_and_equivalence();

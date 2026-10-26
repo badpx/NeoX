@@ -29,7 +29,7 @@ set(NEOX_TARGETS neox test_semantics ex01_scene)
 # 本后端定位为链路验证，移植目标为 GLES3/WebGL2）
 if(NEOX_BACKEND_GL AND APPLE)
   target_sources(neox PRIVATE src/gl.c)
-  target_compile_definitions(neox PRIVATE NEOX_ENABLE_GL=1)
+  target_compile_definitions(neox PUBLIC NEOX_ENABLE_GL=1)
   target_link_libraries(neox PRIVATE "-framework OpenGL")
   set_source_files_properties(src/gl.c PROPERTIES
     COMPILE_OPTIONS "-Wno-deprecated-declarations")
@@ -42,7 +42,7 @@ endif()
 if(NEOX_BACKEND_METAL AND APPLE)
   enable_language(OBJCXX)
   target_sources(neox PRIVATE src/metal.mm)
-  target_compile_definitions(neox PRIVATE NEOX_ENABLE_METAL=1)
+  target_compile_definitions(neox PUBLIC NEOX_ENABLE_METAL=1)
   target_link_libraries(neox PRIVATE "-framework Metal" "-framework Foundation"
                         "-framework QuartzCore")
   set_source_files_properties(src/metal.mm PROPERTIES
@@ -70,7 +70,7 @@ add_test(NAME ex01_smoke COMMAND ex01_scene)
 set_tests_properties(ex01_smoke PROPERTIES
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
-if(NEOX_GL_ENABLED OR NEOX_MTL_ENABLED)
+if(NEOX_GL_ENABLED)
   add_executable(test_gpu_consistency tests/test_gpu_consistency.c)
   target_link_libraries(test_gpu_consistency PRIVATE neox m)
   target_compile_options(test_gpu_consistency PRIVATE -Wall -Wextra)

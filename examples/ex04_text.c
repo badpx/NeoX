@@ -7,9 +7,13 @@
  * 字体缺失时打印提示并以 0 退出（示例冒烟测试不失败）。
  * =========================================================================*/
 #include "neox.h"
-#include "neox_gl.h"
-#include "neox_mtl.h"
 #include "neox_text.h"
+#if NEOX_ENABLE_GL
+#include "neox_gl.h"
+#endif
+#if NEOX_ENABLE_METAL
+#include "neox_mtl.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -180,6 +184,7 @@ int main(void)
     }
 
     /* GL */
+#if NEOX_ENABLE_GL
     {
         neox_gl_device_desc gld;
         memset(&gld, 0, sizeof(gld));
@@ -226,7 +231,9 @@ int main(void)
         }
     }
 
+#endif
     /* Metal */
+#if NEOX_ENABLE_METAL
     {
         neox_mtl_device_desc mtd;
         memset(&mtd, 0, sizeof(mtd));
@@ -273,6 +280,7 @@ int main(void)
             }
         }
     }
+#endif
 
     if (write_bmp("ex04_text.bmp", img_soft, W, H) != 0) return 1;
     printf("wrote ex04_text.bmp\n");

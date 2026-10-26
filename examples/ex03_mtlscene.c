@@ -9,7 +9,9 @@
  * 无 GL/Metal 环境时打印提示并以 0 退出（示例冒烟测试不失败）。
  * =========================================================================*/
 #include "neox.h"
+#if NEOX_ENABLE_GL
 #include "neox_gl.h"
+#endif
 #include "neox_mtl.h"
 
 #include <math.h>
@@ -314,6 +316,7 @@ static int render_on_gpu(neox_device *dev, int use_mtl, uint8_t *out,
             if (!rc && neox_mtl_surface_read_pixels(surf, out) != NEOX_OK) rc = 1;
             if (surf) neox_mtl_surface_destroy(dev, surf);
         } else {
+#if NEOX_ENABLE_GL
             neox_gl_surface *surf = NULL;
             if (neox_gl_surface_create(dev, W, H, &surf) != NEOX_OK) rc = 1;
             else td.surface = surf;
@@ -330,6 +333,9 @@ static int render_on_gpu(neox_device *dev, int use_mtl, uint8_t *out,
                        rep.draw_calls, (int)rep.algorithm);
             if (!rc && neox_gl_surface_read_pixels(surf, out) != NEOX_OK) rc = 1;
             if (surf) neox_gl_surface_destroy(dev, surf);
+#else
+            rc = 1;   /* GL 后端未编译 */
+#endif
         }
     }
     neox_texture_release(dev, checker);
@@ -410,6 +416,7 @@ int main(void)
     }
 
     /* ---------------- GL ---------------- */
+#if NEOX_ENABLE_GL
     {
         neox_gl_device_desc gld;
         memset(&gld, 0, sizeof(gld));
@@ -429,6 +436,7 @@ int main(void)
         }
     }
 
+#endif
     /* ---------------- Metal（真异步） ---------------- */
     {
         neox_mtl_device_desc mtd;

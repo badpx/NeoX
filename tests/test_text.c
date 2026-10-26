@@ -11,9 +11,13 @@
  *     中英混排经 nx_text_draw 在 Soft/GL/Metal 三后端逐位一致
  * =========================================================================*/
 #include "neox.h"
-#include "neox_gl.h"
-#include "neox_mtl.h"
 #include "neox_text.h"
+#if NEOX_ENABLE_GL
+#include "neox_gl.h"
+#endif
+#if NEOX_ENABLE_METAL
+#include "neox_mtl.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -499,6 +503,7 @@ static int render_text(const render_dev *rd, nx_font *font, const char *text,
         td.kind = rd->use_gl || rd->use_mtl ? NEOX_BACKEND_GPU
                                             : NEOX_BACKEND_SOFT;
         td.clear = &clear;
+#if NEOX_ENABLE_GL
         if (rd->use_gl) {
             neox_gl_surface *s = NULL;
             if (neox_gl_surface_create(rd->dev, w, h, &s) != NEOX_OK)
@@ -522,7 +527,10 @@ static int render_text(const render_dev *rd, nx_font *font, const char *text,
                 }
             }
             if (s) neox_gl_surface_destroy(rd->dev, s);
-        } else if (rd->use_mtl) {
+        } else
+#endif
+#if NEOX_ENABLE_METAL
+        if (rd->use_mtl) {
             neox_mtl_surface *s = NULL;
             if (neox_mtl_surface_create(rd->dev, w, h, &s) != NEOX_OK)
                 r = NEOX_ERROR_BACKEND;
@@ -544,7 +552,9 @@ static int render_text(const render_dev *rd, nx_font *font, const char *text,
                 }
             }
             if (s) neox_mtl_surface_destroy(rd->dev, s);
-        } else {
+        } else
+#endif
+        {
             td.soft.pixels = out;
             td.soft.stride = (size_t)w * 4;
             td.soft.width = w;
@@ -575,6 +585,8 @@ static int create_gpu_device(nx_text_context *tctx, int use_mtl, neox_device **o
     (void)tctx;
     memset(&dd, 0, sizeof(dd));
     dd.backend = NEOX_BACKEND_GPU;
+    (void)dd;
+#if NEOX_ENABLE_METAL
     if (use_mtl) {
         neox_mtl_device_desc mtd;
         memset(&mtd, 0, sizeof(mtd));
@@ -584,7 +596,10 @@ static int create_gpu_device(nx_text_context *tctx, int use_mtl, neox_device **o
         dd.platform_size = sizeof(mtd);
         /* desc 为 [borrow]，init 在返回前读取——必须在作用域内调用 */
         return neox_device_create(g_ctx, &dd, out) == NEOX_OK ? 0 : -1;
-    } else {
+    }
+#endif
+#if NEOX_ENABLE_GL
+    if (!use_mtl) {
         neox_gl_device_desc gld;
         memset(&gld, 0, sizeof(gld));
         gld.struct_size = (uint32_t)sizeof(gld);
@@ -593,6 +608,10 @@ static int create_gpu_device(nx_text_context *tctx, int use_mtl, neox_device **o
         dd.platform_size = sizeof(gld);
         return neox_device_create(g_ctx, &dd, out) == NEOX_OK ? 0 : -1;
     }
+#endif
+    (void)use_mtl;
+    (void)out;
+    return -1;   /* 该后端未编译：不可用（运行时降级路径已具备） */
 }
 
 static void test_integration_real_fonts(void)

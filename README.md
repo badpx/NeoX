@@ -23,6 +23,7 @@ NeoX 是一个以**图形语义契约**为中心的跨平台 2D 图形库：矢�
 | 语义规范 v0（最小子集） | 三后端验证通过，草案冻结 |
 | Soft 后端（软件光栅） | 完成，参照实现 |
 | GL 后端（OpenGL 4.1 Core；macOS CGL / Linux EGL surfaceless） | 完成，链路验证定位 |
+| Linux 窗口呈现（Wayland 优先，X11 回退；Soft 与 GL） | 完成，平台胶水层 |
 | Metal 后端（macOS，真异步） | 完成，首个验证"提交后存活期"契约的后端 |
 | 保留模式场景树 | 完成（脏区追踪为粗粒度，增量执行在第二阶段） |
 | CAP 捕获/回放（最小版） | 完成，含跨后端回放 |
@@ -48,9 +49,9 @@ sudo apt-get install -y build-essential cmake libgl1-mesa-dri fonts-dejavu-core
 sudo apt-get install -y libegl1 libegl-mesa0 || sudo apt-get install -y libegl1-mesa
 ```
 
-- macOS 上默认启用 GL 与 Metal（`NEOX_BACKEND_GL` / `NEOX_BACKEND_METAL`）。Linux 默认启用 GL（EGL surfaceless + GL 4.1 Core），Metal 关闭。`-DNEOX_BACKEND_GL=OFF` 仍可只编 Soft。
-- 示例：`build/ex01_scene`（Soft）、`build/ex02_gpuscene`（GL）、`build/ex03_mtlscene`（Metal，仅 macOS）、`build/ex04_text`（中英混排；Linux 需上述字体或文泉驿）输出 BMP 到 build 目录。`NEOX_GL_LOG=1` 打印 EGL 路径与渲染器；`NEOX_GL_FORCE_NO_DUAL=1` 强制关掉 dual-source，走 ping-pong 回退。
-- 方案与已知限制见 [docs/linux-port.md](docs/linux-port.md)。Mesa llvmpipe 25.2.8 上 Soft 与 GL 的一致性场景（含关掉 dual-source 的回退路径）实测逐位一致。
+- macOS 上默认启用 GL 与 Metal（`NEOX_BACKEND_GL` / `NEOX_BACKEND_METAL`）。Linux 默认启用 GL（EGL surfaceless + GL 4.1 Core）和窗口呈现（`NEOX_PRESENT`），Metal 关闭。`-DNEOX_BACKEND_GL=OFF` 仍可只编 Soft；`-DNEOX_PRESENT=OFF` 去掉窗口层。没有显示器时窗口测试与 `ex05_window` 自动跳过，离屏测试照常。
+- 示例：`build/ex01_scene`（Soft）、`build/ex02_gpuscene`（GL）、`build/ex03_mtlscene`（Metal，仅 macOS）、`build/ex04_text`（中英混排；Linux 需上述字体或文泉驿）输出 BMP 到 build 目录。`build/ex05_window` 打开真实窗口（`NEOX_PRESENT_GPU=1` 走 GL，`NEOX_PRESENT_FRAMES=2` 画两帧后退出并写出 resize 前后的 BMP）。`NEOX_GL_LOG=1` 打印 EGL 路径与渲染器；`NEOX_GL_FORCE_NO_DUAL=1` 强制关掉 dual-source，走 ping-pong 回退。
+- 离屏方案见 [docs/linux-port.md](docs/linux-port.md)，上屏方案见 [docs/linux-present.md](docs/linux-present.md)。Mesa llvmpipe 25.2.8 上 Soft 与 GL 的一致性场景（含关掉 dual-source 的回退路径）实测逐位一致。
 
 ## 许可证
 

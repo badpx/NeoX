@@ -65,6 +65,22 @@ else()
   set(NEOX_MTL_ENABLED 0)
 endif()
 
+# 窗口呈现是平台胶水，不是 GL 执行器。Linux 上 X11 与 Wayland 都编进来，
+# 运行期 dlopen，不把 libX11 / libwayland 写进链接行。
+if(UNIX AND NOT APPLE)
+  option(NEOX_PRESENT "Linux window presentation (Wayland, X11 fallback)" ON)
+else()
+  option(NEOX_PRESENT "Linux window presentation (Wayland, X11 fallback)" OFF)
+endif()
+if(NEOX_PRESENT AND (NOT UNIX OR APPLE))
+  message(FATAL_ERROR "NEOX_PRESENT is implemented for Linux only")
+endif()
+if(NEOX_PRESENT)
+  target_sources(neox PRIVATE src/present.c src/present_x11.c src/present_wl.c)
+  target_compile_definitions(neox PUBLIC NEOX_ENABLE_PRESENT=1)
+  target_link_libraries(neox PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
 # 示例：输出 BMP 到构建目录（ctest 可顺带验证示例跑通）
 add_executable(ex01_scene examples/ex01_scene.c)
 target_link_libraries(ex01_scene PRIVATE neox m)
@@ -148,6 +164,27 @@ if(NEOX_WITH_TEXT)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
   list(APPEND NEOX_TARGETS neox_text test_text ex04_text)
+endif()
+
+if(NEOX_PRESENT)
+  add_executable(test_present tests/test_present.c)
+  target_link_libraries(test_present PRIVATE neox m)
+  target_compile_options(test_present PRIVATE -Wall -Wextra)
+  set_target_properties(test_present PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+  add_test(NAME present COMMAND test_present)
+
+  add_executable(ex05_window examples/ex05_window.c)
+  target_link_libraries(ex05_window PRIVATE neox m)
+  target_compile_options(ex05_window PRIVATE -Wall -Wextra)
+  set_target_properties(ex05_window PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+  add_test(NAME ex05_smoke COMMAND ex05_window)
+  set_tests_properties(ex05_smoke PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    ENVIRONMENT "NEOX_PRESENT_FRAMES=2")
+
+  list(APPEND NEOX_TARGETS test_present ex05_window)
 endif()
 
 if(NEOX_SANITIZE)

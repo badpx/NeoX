@@ -226,6 +226,20 @@ static const char *NX_GLSL_FS_CLAMP =
     "    o_color = clamp(texelFetch(u_tex, ivec2(gl_FragCoord.xy), 0), 0.0, 1.0);\n"
     "}\n";
 
+/* 窗口呈现：resolve 纹理的第 0 行是设备顶行，但按 GL 纹素原点放在底边。
+ * 真实窗口的底边是视觉底边，所以这里按高度翻转，让设备顶行出现在窗口顶边。
+ * u_ss 复用为像素高度。离屏 read_pixels 不走这个 shader。 */
+static const char *NX_GLSL_FS_PRESENT =
+    "#version 410 core\n"
+    "uniform sampler2D u_tex;\n"
+    "uniform float u_ss;\n"
+    "out vec4 o_color;\n"
+    "void main(void)\n"
+    "{\n"
+    "    int y = int(u_ss) - 1 - int(gl_FragCoord.y);\n"
+    "    o_color = texelFetch(u_tex, ivec2(int(gl_FragCoord.x), y), 0);\n"
+    "}\n";
+
 /* PLUS（§6.1）：clamp 非线性 + 覆盖率插值无法由固定功能因子表达。
  * 读取层内容 dst，计算 out = cov·clamp(s+d,1) + (1−cov)·d（cov≥0 时等于
  * min(s·cov + cov·d, cov) + (1−cov)·d），写入临时层后由调用方拷回。 */
@@ -460,6 +474,10 @@ struct neox_gl_surface {
     neox_device *dev;           /* 所属设备（上下文归属与借用校验） */
     GLuint fbo, tex;
     uint32_t w, h;
+    void *win_egl;              /* EGLSurface；离屏为 NULL */
+    void *native_window;
+    int vsync;
+    uint8_t *presented;         /* 最近一次 present 的窗口读回，左上原点 */
 };
 
 typedef struct nx_gl_dev {
@@ -468,7 +486,7 @@ typedef struct nx_gl_dev {
     int dual_ok;                /* GL_MAX_DUAL_SOURCE_DRAW_BUFFERS >= 1 且探测链接成功 */
     GLuint vao, vbo;
     nx_gl_prog p_fill, p_tex, p_glyph, p_comp, p_blit, p_clamp, p_plusfill, p_plusglyph;
-    nx_gl_prog p_manualfill, p_manualglyph, p_manualtex;
+    nx_gl_prog p_manualfill, p_manualglyph, p_manualtex, p_present;
     nx_gl_rt *rts;              /* 层池（is_layer=1）与裁剪纹理池（is_layer=0） */
     uint32_t nrts, caprts;
     nx_gl_texent *texs;         /* 并行于 textures 槽位表 */
@@ -867,15 +885,22 @@ static void gl_state_destroy(neox_context *ctx, nx_gl_dev *g)
         gl_prog_free(&g->p_glyph);
         gl_prog_free(&g->p_comp);
         gl_prog_free(&g->p_blit);
+        gl_prog_free(&g->p_present);
         if (g->vao) glDeleteVertexArrays(1, &g->vao);
         if (g->vbo) glDeleteBuffers(1, &g->vbo);
         if (g->snap_tex) glDeleteTextures(1, &g->snap_tex);
         for (i = 0; i < g->nrts; i++) gl_rt_destroy(&g->rts[i]);
         for (i = 0; i < g->ntexs; i++)
             if (g->texs[i].id) glDeleteTextures(1, &g->texs[i].id);
-        /* 表面注册表中仍存活的表面：GL 对象随上下文销毁，这里仅回收结构 */
-        for (i = 0; i < g->nsurfs; i++)
-            nx_free(ctx, g->surfs[i], sizeof(neox_gl_surface), 16);
+        /* 表面注册表中仍存活的表面。窗口的 EGLSurface 不随 GL 上下文一起没，
+         * 必须先拆掉。颜色附件随后随上下文销毁。 */
+        for (i = 0; i < g->nsurfs; i++) {
+            neox_gl_surface *s = g->surfs[i];
+            if (s->win_egl) nx_gl_ctx_window_destroy(g->ctx, s->win_egl);
+            if (s->presented)
+                nx_free(ctx, s->presented, (size_t)s->w * s->h * 4, 16);
+            nx_free(ctx, s, sizeof(neox_gl_surface), 16);
+        }
     }
     if (g->ctx) {
         nx_gl_ctx_destroy(g->ctx);
@@ -1032,7 +1057,7 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
         const GLubyte *rend = glGetString(GL_RENDERER);
         const GLubyte *ver = glGetString(GL_VERSION);
         fprintf(stderr, "neox gl: kind=%s renderer=%s version=%s dual_source=%d\n",
-                nx_gl_ctx_kind(),
+                nx_gl_ctx_kind(g->ctx),
                 rend ? (const char *)rend : "?",
                 ver ? (const char *)ver : "?",
                 g->dual_ok);
@@ -1067,6 +1092,7 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
     NX_BUILD_FS(g->p_tex, NX_GLSL_FS_TEX, "tex");
     NX_BUILD_FS(g->p_glyph, NX_GLSL_FS_GLYPH, "glyph");
     NX_BUILD(g->p_comp, NX_GLSL_FS_COMP, "comp");
+    NX_BUILD(g->p_present, NX_GLSL_FS_PRESENT, "present");
     NX_BUILD(g->p_blit, NX_GLSL_FS_BLIT, "blit");
 #undef NX_BUILD_FS
 #undef NX_BUILD
@@ -2016,6 +2042,9 @@ cleanup:
 
 /* ------------------------------------------------------------------ 表面 API（neox_gl.h） */
 
+static void gl_surface_release_color(neox_gl_surface *surface);
+static int gl_surface_alloc_color(neox_gl_surface *surface, uint32_t w, uint32_t h);
+
 neox_result neox_gl_surface_create(neox_device *dev,
                                    uint32_t width, uint32_t height,
                                    neox_gl_surface **out_surface)
@@ -2037,34 +2066,14 @@ neox_result neox_gl_surface_create(neox_device *dev,
     if (!s) NX_ERR(ctx, "surface allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
     memset(s, 0, sizeof(*s));
     s->dev = dev;
-    s->w = width;
-    s->h = height;
-    glGenTextures(1, &s->tex);
-    glBindTexture(GL_TEXTURE_2D, s->tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)width, (GLsizei)height, 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    glGenFramebuffers(1, &s->fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, s->fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_2D, s->tex, 0);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE ||
-        glGetError() != GL_NO_ERROR) {
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glDeleteFramebuffers(1, &s->fbo);
-        glDeleteTextures(1, &s->tex);
+    if (!gl_surface_alloc_color(s, width, height)) {
         nx_free(ctx, s, sizeof(neox_gl_surface), 16);
         NX_ERR(ctx, "GL surface framebuffer incomplete", NEOX_ERROR_BACKEND);
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     ns = (neox_gl_surface **)nx_array_grow(ctx, g->surfs, sizeof(void *),
                                            &g->capsurfs, g->nsurfs + 1);
     if (!ns) {
-        glDeleteFramebuffers(1, &s->fbo);
-        glDeleteTextures(1, &s->tex);
+        gl_surface_release_color(s);
         nx_free(ctx, s, sizeof(neox_gl_surface), 16);
         NX_ERR(ctx, "surface registry allocation failed",
                NEOX_ERROR_OUT_OF_MEMORY);
@@ -2075,6 +2084,40 @@ neox_result neox_gl_surface_create(neox_device *dev,
     return NEOX_OK;
 }
 
+static void gl_surface_release_color(neox_gl_surface *surface)
+{
+    if (surface->fbo) glDeleteFramebuffers(1, &surface->fbo);
+    if (surface->tex) glDeleteTextures(1, &surface->tex);
+    surface->fbo = 0;
+    surface->tex = 0;
+}
+
+static int gl_surface_alloc_color(neox_gl_surface *surface, uint32_t w, uint32_t h)
+{
+    glGenTextures(1, &surface->tex);
+    glBindTexture(GL_TEXTURE_2D, surface->tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenFramebuffers(1, &surface->fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, surface->fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, surface->tex, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE ||
+        glGetError() != GL_NO_ERROR) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        gl_surface_release_color(surface);
+        return 0;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    surface->w = w;
+    surface->h = h;
+    return 1;
+}
+
 void neox_gl_surface_destroy(neox_device *dev, neox_gl_surface *surface)
 {
     nx_gl_dev *g;
@@ -2082,10 +2125,13 @@ void neox_gl_surface_destroy(neox_device *dev, neox_gl_surface *surface)
     if (!dev || !surface) return;
     g = (nx_gl_dev *)dev->bstate;
     if (!g) return;
-    if (gl_make_current(g)) {
-        glDeleteFramebuffers(1, &surface->fbo);
-        glDeleteTextures(1, &surface->tex);
-    }
+    if (gl_make_current(g))
+        gl_surface_release_color(surface);
+    if (g->ctx && surface->win_egl)
+        nx_gl_ctx_window_destroy(g->ctx, surface->win_egl);
+    if (surface->presented)
+        nx_free(dev->ctx, surface->presented,
+                (size_t)surface->w * surface->h * 4, 16);
     for (i = 0; i < g->nsurfs; i++) {
         if (g->surfs[i] == surface) {
             g->surfs[i] = g->surfs[g->nsurfs - 1];
@@ -2113,6 +2159,199 @@ neox_result neox_gl_surface_read_pixels(neox_gl_surface *surface,
             return NEOX_ERROR_BACKEND;
         }
     }
+    return NEOX_OK;
+}
+
+static neox_result gl_surface_track(neox_device *dev, neox_gl_surface *s)
+{
+    neox_context *ctx = dev->ctx;
+    nx_gl_dev *g = (nx_gl_dev *)dev->bstate;
+    neox_gl_surface **ns =
+        (neox_gl_surface **)nx_array_grow(ctx, g->surfs, sizeof(void *),
+                                          &g->capsurfs, g->nsurfs + 1);
+    if (!ns) return NEOX_ERROR_OUT_OF_MEMORY;
+    g->surfs = ns;
+    g->surfs[g->nsurfs++] = s;
+    return NEOX_OK;
+}
+
+neox_result neox_gl_surface_create_window(neox_device *dev,
+                                          const neox_gl_window_desc *desc,
+                                          neox_gl_surface **out_surface)
+{
+    neox_context *ctx;
+    nx_gl_dev *g;
+    neox_gl_surface *s;
+    neox_result tr;
+    if (!dev || !desc || !out_surface) return NEOX_ERROR_INVALID_ARGUMENT;
+    *out_surface = NULL;
+    ctx = dev->ctx;
+    if (desc->struct_size != (uint32_t)sizeof(*desc) ||
+        desc->magic != NEOX_GL_WINSURF_MAGIC)
+        NX_ERR(ctx, "neox_gl_window_desc version mismatch",
+               NEOX_ERROR_INVALID_ARGUMENT);
+    if (!desc->native_window)
+        NX_ERR(ctx, "window surface requires a native window",
+               NEOX_ERROR_INVALID_ARGUMENT);
+    if (dev->kind != NEOX_BACKEND_GPU) return NEOX_ERROR_INVALID_ARGUMENT;
+    g = (nx_gl_dev *)dev->bstate;
+    if (!g || !nx_gl_ctx_can_window(g->ctx))
+        NX_ERR(ctx, "GL device was not created on a window display",
+               NEOX_ERROR_UNSUPPORTED);
+    if (desc->width == 0 || desc->height == 0 ||
+        desc->width > g->max_tex || desc->height > g->max_tex)
+        NX_ERR(ctx, "invalid window surface size", NEOX_ERROR_INVALID_ARGUMENT);
+    if (!gl_make_current(g))
+        NX_ERR(ctx, "GL: could not make context current", NEOX_ERROR_BACKEND);
+    s = (neox_gl_surface *)nx_alloc(ctx, sizeof(*s), 16);
+    if (!s) NX_ERR(ctx, "surface allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
+    memset(s, 0, sizeof(*s));
+    s->dev = dev;
+    s->native_window = desc->native_window;
+    s->vsync = desc->vsync ? 1 : 0;
+    if (!gl_surface_alloc_color(s, desc->width, desc->height)) {
+        nx_free(ctx, s, sizeof(*s), 16);
+        NX_ERR(ctx, "GL surface framebuffer incomplete", NEOX_ERROR_BACKEND);
+    }
+    s->win_egl = nx_gl_ctx_window_surface(g->ctx, desc->native_window, s->vsync);
+    if (!s->win_egl) {
+        const char *e = nx_gl_ctx_last_error();
+        gl_surface_release_color(s);
+        nx_free(ctx, s, sizeof(*s), 16);
+        NX_ERR(ctx, e ? e : "EGL window surface failed", NEOX_ERROR_BACKEND);
+    }
+    /* 离屏绘制仍绑 FBO；把 current 从窗口表面换回辅助表面。 */
+    if (!nx_gl_ctx_make_current(g->ctx)) {
+        nx_gl_ctx_window_destroy(g->ctx, s->win_egl);
+        gl_surface_release_color(s);
+        nx_free(ctx, s, sizeof(*s), 16);
+        NX_ERR(ctx, "GL: could not restore offscreen current", NEOX_ERROR_BACKEND);
+    }
+    tr = gl_surface_track(dev, s);
+    if (tr != NEOX_OK) {
+        nx_gl_ctx_window_destroy(g->ctx, s->win_egl);
+        gl_surface_release_color(s);
+        nx_free(ctx, s, sizeof(*s), 16);
+        NX_ERR(ctx, "surface registry allocation failed", tr);
+    }
+    *out_surface = s;
+    return NEOX_OK;
+}
+
+neox_result neox_gl_surface_resize(neox_gl_surface *surface,
+                                   uint32_t width, uint32_t height)
+{
+    nx_gl_dev *g;
+    neox_context *ctx;
+    void *win;
+    if (!surface || !surface->dev) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (width == surface->w && height == surface->h) return NEOX_OK;
+    g = (nx_gl_dev *)surface->dev->bstate;
+    ctx = surface->dev->ctx;
+    if (!g) return NEOX_ERROR_BACKEND;
+    if (width == 0 || height == 0 || width > g->max_tex || height > g->max_tex)
+        NX_ERR(ctx, "invalid window surface size", NEOX_ERROR_INVALID_ARGUMENT);
+    if (!gl_make_current(g))
+        NX_ERR(ctx, "GL: could not make context current", NEOX_ERROR_BACKEND);
+    gl_surface_release_color(surface);
+    if (surface->presented) {
+        nx_free(ctx, surface->presented, (size_t)surface->w * surface->h * 4, 16);
+        surface->presented = NULL;
+    }
+    if (!gl_surface_alloc_color(surface, width, height))
+        NX_ERR(ctx, "GL surface resize failed", NEOX_ERROR_BACKEND);
+    if (!surface->win_egl) return NEOX_OK;
+    win = surface->native_window;
+    nx_gl_ctx_window_destroy(g->ctx, surface->win_egl);
+    surface->win_egl = nx_gl_ctx_window_surface(g->ctx, win, surface->vsync);
+    if (!nx_gl_ctx_make_current(g->ctx))
+        NX_ERR(ctx, "GL: could not restore offscreen current", NEOX_ERROR_BACKEND);
+    if (!surface->win_egl) {
+        const char *e = nx_gl_ctx_last_error();
+        NX_ERR(ctx, e ? e : "EGL window surface resize failed", NEOX_ERROR_BACKEND);
+    }
+    return NEOX_OK;
+}
+
+neox_result neox_gl_surface_present(neox_gl_surface *surface)
+{
+    nx_gl_dev *g;
+    neox_context *ctx;
+    uint32_t w, h, y;
+    uint8_t *raw, *dst;
+    float v[6];
+    if (!surface || !surface->dev) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (!surface->win_egl) return NEOX_ERROR_UNSUPPORTED;
+    g = (nx_gl_dev *)surface->dev->bstate;
+    ctx = surface->dev->ctx;
+    if (!g || !g->p_present.id) return NEOX_ERROR_BACKEND;
+    w = surface->w;
+    h = surface->h;
+    if (!nx_gl_ctx_window_make_current(g->ctx, surface->win_egl))
+        NX_ERR(ctx, "GL: could not make window current", NEOX_ERROR_BACKEND);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, surface->tex);
+    gl_use(&g->p_present, 2.0f / (float)w, 2.0f / (float)h);
+    glUniform1i(g->p_present.u_tex, 0);
+    glUniform1f(g->p_present.u_ss, (GLfloat)h);
+    v[0] = 0.0f; v[1] = 0.0f;
+    v[2] = 2.0f * (float)w; v[3] = 0.0f;
+    v[4] = 0.0f; v[5] = 2.0f * (float)h;
+    gl_draw(g, v, 3);
+    raw = (uint8_t *)nx_alloc(ctx, (size_t)w * h * 4, 16);
+    dst = (uint8_t *)nx_alloc(ctx, (size_t)w * h * 4, 16);
+    if (!raw || !dst) {
+        if (raw) nx_free(ctx, raw, (size_t)w * h * 4, 16);
+        if (dst) nx_free(ctx, dst, (size_t)w * h * 4, 16);
+        NX_ERR(ctx, "present readback allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
+    }
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, raw);
+    if (glGetError() != GL_NO_ERROR) {
+        nx_free(ctx, raw, (size_t)w * h * 4, 16);
+        nx_free(ctx, dst, (size_t)w * h * 4, 16);
+        NX_ERR(ctx, "GL window readback failed", NEOX_ERROR_BACKEND);
+    }
+    /* glReadPixels 底行在前；翻转成左上原点，与表面 read_pixels 同向。 */
+    for (y = 0; y < h; y++)
+        memcpy(dst + (size_t)y * w * 4,
+               raw + (size_t)(h - 1 - y) * w * 4,
+               (size_t)w * 4);
+    nx_free(ctx, raw, (size_t)w * h * 4, 16);
+    if (surface->presented)
+        nx_free(ctx, surface->presented, (size_t)w * h * 4, 16);
+    surface->presented = dst;
+    glFinish();
+    nx_gl_ctx_window_swap(g->ctx, surface->win_egl);
+    if (!nx_gl_ctx_make_current(g->ctx))
+        NX_ERR(ctx, "GL: could not restore offscreen current", NEOX_ERROR_BACKEND);
+    return NEOX_OK;
+}
+
+neox_result neox_gl_surface_read_presented(neox_gl_surface *surface,
+                                           uint8_t *out_pixels)
+{
+    if (!surface || !out_pixels) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (!surface->presented) return NEOX_ERROR_UNSUPPORTED;
+    memcpy(out_pixels, surface->presented, (size_t)surface->w * surface->h * 4);
+    return NEOX_OK;
+}
+
+neox_result neox_gl_device_native_visual(neox_device *dev, uint32_t *out_visual_id)
+{
+    nx_gl_dev *g;
+    unsigned long id = 0;
+    if (!dev || !out_visual_id) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (dev->kind != NEOX_BACKEND_GPU) return NEOX_ERROR_INVALID_ARGUMENT;
+    g = (nx_gl_dev *)dev->bstate;
+    if (!g || !nx_gl_ctx_native_visual(g->ctx, &id))
+        return NEOX_ERROR_UNSUPPORTED;
+    *out_visual_id = (uint32_t)id;
     return NEOX_OK;
 }
 

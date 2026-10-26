@@ -9,9 +9,9 @@
 **目标**：NeoX 在 Linux（x86_64 / aarch64）上完成构建、测试全绿，且 GL 后端
 与 Soft 后端通过跨后端一致性测试（§9 容差内，预期逐位一致——见 §5 风险）。
 
-**非目标（本期不做，平台胶水层职责，后续单独立项）**：
+**非目标（离屏 GL 移植本身不做）**：
 
-- 窗口系统呈现（X11/Wayland surface、交换链、vsync）；
+- 窗口系统呈现。已另立胶水层，见 [linux-present.md](linux-present.md)；
 - DMA-BUF / GBM 零拷贝互操作；
 - fontconfig 字体发现（NeoX-Text v0 只接受显式字体路径/内存缓冲）。
 
@@ -166,7 +166,8 @@ SKIP。另有 `gpu_consistency_nodual`（`NEOX_GL_FORCE_NO_DUAL=1`）。
   dual-source 输出改为 `layout(location = 0, index = 1)`：`location = 1`
   在 Mesa 上是第二条颜色附件，进不了混合单元。这是全平台 shader 文本变更。
 - `shared_context` 仍是 `void*`：macOS 为 `CGLContextObj`，Linux 为
-  `EGLContext`。结构体布局未改。
+  `EGLContext`。窗口呈现在结构体末尾追加了 `native_display` /
+  `native_kind`（见 linux-present.md）；为零时与原先的离屏调用相同。
 - 不包含系统 GL/EGL 头，类型与常量在 `gl_api.h` / `gl_ctx_egl.c` 就地定义，
   因此 CI 运行时包不必带 `-dev` 头。
 - 文本测试增加 Linux 字体候选。跨平台不与 macOS 黄金图比较。

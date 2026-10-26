@@ -25,8 +25,19 @@ int         nx_gl_ctx_make_current(nx_gl_ctx *ctx);
 void       *nx_gl_ctx_get_proc(nx_gl_ctx *ctx, const char *name);
 void        nx_gl_ctx_destroy(nx_gl_ctx *ctx);
 const char *nx_gl_ctx_last_error(void);
-/* 诊断用："cgl" / "egl-surfaceless" / "egl-device" / "egl-default"。 */
-const char *nx_gl_ctx_kind(void);
+/* 诊断用："cgl" / "egl-surfaceless" / "egl-x11" / "egl-wayland" 等。 */
+const char *nx_gl_ctx_kind(const nx_gl_ctx *ctx);
+
+/* 窗口表面。native 由平台编译单元解释（Linux：X11 Window 或 wl_egl_window*）。
+ * 上下文必须建在对应的本地 display 上（neox_gl_device_desc.native_display）。
+ * macOS 恒不支持。失败返回 NULL / 0。 */
+int         nx_gl_ctx_can_window(const nx_gl_ctx *ctx);
+void       *nx_gl_ctx_window_surface(nx_gl_ctx *ctx, void *native_window, int vsync);
+void        nx_gl_ctx_window_destroy(nx_gl_ctx *ctx, void *egl_surface);
+int         nx_gl_ctx_window_make_current(nx_gl_ctx *ctx, void *egl_surface);
+void        nx_gl_ctx_window_swap(nx_gl_ctx *ctx, void *egl_surface);
+/* X11：EGL_NATIVE_VISUAL_ID。没有（Wayland / 离屏 / CGL）返回 0。 */
+int         nx_gl_ctx_native_visual(const nx_gl_ctx *ctx, unsigned long *out_id);
 
 #ifdef __cplusplus
 }

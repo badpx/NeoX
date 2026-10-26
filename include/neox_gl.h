@@ -54,7 +54,15 @@ typedef struct neox_gl_device_desc {
     void *shared_context;   /* 外部上下文，加入其 share group，纹理可跨上下文
                              * 共享。macOS：CGLContextObj。Linux：EGLContext。
                              * NULL = 自建离屏上下文，不加入外部 share group。 */
+    /* 以下字段为零时与只含前三个字段的旧调用完全相同（自建 surfaceless /
+     * CGL 离屏）。非零时 Linux 把上下文建在该本地 display 上，以便创建
+     * EGL window surface。macOS 忽略。 */
+    void *native_display;   /* X11 Display* 或 wl_display*。NULL = 离屏。 */
+    uint32_t native_kind;   /* NEOX_GL_NATIVE_* ；native_display 非空时必填 */
 } neox_gl_device_desc;
+
+#define NEOX_GL_NATIVE_X11      0x58313120u /* 'X11 ' */
+#define NEOX_GL_NATIVE_WAYLAND  0x5741594cu /* 'WAYL' */
 /* 约定：platform_size >= sizeof(neox_gl_device_desc) 且首字段 struct_size
  * 与之一致；platform_size 更大时按前向兼容处理（只用本版前缀字段）。 */
 
@@ -76,6 +84,39 @@ void        neox_gl_surface_destroy(neox_device *dev,
  * 正式读回通道（测试与无窗口环境）；内部先同步再拷贝。 */
 neox_result neox_gl_surface_read_pixels(neox_gl_surface *surface,
                                         uint8_t *out_pixels);
+
+/* ------------------------------------------------------------------ 窗口表面
+ * 仍走同一套离屏 FBO resolve（read_pixels 语义不变）。present 把 resolve
+ * 结果画到 EGL window surface 再交换。native_window 在 X11 上是 Window
+ * 转成的指针，在 Wayland 上是 wl_egl_window*。调用方负责本地窗口的尺寸
+ * 与生命周期；resize 在两次帧之间调用。 */
+
+#define NEOX_GL_WINSURF_MAGIC 0x4e585753u /* 'NXWS' */
+
+typedef struct neox_gl_window_desc {
+    uint32_t struct_size;   /* = sizeof(neox_gl_window_desc) */
+    uint32_t magic;         /* = NEOX_GL_WINSURF_MAGIC */
+    void *native_window;
+    uint32_t width, height; /* 帧缓冲像素 */
+    int vsync;              /* 非 0：请求 eglSwapInterval(1)，失败不视为错误 */
+} neox_gl_window_desc;
+
+neox_result neox_gl_surface_create_window(neox_device *dev,
+                                          const neox_gl_window_desc *desc,
+                                          neox_gl_surface **out_surface);
+/* 重建颜色附件与 EGL window surface。不得在未 pump 的提交仍引用该表面时调用。 */
+neox_result neox_gl_surface_resize(neox_gl_surface *surface,
+                                   uint32_t width, uint32_t height);
+/* 翻转到窗口并交换缓冲。离屏表面返回 NEOX_ERROR_UNSUPPORTED。 */
+neox_result neox_gl_surface_present(neox_gl_surface *surface);
+/* 最近一次 present 画进窗口的像素（RGBA8，左上原点）。尚未 present 则失败。 */
+neox_result neox_gl_surface_read_presented(neox_gl_surface *surface,
+                                           uint8_t *out_pixels);
+
+/* 窗口设备的 EGL config 对应的本地 visual id（X11）。
+ * 供胶水层把窗口建在同一 visual 上。离屏设备与 Wayland 返回 UNSUPPORTED。 */
+neox_result neox_gl_device_native_visual(neox_device *dev,
+                                         uint32_t *out_visual_id);
 
 #ifdef __cplusplus
 } /* extern "C" */

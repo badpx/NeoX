@@ -17,4 +17,6 @@
   `EGL_PLATFORM_SURFACELESS_MESA`，回退 device 与 `eglGetDisplay`，
   surfaceless make-current 失败再用 1×1 PBuffer。GLX 未做。dual-source
   探测失败或 `NEOX_GL_FORCE_NO_DUAL` 时走与 Soft 同式的 ping-pong。
-  窗口呈现、GBM/DMA-BUF、fontconfig 仍不在本后端范围。
+  窗口呈现不在本后端里实现：Linux 上屏是独立胶水层（`neox_present.h`，
+  Wayland 优先、X11 回退，运行期 dlopen），GL 执行器只增加 EGL window
+  surface 的交换。GBM/DMA-BUF 与 fontconfig 仍不在本后端范围。

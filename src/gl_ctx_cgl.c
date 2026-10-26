@@ -27,7 +27,52 @@ struct nx_gl_ctx {
 static const char *g_err;
 
 const char *nx_gl_ctx_last_error(void) { return g_err; }
-const char *nx_gl_ctx_kind(void) { return "cgl"; }
+const char *nx_gl_ctx_kind(const nx_gl_ctx *ctx)
+{
+    (void)ctx;
+    return "cgl";
+}
+
+int nx_gl_ctx_can_window(const nx_gl_ctx *ctx)
+{
+    (void)ctx;
+    return 0;
+}
+
+void *nx_gl_ctx_window_surface(nx_gl_ctx *ctx, void *native_window, int vsync)
+{
+    (void)ctx;
+    (void)native_window;
+    (void)vsync;
+    g_err = "CGL: window surfaces are not supported";
+    return NULL;
+}
+
+void nx_gl_ctx_window_destroy(nx_gl_ctx *ctx, void *egl_surface)
+{
+    (void)ctx;
+    (void)egl_surface;
+}
+
+int nx_gl_ctx_window_make_current(nx_gl_ctx *ctx, void *egl_surface)
+{
+    (void)ctx;
+    (void)egl_surface;
+    return 0;
+}
+
+void nx_gl_ctx_window_swap(nx_gl_ctx *ctx, void *egl_surface)
+{
+    (void)ctx;
+    (void)egl_surface;
+}
+
+int nx_gl_ctx_native_visual(const nx_gl_ctx *ctx, unsigned long *out_id)
+{
+    (void)ctx;
+    (void)out_id;
+    return 0;
+}
 
 nx_gl_ctx *nx_gl_ctx_create(const neox_gl_device_desc *desc)
 {

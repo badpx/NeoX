@@ -61,3 +61,49 @@ jobs:
           NEOX_REQUIRE_GL: "1"
           NEOX_GL_LOG: "1"
         run: ctest --test-dir build --output-on-failure
+
+  ubuntu-present:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install EGL, X11, Wayland, Xvfb and a headless compositor
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dri xvfb weston
+          sudo apt-get install -y libegl1 libegl-mesa0 || sudo apt-get install -y libegl1-mesa
+      - name: Configure
+        run: cmake -S . -B build -DNEOX_BACKEND_GL=ON -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build
+      - name: X11 window (Xvfb)
+        env:
+          NEOX_REQUIRE_PRESENT: "1"
+          NEOX_REQUIRE_GL: "1"
+          NEOX_PRESENT_BACKEND: x11
+          NEOX_PRESENT_FRAMES: "2"
+          NEOX_PRESENT_GPU: "1"
+        run: xvfb-run -a -s "-screen 0 1280x1024x24" ctest --test-dir build --output-on-failure -R 'present|ex05'
+      - name: Wayland window (weston headless)
+        env:
+          NEOX_REQUIRE_PRESENT: "1"
+          NEOX_REQUIRE_GL: "1"
+          NEOX_PRESENT_BACKEND: wayland
+          NEOX_PRESENT_FRAMES: "2"
+          NEOX_PRESENT_GPU: "1"
+        run: |
+          set -euo pipefail
+          rt="$(mktemp -d)"
+          chmod 700 "$rt"
+          export XDG_RUNTIME_DIR="$rt"
+          export WAYLAND_DISPLAY=neox-wl
+          weston --backend=headless --socket=neox-wl --width=1280 --height=1024 > "$rt/weston.log" 2>&1 &
+          echo $! > "$rt/pid"
+          trap 'kill "$(cat "$rt/pid")" 2>/dev/null || true' EXIT
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+            if [ -S "$rt/neox-wl" ]; then
+              break
+            fi
+            sleep 0.2
+          done
+          test -S "$rt/neox-wl"
+          ctest --test-dir build --output-on-failure -R 'present|ex05'

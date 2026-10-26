@@ -41,6 +41,7 @@ typedef void         (*nx_egl_fn)(void);
 #define EGL_OPENGL_API                      0x30A2
 #define EGL_OPENGL_BIT                      0x0008
 #define EGL_PBUFFER_BIT                     0x0001
+#define EGL_WINDOW_BIT                      0x0004
 #define EGL_ALPHA_SIZE                      0x3021
 #define EGL_BLUE_SIZE                       0x3022
 #define EGL_GREEN_SIZE                      0x3023
@@ -56,6 +57,8 @@ typedef void         (*nx_egl_fn)(void);
 #define EGL_CONTEXT_OPENGL_PROFILE_MASK     0x30FD
 #define EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT 0x00000001
 #define EGL_PLATFORM_DEVICE_EXT             0x313F
+#define EGL_PLATFORM_X11_KHR                0x31D5
+#define EGL_PLATFORM_WAYLAND_KHR            0x31D8
 #define EGL_PLATFORM_SURFACELESS_MESA       0x31DD
 
 typedef EGLBoolean (*PFN_eglInitialize)(EGLDisplay, EGLint *, EGLint *);
@@ -73,15 +76,34 @@ typedef EGLDisplay (*PFN_eglGetDisplay)(void *);
 typedef const char *(*PFN_eglQueryString)(EGLDisplay, EGLint);
 typedef EGLSurface (*PFN_eglCreatePbufferSurface)(EGLDisplay, EGLConfig,
                                                   const EGLint *);
+typedef EGLSurface (*PFN_eglCreateWindowSurface)(EGLDisplay, EGLConfig, void *,
+                                                 const EGLint *);
 typedef EGLBoolean (*PFN_eglDestroySurface)(EGLDisplay, EGLSurface);
+typedef EGLBoolean (*PFN_eglSwapBuffers)(EGLDisplay, EGLSurface);
+typedef EGLBoolean (*PFN_eglSwapInterval)(EGLDisplay, EGLint);
 typedef nx_egl_fn  (*PFN_eglGetProcAddress)(const char *);
 typedef EGLDisplay (*PFN_eglGetPlatformDisplay)(EGLenum, void *, const EGLAttrib *);
 typedef EGLBoolean (*PFN_eglQueryDevicesEXT)(EGLint, EGLDeviceEXT *, EGLint *);
+typedef EGLBoolean (*PFN_eglGetConfigAttrib)(EGLDisplay, EGLConfig, EGLint, EGLint *);
 
 struct nx_gl_ctx {
+    EGLDisplay dpy;
     EGLContext ctx;
-    EGLSurface surface; /* EGL_NO_SURFACE：surfaceless */
+    EGLSurface surface; /* 离屏 current 用的 NO_SURFACE 或 1×1 PBuffer */
+    EGLConfig win_cfg;
+    int native;         /* 1：独立于进程级 surfaceless display */
+    int can_window;
+    const char *kind;
 };
+
+#define NX_NATIVE_MAX 4
+struct nx_native_dpy {
+    EGLDisplay dpy;
+    void *native;
+    uint32_t kind;
+    int refs;
+};
+static struct nx_native_dpy g_native[NX_NATIVE_MAX];
 
 static void *g_lib;
 static EGLDisplay g_dpy;
@@ -102,11 +124,18 @@ static PFN_eglMakeCurrent          p_makeCurrent;
 static PFN_eglGetError             p_getError;
 static PFN_eglQueryString          p_queryString;
 static PFN_eglCreatePbufferSurface p_createPbuffer;
+static PFN_eglCreateWindowSurface  p_createWindow;
 static PFN_eglDestroySurface       p_destroySurface;
+static PFN_eglSwapBuffers          p_swapBuffers;
+static PFN_eglSwapInterval         p_swapInterval;
 static PFN_eglGetPlatformDisplay   p_getPlatformDisplay;
+static PFN_eglGetConfigAttrib      p_getConfigAttrib;
 
 const char *nx_gl_ctx_last_error(void) { return g_err; }
-const char *nx_gl_ctx_kind(void) { return g_kind; }
+const char *nx_gl_ctx_kind(const nx_gl_ctx *ctx)
+{
+    return (ctx && ctx->kind) ? ctx->kind : g_kind;
+}
 
 static void set_err(const char *msg) { g_err = msg; }
 
@@ -161,14 +190,19 @@ static int load_lib(void)
     NX_DLSYM(p_getError, PFN_eglGetError, "eglGetError");
     NX_DLSYM(p_queryString, PFN_eglQueryString, "eglQueryString");
     NX_DLSYM(p_createPbuffer, PFN_eglCreatePbufferSurface, "eglCreatePbufferSurface");
+    NX_DLSYM(p_createWindow, PFN_eglCreateWindowSurface, "eglCreateWindowSurface");
     NX_DLSYM(p_destroySurface, PFN_eglDestroySurface, "eglDestroySurface");
+    NX_DLSYM(p_swapBuffers, PFN_eglSwapBuffers, "eglSwapBuffers");
+    NX_DLSYM(p_swapInterval, PFN_eglSwapInterval, "eglSwapInterval");
     if (!p_getProc || !p_getDisplay || !p_initialize || !p_terminate ||
         !p_bindAPI || !p_chooseConfig || !p_createContext || !p_destroyContext ||
-        !p_makeCurrent || !p_getError || !p_createPbuffer || !p_destroySurface) {
+        !p_makeCurrent || !p_getError || !p_createPbuffer || !p_destroySurface ||
+        !p_createWindow || !p_swapBuffers) {
         set_err("EGL: libEGL is missing a required entry point");
         return 0;
     }
     NX_DLSYM(p_getPlatformDisplay, PFN_eglGetPlatformDisplay, "eglGetPlatformDisplay");
+    NX_DLSYM(p_getConfigAttrib, PFN_eglGetConfigAttrib, "eglGetConfigAttrib");
     if (!p_getPlatformDisplay) {
         nx_egl_fn raw = p_getProc("eglGetPlatformDisplay");
         union { nx_egl_fn fn; PFN_eglGetPlatformDisplay plat; } u;
@@ -241,12 +275,11 @@ static int ensure_display(void)
     return 0;
 }
 
-static int choose_config(int want_pbuffer, EGLConfig *out)
+static int choose_config(EGLDisplay dpy, int mode, EGLConfig *out)
 {
-    /* eglChooseConfig 未写 EGL_SURFACE_TYPE 时默认要求 WINDOW_BIT。
-     * Mesa surfaceless 的 config 只有 PBUFFER（且带 EGL_OPENGL_BIT），
-     * 默认匹配会得到 0 个。显式要 0：不要求任何 surface 位。渲染目标是
-     * 自有 FBO，配合 EGL_KHR_surfaceless_context 用 EGL_NO_SURFACE。 */
+    /* mode 0：不要求 surface 位。eglChooseConfig 缺省是 WINDOW_BIT，
+     * Mesa surfaceless 的 config 只有 PBUFFER，不显式写会选到 0 个。
+     * mode 1：PBuffer。mode 2：窗口。 */
     const EGLint plain[] = {
         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
@@ -259,8 +292,26 @@ static int choose_config(int want_pbuffer, EGLConfig *out)
         EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
         EGL_NONE
     };
+    const EGLint win[] = {
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_NONE
+    };
+    /* 窗口 config 上 NO_SURFACE 失败时，上下文必须跟后来的 window surface
+     * 用同一份 config，所以 PBuffer 回退仍要求 WINDOW_BIT。 */
+    const EGLint winpbuf[] = {
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
+        EGL_NONE
+    };
+    const EGLint *attr = plain;
+    if (mode == 1) attr = pbuf;
+    else if (mode == 2) attr = win;
+    else if (mode == 3) attr = winpbuf;
     EGLint n = 0;
-    if (!p_chooseConfig(g_dpy, want_pbuffer ? pbuf : plain, out, 1, &n) || n < 1)
+    if (!p_chooseConfig(dpy, attr, out, 1, &n) || n < 1)
         return 0;
     return 1;
 }
@@ -272,81 +323,232 @@ static const EGLint g_ctx_attribs[] = {
     EGL_NONE
 };
 
-static void drop_ctx(EGLContext ctx, EGLSurface surf)
+static void drop_ctx(EGLDisplay dpy, EGLContext ctx, EGLSurface surf)
 {
-    p_makeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    if (surf != EGL_NO_SURFACE) p_destroySurface(g_dpy, surf);
-    if (ctx != EGL_NO_CONTEXT) p_destroyContext(g_dpy, ctx);
+    p_makeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (surf != EGL_NO_SURFACE) p_destroySurface(dpy, surf);
+    if (ctx != EGL_NO_CONTEXT) p_destroyContext(dpy, ctx);
+}
+
+static void native_release(EGLDisplay dpy)
+{
+    int i;
+    for (i = 0; i < NX_NATIVE_MAX; i++) {
+        if (g_native[i].dpy != dpy) continue;
+        if (g_native[i].refs > 0 && --g_native[i].refs == 0) {
+            p_terminate(dpy);
+            g_native[i].dpy = EGL_NO_DISPLAY;
+            g_native[i].native = NULL;
+            g_native[i].kind = 0;
+        }
+        return;
+    }
+}
+
+static EGLDisplay native_acquire(uint32_t kind, void *native)
+{
+    EGLenum plat;
+    EGLDisplay dpy;
+    int i, free_slot = -1;
+    if (kind == NEOX_GL_NATIVE_X11) plat = EGL_PLATFORM_X11_KHR;
+    else if (kind == NEOX_GL_NATIVE_WAYLAND) plat = EGL_PLATFORM_WAYLAND_KHR;
+    else {
+        set_err("EGL: unknown native display kind");
+        return EGL_NO_DISPLAY;
+    }
+    if (!p_getPlatformDisplay) {
+        set_err("EGL: eglGetPlatformDisplay is required for window displays");
+        return EGL_NO_DISPLAY;
+    }
+    for (i = 0; i < NX_NATIVE_MAX; i++) {
+        if (g_native[i].refs > 0 && g_native[i].native == native &&
+            g_native[i].kind == kind) {
+            g_native[i].refs++;
+            return g_native[i].dpy;
+        }
+        if (g_native[i].refs == 0 && free_slot < 0) free_slot = i;
+    }
+    if (free_slot < 0) {
+        set_err("EGL: too many native displays");
+        return EGL_NO_DISPLAY;
+    }
+    dpy = p_getPlatformDisplay(plat, native, NULL);
+    if (!try_init_display(dpy)) {
+        set_err_egl("EGL: native display init failed");
+        return EGL_NO_DISPLAY;
+    }
+    g_native[free_slot].dpy = dpy;
+    g_native[free_slot].native = native;
+    g_native[free_slot].kind = kind;
+    g_native[free_slot].refs = 1;
+    return dpy;
+}
+
+static int make_current_or_pbuffer(EGLDisplay dpy, EGLContext *glctx,
+                                   EGLContext share, EGLSurface *surf,
+                                   EGLConfig *cfg, int window_cfg)
+{
+    *surf = EGL_NO_SURFACE;
+    if (!choose_config(dpy, window_cfg ? 2 : 0, cfg)) {
+        set_err(window_cfg ? "EGL: no windowed OpenGL config"
+                           : "EGL: no desktop OpenGL config");
+        return 0;
+    }
+    *glctx = p_createContext(dpy, *cfg, share, g_ctx_attribs);
+    if (*glctx == EGL_NO_CONTEXT) {
+        set_err_egl("EGL: OpenGL 4.1 Core context creation failed");
+        return 0;
+    }
+    if (p_makeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, *glctx))
+        return 1;
+    /* 这个 config 不接受 NO_SURFACE：换成 1×1 PBuffer 重建。 */
+    drop_ctx(dpy, *glctx, EGL_NO_SURFACE);
+    *glctx = EGL_NO_CONTEXT;
+    if (!choose_config(dpy, window_cfg ? 3 : 1, cfg)) {
+        set_err("EGL: make-current failed and no pbuffer config");
+        return 0;
+    }
+    {
+        const EGLint sattr[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+        *surf = p_createPbuffer(dpy, *cfg, sattr);
+    }
+    if (*surf == EGL_NO_SURFACE) {
+        set_err_egl("EGL: pbuffer surface failed");
+        return 0;
+    }
+    *glctx = p_createContext(dpy, *cfg, share, g_ctx_attribs);
+    if (*glctx == EGL_NO_CONTEXT ||
+        !p_makeCurrent(dpy, *surf, *surf, *glctx)) {
+        drop_ctx(dpy, *glctx, *surf);
+        *glctx = EGL_NO_CONTEXT;
+        *surf = EGL_NO_SURFACE;
+        set_err_egl("EGL: could not make context current");
+        return 0;
+    }
+    return 1;
 }
 
 nx_gl_ctx *nx_gl_ctx_create(const neox_gl_device_desc *desc)
 {
-    EGLConfig cfg;
+    EGLConfig cfg = NULL;
     EGLContext share;
-    EGLContext glctx;
+    EGLContext glctx = EGL_NO_CONTEXT;
     EGLSurface surf = EGL_NO_SURFACE;
+    EGLDisplay dpy;
     nx_gl_ctx *out;
+    int native = 0;
+    const char *kind = "egl-surfaceless";
 
     g_err = NULL;
-    if (!load_lib() || !ensure_display()) return NULL;
+    if (!load_lib()) return NULL;
     if (!p_bindAPI(EGL_OPENGL_API)) {
         set_err_egl("EGL: eglBindAPI(OpenGL) failed");
         return NULL;
     }
     share = (desc && desc->shared_context) ? (EGLContext)desc->shared_context
                                             : EGL_NO_CONTEXT;
-    if (!choose_config(0, &cfg)) {
-        set_err("EGL: no desktop OpenGL config");
-        return NULL;
-    }
-    glctx = p_createContext(g_dpy, cfg, share, g_ctx_attribs);
-    if (glctx == EGL_NO_CONTEXT) {
-        set_err_egl("EGL: OpenGL 4.1 Core context creation failed");
-        return NULL;
-    }
-    if (!p_makeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, glctx)) {
-        /* surfaceless 不被这个 config 接受：换成 PBuffer 重建。 */
-        drop_ctx(glctx, EGL_NO_SURFACE);
-        glctx = EGL_NO_CONTEXT;
-        if (!choose_config(1, &cfg)) {
-            set_err("EGL: surfaceless make-current failed and no pbuffer config");
+    if (desc && desc->native_display) {
+        dpy = native_acquire(desc->native_kind, desc->native_display);
+        if (dpy == EGL_NO_DISPLAY) return NULL;
+        native = 1;
+        kind = desc->native_kind == NEOX_GL_NATIVE_WAYLAND ? "egl-wayland"
+                                                           : "egl-x11";
+        if (!make_current_or_pbuffer(dpy, &glctx, share, &surf, &cfg, 1)) {
+            native_release(dpy);
             return NULL;
         }
-        {
-            const EGLint sattr[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
-            surf = p_createPbuffer(g_dpy, cfg, sattr);
-        }
-        if (surf == EGL_NO_SURFACE) {
-            set_err_egl("EGL: pbuffer surface failed");
+    } else {
+        if (!ensure_display()) return NULL;
+        dpy = g_dpy;
+        kind = g_kind;
+        if (!make_current_or_pbuffer(dpy, &glctx, share, &surf, &cfg, 0))
             return NULL;
-        }
-        glctx = p_createContext(g_dpy, cfg, share, g_ctx_attribs);
-        if (glctx == EGL_NO_CONTEXT ||
-            !p_makeCurrent(g_dpy, surf, surf, glctx)) {
-            drop_ctx(glctx, surf);
-            set_err_egl("EGL: could not make context current");
-            return NULL;
-        }
     }
 
     out = (nx_gl_ctx *)calloc(1, sizeof(*out));
     if (!out) {
-        drop_ctx(glctx, surf);
+        drop_ctx(dpy, glctx, surf);
+        if (native) native_release(dpy);
         set_err("EGL: out of memory");
         return NULL;
     }
+    out->dpy = dpy;
     out->ctx = glctx;
     out->surface = surf;
-    g_refs++;
+    out->win_cfg = native ? cfg : NULL;
+    out->native = native;
+    out->can_window = native ? 1 : 0;
+    out->kind = kind;
+    if (!native) g_refs++;
     return out;
 }
 
 int nx_gl_ctx_make_current(nx_gl_ctx *ctx)
 {
     EGLSurface s;
-    if (!ctx || ctx->ctx == EGL_NO_CONTEXT || g_dpy == EGL_NO_DISPLAY) return 0;
+    if (!ctx || ctx->ctx == EGL_NO_CONTEXT || ctx->dpy == EGL_NO_DISPLAY) return 0;
     s = ctx->surface;
-    return p_makeCurrent(g_dpy, s, s, ctx->ctx) == EGL_TRUE;
+    return p_makeCurrent(ctx->dpy, s, s, ctx->ctx) == EGL_TRUE;
+}
+
+int nx_gl_ctx_can_window(const nx_gl_ctx *ctx)
+{
+    return ctx && ctx->can_window && ctx->win_cfg;
+}
+
+void *nx_gl_ctx_window_surface(nx_gl_ctx *ctx, void *native_window, int vsync)
+{
+    EGLSurface s;
+    const EGLint attr[] = { EGL_NONE };
+    if (!nx_gl_ctx_can_window(ctx) || !native_window || !p_createWindow) {
+        set_err("EGL: this context has no window display");
+        return NULL;
+    }
+    s = p_createWindow(ctx->dpy, ctx->win_cfg, native_window, attr);
+    if (s == EGL_NO_SURFACE) {
+        set_err_egl("EGL: window surface failed");
+        return NULL;
+    }
+    if (!p_makeCurrent(ctx->dpy, s, s, ctx->ctx)) {
+        p_destroySurface(ctx->dpy, s);
+        set_err_egl("EGL: could not make window surface current");
+        return NULL;
+    }
+    /* 交换间隔失败（Xvfb、部分驱动）不让窗口表面作废。 */
+    if (p_swapInterval)
+        (void)p_swapInterval(ctx->dpy, vsync ? 1 : 0);
+    return s;
+}
+
+void nx_gl_ctx_window_destroy(nx_gl_ctx *ctx, void *egl_surface)
+{
+    if (!ctx || !egl_surface || !p_destroySurface) return;
+    if (ctx->dpy != EGL_NO_DISPLAY)
+        p_destroySurface(ctx->dpy, (EGLSurface)egl_surface);
+}
+
+int nx_gl_ctx_window_make_current(nx_gl_ctx *ctx, void *egl_surface)
+{
+    if (!ctx || !egl_surface) return 0;
+    return p_makeCurrent(ctx->dpy, (EGLSurface)egl_surface,
+                         (EGLSurface)egl_surface, ctx->ctx) == EGL_TRUE;
+}
+
+void nx_gl_ctx_window_swap(nx_gl_ctx *ctx, void *egl_surface)
+{
+    if (!ctx || !egl_surface || !p_swapBuffers) return;
+    (void)p_swapBuffers(ctx->dpy, (EGLSurface)egl_surface);
+}
+
+int nx_gl_ctx_native_visual(const nx_gl_ctx *ctx, unsigned long *out_id)
+{
+    EGLint id = 0;
+    if (!ctx || !ctx->win_cfg || !out_id || !p_getConfigAttrib) return 0;
+    /* EGL_NATIVE_VISUAL_ID。Wayland 上通常为 0。 */
+    if (!p_getConfigAttrib(ctx->dpy, ctx->win_cfg, 0x302E, &id) || id == 0)
+        return 0;
+    *out_id = (unsigned long)id;
+    return 1;
 }
 
 void *nx_gl_ctx_get_proc(nx_gl_ctx *ctx, const char *name)
@@ -364,10 +566,18 @@ void *nx_gl_ctx_get_proc(nx_gl_ctx *ctx, const char *name)
 
 void nx_gl_ctx_destroy(nx_gl_ctx *ctx)
 {
+    EGLDisplay dpy;
+    int native;
     if (!ctx) return;
-    if (g_dpy != EGL_NO_DISPLAY)
-        drop_ctx(ctx->ctx, ctx->surface);
+    dpy = ctx->dpy;
+    native = ctx->native;
+    if (dpy != EGL_NO_DISPLAY)
+        drop_ctx(dpy, ctx->ctx, ctx->surface);
     free(ctx);
+    if (native) {
+        native_release(dpy);
+        return;
+    }
     if (g_refs > 0 && --g_refs == 0 && g_dpy != EGL_NO_DISPLAY) {
         p_terminate(g_dpy);
         g_dpy = EGL_NO_DISPLAY;

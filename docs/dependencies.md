@@ -28,6 +28,7 @@ Mesa llvmpipe，包名见下）。找不到库时 GL 设备创建返回
 | OpenGL.framework | GL 后端（已 deprecated，链路验证定位） | 仅 macOS，`-DNEOX_BACKEND_GL=OFF` 可裁 |
 | Metal / Foundation / QuartzCore.framework | Metal 后端 | 仅 macOS，`-DNEOX_BACKEND_METAL=OFF` 可裁 |
 | libEGL.so.1（运行期 dlopen，非链接依赖） | Linux GL 后端 | Ubuntu 24.04：`libegl1` + `libegl-mesa0`（旧版本包名 `libegl1-mesa`）。驱动：`libgl1-mesa-dri`（`swrast_dri.so` = llvmpipe） |
+| libX11.so.6、libwayland-client.so.0、libwayland-egl.so.1（运行期 dlopen，非链接依赖） | Linux 窗口呈现 | 包：`libx11-6`、`libwayland-client0`、`libwayland-egl1`。缺库时只有窗口创建失败，离屏 Soft/GL 仍可运行。不需要 `-dev` 头。构建开关：`-DNEOX_PRESENT=OFF` |
 | fonts-dejavu-core（仅测试/示例） | NeoX-Text 集成 | `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf`；CJK 可选文泉驿 / Noto |
 
 ## 仅工具链

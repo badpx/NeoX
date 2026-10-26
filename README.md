@@ -50,7 +50,7 @@ sudo apt-get install -y libegl1 libegl-mesa0 || sudo apt-get install -y libegl1-
 
 - macOS 上默认启用 GL 与 Metal（`NEOX_BACKEND_GL` / `NEOX_BACKEND_METAL`）。Linux 默认启用 GL（EGL surfaceless + GL 4.1 Core），Metal 关闭。`-DNEOX_BACKEND_GL=OFF` 仍可只编 Soft。
 - 示例：`build/ex01_scene`（Soft）、`build/ex02_gpuscene`（GL）、`build/ex03_mtlscene`（Metal，仅 macOS）、`build/ex04_text`（中英混排；Linux 需上述字体或文泉驿）输出 BMP 到 build 目录。`NEOX_GL_LOG=1` 打印 EGL 路径与渲染器；`NEOX_GL_FORCE_NO_DUAL=1` 强制关掉 dual-source，走 ping-pong 回退。
-- 方案与已知限制见 [docs/linux-port.md](docs/linux-port.md)。
+- 方案与已知限制见 [docs/linux-port.md](docs/linux-port.md)。Mesa llvmpipe 25.2.8 上 Soft 与 GL 的一致性场景（含关掉 dual-source 的回退路径）实测逐位一致。
 
 ## 许可证
 

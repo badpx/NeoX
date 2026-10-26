@@ -223,5 +223,6 @@ out = cov · blend(src, dst) + (1 − cov) · dst
 > **移植性注记**：当前 GL 验证后端用 dual-source blending
 > （`ARB_blend_func_extended`）表达 §6.1 插值语义下的
 > SRC/SRC_IN/SRC_OUT/DST_ATOP 四模式；GLES3 无此 core 特性、WebGL2 完全
-> 没有，未来这两类后端须回退到 ping-pong 手动混合。这属于 ER 自由，
-> SD 不受影响，但选型与工作预估时应知悉。
+> 没有。Linux EGL 后端已按此回退：探测失败或设置 `NEOX_GL_FORCE_NO_DUAL`
+> 时改走 ping-pong 手动混合（与 Metal 同款）。这属于 ER 自由，
+> SD 不受影响。

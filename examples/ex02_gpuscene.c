@@ -355,6 +355,7 @@ int main(void)
         dd.platform = &gld;
         dd.platform_size = sizeof(gld);
         if (neox_device_create(ctx, &dd, &gpu) != NEOX_OK) {
+            const char *req = getenv("NEOX_REQUIRE_GL");
             printf("GL backend unavailable (%s) — 仅输出 Soft 黄金图\n",
                    neox_get_error_detail(ctx));
             if (write_bmp("ex02_gpuscene.bmp", soft_px, W, H) != 0)
@@ -362,7 +363,7 @@ int main(void)
             printf("wrote ex02_gpuscene.bmp (soft only)\n");
             neox_device_destroy(soft);
             neox_context_destroy(ctx);
-            return 0;
+            return (req && req[0]) ? 1 : 0;
         }
     }
     {

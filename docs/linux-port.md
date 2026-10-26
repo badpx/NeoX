@@ -1,6 +1,6 @@
 # NeoX Linux 平台适配方案
 
-> 状态：待实施（跟踪：GitHub issue #1）
+> 状态：已实施（跟踪：GitHub issue #1；issue 由仓库主人关闭）
 > 读者：在 Linux 环境执行适配的开发者。本文假设你已通读
 > [design-v0.2.md](design-v0.2.md) 与 [adr/0004-gl-validation-backend.md](adr/0004-gl-validation-backend.md)。
 
@@ -91,11 +91,11 @@ macOS 下保持静态链接现状（`gl_load` 不参与编译或为空实现）�
 （与 NeoX 的"后端可独立链接"策略一致；找不到库 = 后端不可用 =
 `NEOX_ERROR_BACKEND`，进程仍可跑 Soft）。
 
-### W4：备选 GLX 路径
+### W4：备选 GLX 路径（本期不做）
 
-仅在 EGL surfaceless/device 不可用时需要（老 Mesa）。Xvfb + GLX 1.4 创建
-3.2+ core 上下文（`glXCreateContextAttribsARB`）。若 CI 实测 EGL 路径稳定，
-本项可砍掉。
+仅在 EGL surfaceless/device/default 都不可用时才需要（老 Mesa）。本机与
+CI 的 Mesa 提供 `EGL_MESA_platform_surfaceless`，无头、不需要 Xvfb。
+三条 EGL 路径都失败时后端返回 `NEOX_ERROR_BACKEND`，不隐式拉起 GLX。
 
 ### W5：CMake 接线
 
@@ -105,9 +105,10 @@ if(UNIX AND NOT APPLE)
 endif()
 ```
 
-- 源文件选择：`APPLE → gl_ctx_cgl.c`，`LINUX → gl_ctx_egl.c + gl_load.c`；
+- 源文件选择：`APPLE → gl.c + gl_ctx_cgl.c`，`UNIX → gl.c + gl_ctx_egl.c + gl_load.c`；
 - 链接 `${CMAKE_DL_LIBS}`（dlopen）；
-- gl.c 保持零改动（W1 完成后）。
+- gl.c 不再含上下文创建。dual-source 的 `layout(location=1)` 已改为
+  `layout(location=0, index=1)`，否则 Mesa 不把 SRC1 送进混合单元。
 
 ### W6：测试与 CI
 
@@ -115,15 +116,10 @@ endif()
   GL 环境）；**验收标准 = Soft↔GL 25+1 场景逐位一致**（同 macOS）；
 - CI 新增 `ubuntu-gl` job：
 
-```yaml
-ubuntu-gl:
-  runs-on: ubuntu-latest
-  steps:
-    - uses: actions/checkout@v4
-    - run: sudo apt-get update && sudo apt-get install -y libegl1-mesa libgl1-mesa-dri
-    - run: cmake -S . -B build -DNEOX_BACKEND_GL=ON && cmake --build build
-    - run: ctest --test-dir build --output-on-failure
-```
+Ubuntu 24.04 上 `libegl1-mesa` 已拆成 `libegl1` + `libegl-mesa0`。CI 先装
+`libgl1-mesa-dri fonts-dejavu-core`，再 `libegl1 libegl-mesa0`，失败才回退
+`libegl1-mesa`。job 设置 `NEOX_REQUIRE_GL=1`，避免 GL 创建失败被测试当成
+SKIP。另有 `gpu_consistency_nodual`（`NEOX_GL_FORCE_NO_DUAL=1`）。
 
 - NeoX-Text 集成测试字体：ubuntu CI 安装 `fonts-dejavu-core`，测试按
   候选路径列表探测（`/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` 等），
@@ -149,12 +145,24 @@ ubuntu-gl:
 5. **确定性边界**：stb_truetype 光栅化同版本同平台确定，跨平台不保证——
    文本一致性测试只在同机三后端间比较，不与 macOS 黄金图比对。
 
-## 6. 执行清单（可勾选）
+## 6. 执行清单
 
-- [ ] W1 `src/gl_ctx.h` + `gl_ctx_cgl.c` 拆分，macOS 侧测试无回归
-- [ ] W2 `src/gl_load.c` 函数清单与加载器
-- [ ] W3 `gl_ctx_egl.c`（surfaceless → device 探测链）
-- [ ] W5 CMake 接线 + dlopen 链接
-- [ ] W6 本机 `ctest` 全绿（Soft↔GL 一致性非 SKIP 通过）
-- [ ] W6 CI `ubuntu-gl` job 绿灯
-- [ ] 关闭 issue #1，ADR 0004 补充 Linux 落地记录
+- [x] W1 `src/gl_ctx.h` + `gl_ctx_cgl.c` 拆分（macOS 回归需在 macOS CI 上确认）
+- [x] W2 `src/gl_load.c` 函数清单与加载器
+- [x] W3 `gl_ctx_egl.c`（surfaceless → device → default，PBuffer 回退）
+- [x] W4 砍掉：EGL 三条路径足够，失败即 `NEOX_ERROR_BACKEND`
+- [x] W5 CMake 接线 + `${CMAKE_DL_LIBS}`
+- [ ] W6 本机 `ctest` 全绿（Soft↔GL 一致性非 SKIP 通过）——见 PR 自测记录
+- [x] W6 CI `ubuntu-gl` job 已加入（绿灯以 GitHub Actions 为准）
+- [x] ADR 0004 已补 Linux 落地记录。issue #1 不在本变更中关闭。
+
+## 7. 实施说明
+
+- `gl.c` 不再创建上下文，也不出现 CGL/EGL 分支。fill/tex/glyph 的
+  dual-source 输出改为 `layout(location = 0, index = 1)`：`location = 1`
+  在 Mesa 上是第二条颜色附件，进不了混合单元。这是全平台 shader 文本变更。
+- `shared_context` 仍是 `void*`：macOS 为 `CGLContextObj`，Linux 为
+  `EGLContext`。结构体布局未改。
+- 不包含系统 GL/EGL 头，类型与常量在 `gl_api.h` / `gl_ctx_egl.c` 就地定义，
+  因此 CI 运行时包不必带 `-dev` 头。
+- 文本测试增加 Linux 字体候选。跨平台不与 macOS 黄金图比较。

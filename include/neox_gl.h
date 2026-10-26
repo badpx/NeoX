@@ -2,7 +2,9 @@
  * neox_gl.h — NeoX GPU（OpenGL）后端公开接口
  *
  * 状态：随 NEOX_API_DRAFT，后端专属扩展。仅当构建启用 NEOX_BACKEND_GL
- * （macOS：CGL 离屏上下文 + OpenGL 4.1 Core Profile）时可用。
+ * 时可用。macOS 用 CGL 离屏上下文；Linux 用 EGL surfaceless（失败再试
+ * device / default display，必要时 1×1 PBuffer）+ OpenGL 4.1 Core。
+ * Linux 上 libEGL.so.1 运行期 dlopen，不在链接期硬依赖。
  *
  * 用法（platform_size 协商见 neox_device_desc 约定）：
  *   neox_gl_device_desc gld;
@@ -49,8 +51,9 @@ extern "C" {
 typedef struct neox_gl_device_desc {
     uint32_t struct_size;   /* 必须 = sizeof(neox_gl_device_desc)（版本协商） */
     uint32_t magic;         /* 必须 = NEOX_GL_DESC_MAGIC（后端区分） */
-    void *shared_context;   /* 外部 CGLContextObj：新上下文加入其 share group，
-                             * 纹理对象可跨上下文共享。NULL = 自建离屏上下文。 */
+    void *shared_context;   /* 外部上下文，加入其 share group，纹理可跨上下文
+                             * 共享。macOS：CGLContextObj。Linux：EGLContext。
+                             * NULL = 自建离屏上下文，不加入外部 share group。 */
 } neox_gl_device_desc;
 /* 约定：platform_size >= sizeof(neox_gl_device_desc) 且首字段 struct_size
  * 与之一致；platform_size 更大时按前向兼容处理（只用本版前缀字段）。 */

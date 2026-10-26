@@ -5,6 +5,7 @@
  *       30px 大标题片段。图集为各后端独立的确定性 A8 图集（同内容）。
  * 输出（构建目录）：ex04_text.bmp（Soft）+ ex04_compare.bmp（三联并排）。
  * 字体缺失时打印提示并以 0 退出（示例冒烟测试不失败）。
+ * NEOX_REQUIRE_GL 非空时，缺字体或 GL 画不出来改为失败。
  * =========================================================================*/
 #include "neox.h"
 #include "neox_text.h"
@@ -126,7 +127,12 @@ int main(void)
         { "/System/Library/Fonts/STHeiti Medium.ttc", 0 },
         { "/System/Library/Fonts/Songti.ttc", 0 },
         { "/System/Library/Fonts/Supplemental/Arial.ttf", 0 },
-        { "/System/Library/Fonts/Helvetica.ttc", 0 }
+        { "/System/Library/Fonts/Helvetica.ttc", 0 },
+        { "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0 },
+        { "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0 },
+        { "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 0 },
+        { "/usr/share/fonts/truetype/freefont/FreeSans.ttf", 0 },
+        { "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0 }
     };
     uint32_t ci;
 
@@ -143,10 +149,11 @@ int main(void)
             font = NULL;
     }
     if (!font) {
+        const char *req = getenv("NEOX_REQUIRE_GL");
         printf("no system font found — ex04 skipped\n");
         nx_text_context_destroy(tctx);
         neox_context_destroy(ctx);
-        return 0;
+        return (req && req[0]) ? 1 : 0;
     }
 
     memset(&dd, 0, sizeof(dd));
@@ -282,6 +289,19 @@ int main(void)
     }
 #endif
 
+    {
+        const char *req = getenv("NEOX_REQUIRE_GL");
+        if (req && req[0] && !have_gl) {
+            fprintf(stderr, "NEOX_REQUIRE_GL: GL text render unavailable\n");
+            if (mtl) neox_device_destroy(mtl);
+            if (gl) neox_device_destroy(gl);
+            if (soft) neox_device_destroy(soft);
+            nx_font_destroy(font);
+            nx_text_context_destroy(tctx);
+            neox_context_destroy(ctx);
+            return 1;
+        }
+    }
     if (write_bmp("ex04_text.bmp", img_soft, W, H) != 0) return 1;
     printf("wrote ex04_text.bmp\n");
     for (y = 0; y < H; y++) {

@@ -7,8 +7,11 @@
  *   - 排版（mock 字体后端注入）：kerning、拉丁按词贪心断行、CJK 逐字断行、
  *     '\n' 强制断行、三对齐、度量包围盒
  *   - 动态图集：缓存命中/未命中统计、size 量化、容量满错误、flush 语义
- *   - 集成（macOS 系统字体存在时；否则 SKIP 段落）：度量合理性 +
- *     中英混排经 nx_text_draw 在 Soft/GL/Metal 三后端逐位一致
+ *   - 集成（系统字体存在时；否则 SKIP 段落）：度量合理性 +
+ *     中英混排经 nx_text_draw 在同机已启用后端间逐位一致。
+ *     候选含 macOS 系统字体与 Linux 常见路径（DejaVu / Liberation /
+ *     FreeSans / Noto CJK / 文泉驿）。NEOX_REQUIRE_GL 非空且 GL 创建失败
+ *     时本段失败，而不是静默跳过 GL 比较。
  * =========================================================================*/
 #include "neox.h"
 #include "neox_text.h"
@@ -623,7 +626,12 @@ static void test_integration_real_fonts(void)
         { "/System/Library/Fonts/PingFang.ttc", 0 },
         { "/System/Library/Fonts/STHeiti Medium.ttc", 0 },
         { "/System/Library/Fonts/Songti.ttc", 0 },
-        { "/System/Library/Fonts/Supplemental/Arial.ttf", 0 }
+        { "/System/Library/Fonts/Supplemental/Arial.ttf", 0 },
+        { "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0 },
+        { "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0 },
+        { "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 0 },
+        { "/usr/share/fonts/truetype/freefont/FreeSans.ttf", 0 },
+        { "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0 }
     };
     static const char *sample = "Hello, NeoX! \xE4\xB8\xAD\xE6\x96\x87\xE6\xB8\xAC\xE8\xAF\x95 123\nSecond line.";
     nx_font *f = NULL;
@@ -667,6 +675,10 @@ static void test_integration_real_fonts(void)
         CHECK_RES(neox_device_create(g_ctx, &dd, &soft), NEOX_OK);
         have_gl = create_gpu_device(g_tctx, 0, &gl) == 0;
         have_mtl = create_gpu_device(g_tctx, 1, &mtl) == 0;
+        {
+            const char *req = getenv("NEOX_REQUIRE_GL");
+            if (req && req[0]) CHECK(have_gl);
+        }
 
         memset(&rd, 0, sizeof(rd));
         rd.dev = soft;

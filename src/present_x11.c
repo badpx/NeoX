@@ -685,7 +685,8 @@ const nx_win_vt *nx_present_x11_vt(void)
         x11_read_screen,
         x11_gl_display,
         x11_gl_window,
-        x11_use_visual
+        x11_use_visual,
+        NULL /* native GPU bridge */
     };
     return &vt;
 }

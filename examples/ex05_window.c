@@ -1,7 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 /* ex05_window — 上屏示例。
  * NEOX_PRESENT_FRAMES=N 画 N 帧后退出（第 1 帧存 before，然后放大，第 2 帧存 after）。
- * 不设置时一直画到关窗或 Escape。NEOX_PRESENT_GPU=1 用 GL，否则 Soft。
+ * 不设置时一直画到关窗或 Escape。NEOX_PRESENT_GPU=1 用原生 GPU（Linux GL / macOS Metal），否则 Soft。
  * 没有显示时打印 skip 并返回 0；NEOX_REQUIRE_PRESENT 则返回 1。 */
 #include "neox.h"
 #include "neox_present.h"
@@ -72,12 +72,16 @@ static neox_path make_rect(neox_device *dev, float x, float y, float w, float h)
 
 static int have_display(void)
 {
+#ifdef __APPLE__
+    return 1; /* Cocoa open reports an unavailable window server. */
+#else
     const char *force = getenv("NEOX_PRESENT_BACKEND");
     const char *xd = getenv("DISPLAY");
     const char *wd = getenv("WAYLAND_DISPLAY");
     if (force && strcmp(force, "wayland") == 0) return wd && wd[0];
     if (force && strcmp(force, "x11") == 0) return xd && xd[0];
     return (xd && xd[0]) || (wd && wd[0]);
+#endif
 }
 
 static int frame(neox_window *win, neox_device *dev, const char *bmp)
@@ -156,6 +160,11 @@ int main(void)
     int n = 0;
     int gpu = getenv("NEOX_PRESENT_GPU") && getenv("NEOX_PRESENT_GPU")[0] == '1';
     char before[160], after[160];
+#ifdef __APPLE__
+    const char *gpu_name = "metal";
+#else
+    const char *gpu_name = "gl";
+#endif
     if (!have_display()) {
         if (getenv("NEOX_REQUIRE_PRESENT")) {
             fprintf(stderr, "ex05: display required\n");
@@ -182,15 +191,18 @@ int main(void)
         return 1;
     }
     be = neox_window_backend_name(win);
-    snprintf(before, sizeof before, "ex05_%s_%s_before.bmp", be, gpu ? "gl" : "soft");
-    snprintf(after, sizeof after, "ex05_%s_%s_after.bmp", be, gpu ? "gl" : "soft");
+    snprintf(before, sizeof before, "ex05_%s_%s_before.bmp", be, gpu ? gpu_name : "soft");
+    snprintf(after, sizeof after, "ex05_%s_%s_after.bmp", be, gpu ? gpu_name : "soft");
     if (neox_window_create_device(win, ctx, kind, &dev) != NEOX_OK) {
         fprintf(stderr, "ex05 device: %s\n", neox_window_last_error());
         neox_window_destroy(win);
         neox_context_destroy(ctx);
+#ifdef __APPLE__
+        if(gpu && !getenv("NEOX_REQUIRE_METAL") && !getenv("NEOX_REQUIRE_PRESENT"))return 77;
+#endif
         return 1;
     }
-    printf("ex05 %s on %s\n", gpu ? "gl" : "soft", be);
+    printf("ex05 %s on %s\n", gpu ? gpu_name : "soft", be);
     for (;;) {
         const char *shot = NULL;
         neox_window_event ev;

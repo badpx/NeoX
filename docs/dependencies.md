@@ -4,7 +4,7 @@
 核心级依赖目标数量为零——当前核心（`src/core.c`、`geom.c`、`soft.c`、
 `gl.c`、`metal.mm`）除 C/POSIX 标准库与平台系统库外无第三方依赖。
 macOS 链接 OpenGL.framework / Metal.framework / Foundation.framework /
-QuartzCore.framework。Linux GL 后端不在链接期依赖 libEGL：运行期
+QuartzCore.framework；可选 Cocoa 窗口模块另链接 AppKit.framework。Linux GL 后端不在链接期依赖 libEGL：运行期
 `dlopen("libEGL.so.1")`，并需要一份桌面 GL 4.1 驱动（CI 与无头环境用
 Mesa llvmpipe，包名见下）。找不到库时 GL 设备创建返回
 `NEOX_ERROR_BACKEND`，Soft 仍可运行。
@@ -33,13 +33,14 @@ Mesa llvmpipe，包名见下）。找不到库时 GL 设备创建返回
 |---|---|---|
 | OpenGL.framework | GL 后端（已 deprecated，链路验证定位） | 仅 macOS，`-DNEOX_BACKEND_GL=OFF` 可裁 |
 | Metal / Foundation / QuartzCore.framework | Metal 后端 | 仅 macOS，`-DNEOX_BACKEND_METAL=OFF` 可裁 |
+| AppKit / QuartzCore.framework | macOS 窗口呈现（Soft + Metal） | 仅 `neox_present` 链接；`-DNEOX_PRESENT=OFF` 可裁，核心不引入 AppKit |
 | libEGL.so.1（运行期 dlopen，非链接依赖） | Linux GL 后端 | Ubuntu 24.04：`libegl1` + `libegl-mesa0`（旧版本包名 `libegl1-mesa`）。驱动：`libgl1-mesa-dri`（`swrast_dri.so` = llvmpipe） |
 | libX11.so.6、libwayland-client.so.0、libwayland-egl.so.1（运行期 dlopen，非链接依赖） | Linux 窗口呈现 | 包：`libx11-6`、`libwayland-client0`、`libwayland-egl1`。缺库时只有窗口创建失败，离屏 Soft/GL 仍可运行。不需要 `-dev` 头。构建开关：`-DNEOX_PRESENT=OFF` |
 | fonts-dejavu-core（仅测试/示例） | NeoX-Text 集成 | `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf`；CJK 可选文泉驿 / Noto |
 
 ## 仅工具链
 
-CMake ≥ 3.16、C11 编译器、macOS 上 ObjC++ 编译器（Metal 后端）。
+CMake ≥ 3.16、C11 编译器、macOS 上 ObjC++ 编译器（Metal 后端或 Cocoa 窗口模块）。
 
 
 模块边界：Text 只包含私有 `src/module.h` 的不透明分配/归属服务和检查过的

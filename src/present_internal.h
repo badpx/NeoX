@@ -1,4 +1,4 @@
-/* 呈现层内部。只被 present.c / present_x11.c / present_wl.c 包含。 */
+/* 呈现层内部。平台适配器与 present.c 共享，不对外安装。 */
 #ifndef NEOX_PRESENT_INTERNAL_H
 #define NEOX_PRESENT_INTERNAL_H
 
@@ -10,6 +10,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define NX_WIN_Q 32
 
@@ -27,7 +31,7 @@ struct neox_window {
     int close_latched;
     neox_context *ctx;
     neox_device *dev;
-    int is_gl;
+    int is_gpu;
     uint8_t *soft_px;
     size_t soft_bytes;
     uint32_t soft_w, soft_h; /* dimensions of the acquired CPU target */
@@ -40,6 +44,15 @@ struct neox_window {
     int qh, qt, qn;
 };
 
+typedef struct nx_win_gpu_vt {
+    neox_result (*create)(neox_window *, neox_context *, neox_device **);
+    neox_result (*acquire)(neox_window *, neox_target_desc *);
+    neox_result (*present)(neox_window *);
+    neox_result (*request_readback)(neox_window *);
+    neox_result (*read)(neox_window *, uint8_t *);
+    void (*detach)(neox_window *);
+} nx_win_gpu_vt;
+
 struct nx_win_vt {
     const char *name;
     neox_result (*open)(neox_window *w);
@@ -48,13 +61,14 @@ struct nx_win_vt {
     int (*poll)(neox_window *w);
     neox_result (*resize)(neox_window *w, uint32_t pt_w, uint32_t pt_h);
     neox_result (*present_soft)(neox_window *w);
-    /* 读屏幕。失败返回非 0，调用方改用 GL presented 缓冲。 */
+    /* 读屏幕。失败返回非 0，调用方改用当前 CPU 帧缓冲。 */
     int (*read_screen)(neox_window *w, uint8_t *out);
     void (*gl_display)(neox_window *w, void **display, uint32_t *kind);
     /* 当前像素尺寸的本地窗口（X Window 或 wl_egl_window*）。 */
     void *(*gl_window)(neox_window *w);
     /* X11：若 visual_id 与当前窗口不同，按 EGL config 重建窗口。可为 NULL。 */
     void (*use_visual)(neox_window *w, unsigned long visual_id);
+    const nx_win_gpu_vt *gpu; /* optional native presentation bridge */
 };
 
 /* Checked geometry publication. Failure leaves all metrics unchanged. */
@@ -66,4 +80,8 @@ void nx_win_set_error(const char *msg);
 const nx_win_vt *nx_present_x11_vt(void);
 const nx_win_vt *nx_present_wl_vt(void);
 
+const nx_win_vt *nx_present_cocoa_vt(void);
+#ifdef __cplusplus
+}
+#endif
 #endif

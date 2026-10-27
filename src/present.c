@@ -1,8 +1,8 @@
 /* ===========================================================================
- * present.c — 窗口呈现胶水（与 Soft/GL 执行器分开）
+ * present.c — 窗口呈现胶水（与 Soft/GL/Metal 执行器分开）
  *
- * 选择：WAYLAND_DISPLAY 非空时先试 Wayland，失败再回退 X11。
- * NEOX_PRESENT_BACKEND=wayland|x11 强制，不再回退。
+ * macOS 选择 Cocoa；Linux 的选择：WAYLAND_DISPLAY 非空时先试 Wayland，失败再回退 X11。
+ * NEOX_PRESENT_BACKEND=cocoa|wayland|x11 按平台强制，不再回退。
  * 事件队列在这里，平台文件只负责把系统事件推进来。
  * =========================================================================*/
 #include "present_internal.h"
@@ -93,8 +93,10 @@ neox_result neox_window_create(const neox_present_desc *desc, neox_window **out)
 {
     neox_window *w;
     const char *forced = NULL;
+#if !defined(__APPLE__) || defined(NEOX_PRESENT_TEST_ADAPTERS)
     const char *wl_env;
     int try_wl = 0;
+#endif
     neox_result r;
 
     if (out) *out = NULL;
@@ -124,6 +126,19 @@ neox_result neox_window_create(const neox_present_desc *desc, neox_window **out)
     r = nx_win_set_geometry(w, w->pt_w, w->pt_h, w->scale);
     if (r != NEOX_OK) { free(w); return r; }
 
+#if defined(__APPLE__) && !defined(NEOX_PRESENT_TEST_ADAPTERS)
+    if (backend_forced(&forced) && strcmp(forced, "cocoa") != 0) {
+        nx_win_set_error("macOS requires NEOX_PRESENT_BACKEND=cocoa");
+        free(w); return NEOX_ERROR_INVALID_ARGUMENT;
+    }
+    w->vt = nx_present_cocoa_vt();
+    r = w->vt->open(w);
+    if (r != NEOX_OK) {
+        if (w->vt->close) w->vt->close(w);
+        free(w); return r;
+    }
+    *out = w; return NEOX_OK;
+#else
     if (backend_forced(&forced)) {
         if (strcmp(forced, "wayland") == 0) try_wl = 1;
         else if (strcmp(forced, "x11") == 0) try_wl = 0;
@@ -183,6 +198,7 @@ neox_result neox_window_create(const neox_present_desc *desc, neox_window **out)
     }
     *out = w;
     return NEOX_OK;
+#endif
 }
 
 /* The context owns the device. The window may request destruction, and this
@@ -190,7 +206,8 @@ neox_result neox_window_create(const neox_present_desc *desc, neox_window **out)
 static void window_device_detached(void *owner)
 {
     neox_window *win = owner;
-    win->dev = NULL; win->ctx = NULL; win->is_gl = 0;
+    if (win->vt->gpu && win->vt->gpu->detach) win->vt->gpu->detach(win);
+    win->dev = NULL; win->ctx = NULL; win->is_gpu = 0;
     win->soft_w = win->soft_h = 0;
 #if NEOX_ENABLE_GL
     win->gl_surf = NULL; win->gl_native = NULL; win->gl_w = win->gl_h = 0;
@@ -288,11 +305,18 @@ neox_result neox_window_create_device(neox_window *win, neox_context *ctx,
         win->ctx = ctx;
         win->dev = *out_dev;
         win->dev->owner = win; win->dev->owner_detach = window_device_detached;
-        win->is_gl = 0;
+        win->is_gpu = 0;
         return NEOX_OK;
     }
 
     if (backend != NEOX_BACKEND_GPU) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (win->vt->gpu) {
+        r = win->vt->gpu->create(win, ctx, out_dev);
+        if (r != NEOX_OK) return r;
+        win->ctx = ctx; win->dev = *out_dev; win->is_gpu = 1;
+        win->dev->owner = win; win->dev->owner_detach = window_device_detached;
+        return NEOX_OK;
+    }
 #if NEOX_ENABLE_GL
     {
         neox_gl_device_desc gld;
@@ -324,7 +348,7 @@ neox_result neox_window_create_device(neox_window *win, neox_context *ctx,
         win->ctx = ctx;
         win->dev = *out_dev;
         win->dev->owner = win; win->dev->owner_detach = window_device_detached;
-        win->is_gl = 1;
+        win->is_gpu = 1;
         return NEOX_OK;
     }
 #else
@@ -343,7 +367,8 @@ neox_result neox_window_acquire_target(neox_window *win, neox_device *dev,
         return NEOX_ERROR_INVALID_ARGUMENT;
     }
 
-    if (!win->is_gl) {
+    if (win->is_gpu && win->vt->gpu) return win->vt->gpu->acquire(win, out_target);
+    if (!win->is_gpu) {
         size_t n;
         /* Reacquisition clears/reallocates borrowed target storage. Even an
          * unchanged size must not overwrite an active or queued frame. */
@@ -439,7 +464,8 @@ static int soft_target_current(const neox_window *win)
 neox_result neox_window_present(neox_window *win)
 {
     if (!win || !win->dev) return NEOX_ERROR_INVALID_ARGUMENT;
-    if (win->is_gl) {
+    if (win->is_gpu && win->vt->gpu) return win->vt->gpu->present(win);
+    if (win->is_gpu) {
 #if NEOX_ENABLE_GL
         if (!win->gl_surf || win->gl_w != win->px_w || win->gl_h != win->px_h) {
             nx_win_set_error("acquire_target before present and after size changes");
@@ -461,8 +487,9 @@ neox_result neox_window_present(neox_window *win)
 neox_result neox_window_request_readback(neox_window *win)
 {
     if (!win || !win->dev) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (win->is_gpu && win->vt->gpu) return win->vt->gpu->request_readback(win);
 #if NEOX_ENABLE_GL
-    if (win->is_gl) {
+    if (win->is_gpu) {
         if (!win->gl_surf || win->gl_w != win->px_w || win->gl_h != win->px_h)
             return NEOX_ERROR_INVALID_ARGUMENT;
         return neox_gl_surface_request_readback(win->gl_surf);
@@ -474,20 +501,21 @@ neox_result neox_window_request_readback(neox_window *win)
 neox_result neox_window_read_pixels(neox_window *win, uint8_t *out_pixels)
 {
     if (!win || !win->dev || !out_pixels) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (win->is_gpu && win->vt->gpu) return win->vt->gpu->read(win, out_pixels);
 #if NEOX_ENABLE_GL
-    if (win->is_gl) {
+    if (win->is_gpu) {
         if (!win->gl_surf || win->gl_w != win->px_w || win->gl_h != win->px_h)
             return NEOX_ERROR_INVALID_ARGUMENT;
         return neox_gl_surface_read_presented(win->gl_surf, out_pixels);
     }
 #endif
-    if (!win->is_gl && !soft_target_current(win)) {
+    if (!win->is_gpu && !soft_target_current(win)) {
         nx_win_set_error("acquire_target after window size changes");
         return NEOX_ERROR_INVALID_ARGUMENT;
     }
-    if (!win->is_gl && win->vt && win->vt->read_screen && win->vt->read_screen(win,out_pixels)==0)
+    if (!win->is_gpu && win->vt && win->vt->read_screen && win->vt->read_screen(win,out_pixels)==0)
         return NEOX_OK;
-    if (!win->is_gl && win->soft_px) {
+    if (!win->is_gpu && win->soft_px) {
         memcpy(out_pixels, win->soft_px, (size_t)win->px_w * (size_t)win->px_h * 4u);
         return NEOX_OK;
     }

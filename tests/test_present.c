@@ -1,5 +1,5 @@
-/* 窗口呈现：Soft 与 GL 上屏后读回，检查朝向、缩放、resize 和关闭。
- * 没有 DISPLAY / WAYLAND_DISPLAY 时跳过（返回 77），除非 NEOX_REQUIRE_PRESENT。 */
+/* 窗口呈现：Soft 与 GPU 上屏后读回，检查朝向、缩放、resize 和关闭。
+ * Linux 没有 DISPLAY / WAYLAND_DISPLAY 时跳过（返回 77），除非 NEOX_REQUIRE_PRESENT。 */
 #include "neox.h"
 #include "neox_present.h"
 
@@ -24,12 +24,16 @@ static void expect(int cond, const char *msg)
 
 static int have_display(void)
 {
+#ifdef __APPLE__
+    return 1; /* Cocoa open reports an unavailable window server. */
+#else
     const char *force = getenv("NEOX_PRESENT_BACKEND");
     const char *xd = getenv("DISPLAY");
     const char *wd = getenv("WAYLAND_DISPLAY");
     if (force && strcmp(force, "wayland") == 0) return wd && wd[0];
     if (force && strcmp(force, "x11") == 0) return xd && xd[0];
     return (xd && xd[0]) || (wd && wd[0]);
+#endif
 }
 
 static neox_path make_rect(neox_device *dev, float x, float y, float w, float h)
@@ -191,7 +195,7 @@ static void run_backend(neox_context *ctx, neox_backend_kind kind, const char *t
     }
     if (neox_window_create_device(win, ctx, kind, &dev) != NEOX_OK) {
         fprintf(stderr, "%s device: %s\n", tag, neox_window_last_error());
-        if (kind == NEOX_BACKEND_GPU && !getenv("NEOX_REQUIRE_GL")) {
+        if (kind == NEOX_BACKEND_GPU && !getenv("NEOX_REQUIRE_GL") && !getenv("NEOX_REQUIRE_METAL") && !getenv("NEOX_REQUIRE_PRESENT")) {
             printf("%s GPU skipped\n", tag);
             neox_window_destroy(win);
             return;
@@ -288,9 +292,11 @@ int main(void)
 #endif
     run_backend(ctx, NEOX_BACKEND_SOFT, "soft", 64, 48, 1.0f);
     run_backend(ctx, NEOX_BACKEND_SOFT, "soft-hidpi", 30, 24, 2.0f);
+#if (defined(__APPLE__) && NEOX_ENABLE_METAL) || (!defined(__APPLE__) && NEOX_ENABLE_GL)
+    run_backend(ctx, NEOX_BACKEND_GPU, "gpu", 64, 48, 1.0f);
+    run_backend(ctx, NEOX_BACKEND_GPU, "gpu-hidpi", 30, 24, 2.0f);
+#endif
 #if NEOX_ENABLE_GL
-    run_backend(ctx, NEOX_BACKEND_GPU, "gl", 64, 48, 1.0f);
-    run_backend(ctx, NEOX_BACKEND_GPU, "gl-hidpi", 30, 24, 2.0f);
     expect(offscreen_still_works(ctx), "surfaceless GL after window");
 #endif
     neox_context_destroy(ctx);

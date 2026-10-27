@@ -1069,7 +1069,8 @@ const nx_win_vt *nx_present_wl_vt(void)
         NULL, /* 读回走 soft_px 或 GL presented */
         wl_gl_display,
         wl_gl_window,
-        NULL
+        NULL,
+        NULL /* native GPU bridge */
     };
     return &vt;
 }

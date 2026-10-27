@@ -36,6 +36,8 @@
  * =========================================================================*/
 #include "execution.h"
 #include "neox_mtl.h"
+#include "metal_present.h"
+#import <QuartzCore/CAMetalLayer.h>
 
 #import <Metal/Metal.h>
 #import <Foundation/NSString.h>
@@ -358,6 +360,7 @@ typedef struct nx_mtl_dev {
     id<MTLRenderPipelineState> ps_comp[NX_MTL_NMODE];
     id<MTLRenderPipelineState> ps_blit, ps_clamp, ps_plusfill, ps_plusglyph, ps_manual;
     id<MTLRenderPipelineState> ps_manual_glyph;
+    id<MTLRenderPipelineState> ps_present;
     int dual_ok;
     nx_mtl_rt *rts;                 /* 池：层（is_layer=1）与掩码纹理 */
     uint32_t nrts, caprts;
@@ -762,6 +765,7 @@ static void mtl_state_destroy(neox_context *ctx, nx_mtl_dev *g)
     [g->ps_blit release]; [g->ps_clamp release];
     [g->ps_plusfill release]; [g->ps_plusglyph release];
     [g->ps_manual release]; [g->ps_manual_glyph release];
+    [g->ps_present release];
     [g->vs release];
     [g->fs_fill release]; [g->fs_fill_ds release];
     [g->fs_tex release];
@@ -1954,4 +1958,76 @@ const nx_backend *nx_backend_mtl(void)
         mtl_memory_stats
     };
     return &vt;
+}
+
+
+neox_result nx_mtl_present(neox_mtl_surface *surface, void *native_layer, uint8_t *snapshot)
+{
+    if (!surface || !native_layer) return NEOX_ERROR_INVALID_ARGUMENT;
+    neox_device *dev = surface->dev;
+    if (nx_device_check_live(dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
+    if (dev->active_frame || dev->pending_count) return NEOX_ERROR_INVALID_ARGUMENT;
+    nx_mtl_dev *g = (nx_mtl_dev *)dev->bstate;
+    CAMetalLayer *layer = (CAMetalLayer *)native_layer;
+    @autoreleasepool {
+        if (!g->ps_present) {
+            NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                "vertex float4 vp(uint i [[vertex_id]]) { float2 p[3]={float2(-1,-1),float2(3,-1),float2(-1,3)}; return float4(p[i],0,1); }\n"
+                "fragment float4 fp(float4 p [[position]], texture2d<float> t [[texture(0)]]) { return float4(t.read(uint2(p.xy)).rgb,1); }\n";
+            NSError *error = nil;
+            id<MTLLibrary> lib = [g->device newLibraryWithSource:source options:nil error:&error];
+            if (!lib) return NEOX_ERROR_BACKEND;
+            id<MTLFunction> vs = [lib newFunctionWithName:@"vp"], fs = [lib newFunctionWithName:@"fp"];
+            MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+            pd.vertexFunction = vs; pd.fragmentFunction = fs;
+            pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+            g->ps_present = [g->device newRenderPipelineStateWithDescriptor:pd error:&error];
+            [pd release]; [vs release]; [fs release]; [lib release];
+            if (!g->ps_present) return NEOX_ERROR_BACKEND;
+        }
+        layer.device = g->device;
+        layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        layer.framebufferOnly = snapshot ? NO : YES;
+        id<CAMetalDrawable> drawable = [layer nextDrawable];
+        if (!drawable) return NEOX_ERROR_BACKEND; /* occluded/unavailable drawable */
+        if (drawable.texture.width != surface->w || drawable.texture.height != surface->h)
+            return NEOX_ERROR_INVALID_ARGUMENT;
+        id<MTLCommandBuffer> cb = [g->queue commandBuffer];
+        if (!cb) return NEOX_ERROR_OUT_OF_MEMORY;
+        size_t row = ((size_t)surface->w * 4 + 255) & ~(size_t)255;
+        id<MTLBuffer> readback = snapshot ? [g->device newBufferWithLength:row*surface->h options:MTLResourceStorageModeShared] : nil;
+        if (snapshot && !readback) return NEOX_ERROR_OUT_OF_MEMORY;
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = drawable.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
+        if (!enc) { [readback release]; return NEOX_ERROR_BACKEND; }
+        [enc setRenderPipelineState:g->ps_present];
+        [enc setFragmentTexture:surface->tex atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+        if (snapshot) {
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            if (!blit) { [readback release]; return NEOX_ERROR_BACKEND; }
+            [blit copyFromTexture:drawable.texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                sourceSize:MTLSizeMake(surface->w,surface->h,1) toBuffer:readback destinationOffset:0
+                destinationBytesPerRow:row destinationBytesPerImage:row*surface->h];
+            [blit endEncoding];
+        }
+        [cb presentDrawable:drawable]; [cb commit];
+        /* Shared source storage may be updated by the next frame's CPU resolve.
+         * Finish the GPU copy before returning; no implicit CPU pixel readback. */
+        [cb waitUntilCompleted];
+        neox_result r = cb.status == MTLCommandBufferStatusCompleted ? NEOX_OK : NEOX_ERROR_BACKEND;
+        if (r == NEOX_OK && snapshot) {
+            const uint8_t *src = (const uint8_t *)readback.contents;
+            for (uint32_t y=0;y<surface->h;y++) for (uint32_t x=0;x<surface->w;x++) {
+                const uint8_t *p = src+y*row+x*4;
+                uint8_t *q = snapshot+((size_t)y*surface->w+x)*4;
+                q[0]=p[2]; q[1]=p[1]; q[2]=p[0]; q[3]=p[3];
+            }
+        }
+        [readback release]; return r;
+    }
 }

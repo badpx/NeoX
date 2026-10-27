@@ -88,11 +88,11 @@ static void test_resize_buffers(void)
 #if NEOX_ENABLE_GL
     /* A stale GL snapshot may be larger than the caller's new output buffer.
      * Mismatched dimensions must fail before dereferencing the surface. */
-    w->is_gl=1;w->gl_surf=(neox_gl_surface*)(uintptr_t)1;w->gl_w=32;w->gl_h=8;
+    w->is_gpu=1;w->gl_surf=(neox_gl_surface*)(uintptr_t)1;w->gl_w=32;w->gl_h=8;
     CHECK(neox_window_present(w)==NEOX_ERROR_INVALID_ARGUMENT);
     CHECK(neox_window_request_readback(w)==NEOX_ERROR_INVALID_ARGUMENT);
     CHECK(neox_window_read_pixels(w,pixels)==NEOX_ERROR_INVALID_ARGUMENT);
-    w->is_gl=0;w->gl_surf=NULL;
+    w->is_gpu=0;w->gl_surf=NULL;
 #endif
     neox_window_destroy(w);neox_context_destroy(ctx);
 }

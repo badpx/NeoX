@@ -23,5 +23,11 @@ if(NEOX_PRESENT)
   if(NEOX_BUILD_TESTS)
     set_tests_properties(ex05_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
       ENVIRONMENT "NEOX_PRESENT_FRAMES=2")
+    if(APPLE AND NEOX_ENABLE_METAL)
+      add_test(NAME ex05_metal_smoke COMMAND ex05_window)
+      set_tests_properties(ex05_metal_smoke PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        ENVIRONMENT "NEOX_PRESENT_FRAMES=2;NEOX_PRESENT_GPU=1")
+    endif()
   endif()
 endif()

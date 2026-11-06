@@ -373,11 +373,14 @@ neox_result neox_node_append_child(neox_device *dev, neox_node parent,
     p->children = nc;
     if (c->parent != ci) {
         nx_node_slot *op = &((nx_node_slot *)dev->nodes.slots)[c->parent];
-        uint32_t out = 0;
+        uint32_t out = 0, old_parent = c->parent;
         for (i = 0; i < op->child_count; i++)
             if (op->children[i] != ci) op->children[out++] = op->children[i];
         op->child_count = out;
-        node_mark_dirty(dev, c->parent, NX_DIRTY_CHILDREN);
+        node_mark_dirty(dev, old_parent, NX_DIRTY_CHILDREN);
+        /* 评审 4489969077：直接 reparent 时旧祖先的高度也要刷新，否则旧链上
+         * 的 height 继续把已经搬走的子树算进去。 */
+        node_refresh_heights(dev, old_parent);
     }
     p->children[p->child_count++] = ci;
     c->parent = pi;
@@ -441,7 +444,10 @@ neox_result neox_node_remove_from_parent(neox_device *dev, neox_node child)
     {
         uint32_t old_parent = c->parent;
         c->parent = ci;
-        c->height = 0; /* 摘下的子树高度不变，但不再影响旧祖先 */
+        /* 评审 4489969077：摘下的节点仍带着整棵子树，height 必须保留，
+         * 否则之后 append 到别处时深度检查会把整棵子树当成 0 层，允许挂出
+         * 超过 NX_SCENE_MAX_DEPTH 的树、直到渲染才失败。这里只刷新旧祖先
+         * （根为自身，也是 "detached" 的标志）。 */
         node_refresh_heights(dev, old_parent);
     }
     return NEOX_OK;
@@ -560,7 +566,8 @@ static neox_result scene_emit(neox_frame *fr, uint32_t idx, neox_affine parent_c
             clip_idx = (int32_t)p;
             clip_id = n->u.group.clip_id;
         }
-        /* 场景组始终隔离（P1-8）：组 blend 只在 POP 生效。 */
+        /* 组节点与立即模式 push_state 同语义（§7.1）：blend 只在 POP 生效，
+         * 组内子绘制 SRC_OVER。force_isolate=1 只记录来源。 */
         r = nx_emit_push(fr, ctm, n->opacity, n->blend, 0, clip_idx, clip_id, 1);
         if (r != NEOX_OK) return r;
         for (i = 0; i < n->child_count; i++) {

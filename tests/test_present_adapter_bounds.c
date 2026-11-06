@@ -1,5 +1,6 @@
 /* Execute the actual adapter boundary code with no compositor or display.
  * Invalid geometry must return before dispatching to any native API. */
+#define NX_WL_TEST_HOOK 1
 #include "../src/present_wl.c"
 #include "../src/present_x11.c"
 #include <float.h>
@@ -10,6 +11,43 @@ static int mock_resize(void *d,unsigned long w,unsigned int x,unsigned int y)
 { (void)d;(void)w;CHECK(x==65535 && y==1);native_resizes++;return 1; }
 static int mock_sync(void *d,int discard)
 { (void)d;(void)discard;native_syncs++;return 1; }
+struct fake_marshal_rec {
+    void *proxy;
+    uint32_t op;
+    const struct wl_interface *iface;
+    uint32_t ver;
+    void *args[8];
+};
+static struct fake_marshal_rec *g_marshals;
+static void *capture_marshal(void *proxy, uint32_t op,
+                             const struct wl_interface *iface, uint32_t ver,
+                             uint32_t flags, ...)
+{
+    (void)flags;
+    if (g_marshals) {
+        g_marshals->proxy = proxy;
+        g_marshals->op = op;
+        g_marshals->iface = iface;
+        g_marshals->ver = ver;
+    }
+    return (void *)(uintptr_t)0x9000;
+}
+struct fake_listen_rec {
+    void *proxy;
+    void *data;
+};
+static struct fake_listen_rec *g_listens;
+static int capture_listen(void *proxy, void *lis, void *data)
+{
+    if (g_listens) {
+        g_listens->proxy = proxy;
+        g_listens->data = data;
+    }
+    (void)lis;
+    return 0;
+}
+static int stub_flush_ok(void *dpy) { (void)dpy; return 0; }
+static int stub_pending_zero(void *dpy) { (void)dpy; return 0; }
 static int event_left;
 static int mock_pending(void *d) { (void)d;return event_left; }
 static int mock_next(void *d,void *event)
@@ -38,7 +76,9 @@ int main(void)
     w.scale=(float)INT32_MAX;CHECK(shell_scale(&w)==0);
     w.scale=1.5f;CHECK(shell_scale(&w)==2);
     w.scale=0.5f;CHECK(shell_scale(&w)==1);
-    memset(&wl,0,sizeof(wl));wl.win=&w;wl.opened=1;
+    /* surf_ver >= 3（现代合成器）：输出 scale 正常跟随；v<3 的 1 倍约束
+     * 单独在下面验证（评审 4489969163）。 */
+    memset(&wl,0,sizeof(wl));wl.win=&w;wl.opened=1;wl.surf_ver=4;
     /* 输出 scale 只跟随"当前 output"（P1-6）：先登记一个已绑定的 wl_output
      * 槽位，未 enter 之前的第一份 scale 作为窗口初值。 */
     wl.outputs[0]=sentinel;wl.noutputs=1;wl.output_scale=0;
@@ -74,6 +114,109 @@ int main(void)
         on_button(&wl,NULL,0,0,0x111u,0);
         CHECK(wl.buttons==3u);
     }
+    /* 评审 4489969071：wl_compositor 必须按服务端实际版本（上限 5）绑定，
+     * wl_surface 的 enter/leave（v5 事件）才可能注册。旧实现 clamp 到 4，
+     * surf_ver >= 5 永远为假，多输出跟踪接不上。 */
+    {
+        struct fake_marshal_rec rec;
+        PFN_marshal saved_marshal = g_wl.marshal;
+        nx_wl wl2;
+        memset(&wl2, 0, sizeof wl2);
+        memset(&rec, 0, sizeof rec);
+        g_wl.marshal = capture_marshal;
+        g_marshals = &rec;
+        /* 服务端宣告 v7：应绑定到 5（不是 4），并把版本写进 comp_ver。 */
+        on_global(&wl2, (void *)(uintptr_t)0x77, 3, "wl_compositor", 7);
+        g_wl.marshal = saved_marshal;
+        g_marshals = NULL;
+        CHECK(rec.iface == g_wl.compositor && rec.ver == 5);
+        CHECK(wl2.comp_ver == 5);
+        /* v4 服务端：绑定 4，enter/leave 不可用。 */
+        memset(&wl2, 0, sizeof wl2);
+        g_wl.marshal = capture_marshal;
+        g_marshals = &rec;
+        on_global(&wl2, (void *)(uintptr_t)0x77, 3, "wl_compositor", 4);
+        g_wl.marshal = saved_marshal;
+        g_marshals = NULL;
+        CHECK(rec.ver == 4 && wl2.comp_ver == 4);
+        /* 评审 4489969163：v<3 时 resize/输出 scale 更新也强制 1 倍，
+         * 与 wl_open 的初始创建约束一致。 */
+        {
+            neox_window wv;
+            memset(&wl2, 0, sizeof wl2);
+            memset(&wv, 0, sizeof wv);
+            wl2.win = &wv;
+            wl2.opened = 1;
+            wl2.surf_ver = 2;
+            OK(nx_win_set_geometry(&wv, 8, 8, 1));
+            on_out_scale(&wl2, NULL, 3);
+            apply_output_scale(&wl2, 3);
+            CHECK(wv.scale == 1.0f && wv.px_w == 8 && wv.px_h == 8);
+            wl2.surf_ver = 3;
+            apply_output_scale(&wl2, 2);
+            CHECK(wv.scale == 2.0f && wv.px_w == 16 && wv.px_h == 16);
+        }
+    }
+    /* 版本判定本身：只有 >= 5 才注册 enter/leave。 */
+    {
+        CHECK(!nx_wl_surface_enter_ready(4));
+        CHECK(nx_wl_surface_enter_ready(5));
+        CHECK(nx_wl_surface_enter_ready(6));
+        /* 注册入口真正调用 wl_listener 的接线：v4 不注册，v5 注册一次。 */
+        {
+            struct fake_listen_rec lrec;
+            PFN_listen saved_listen = g_wl.listen;
+            nx_wl wl3;
+            memset(&lrec, 0, sizeof lrec);
+            memset(&wl3, 0, sizeof wl3);
+            g_wl.listen = capture_listen;
+            g_listens = &lrec;
+            wl3.surf_ver = 4;
+            CHECK(!nx_wl_register_enter(&wl3, (void *)(uintptr_t)0x11));
+            CHECK(lrec.proxy == NULL && !wl3.surf_enter_ready);
+            wl3.surf_ver = 5;
+            CHECK(nx_wl_register_enter(&wl3, (void *)(uintptr_t)0x11));
+            CHECK(lrec.proxy == (void *)(uintptr_t)0x11 && lrec.data == &wl3);
+            CHECK(wl3.surf_enter_ready);
+            g_wl.listen = saved_listen;
+            g_listens = NULL;
+        }
+    }
+
+    /* 评审 4489969158：两个槽都在合成器手里时，present 必须返回可重试的
+     * BACKEND 错误，且不写任何 busy 槽（P2-2）；连接已死时同样返回失败
+     * 而不是"成功但没上屏"（P1-4）。这里用真实的 wl_present_soft。 */
+    {
+        nx_wl wp;
+        neox_window ww;
+        uint8_t frame[4 * 4 * 4];
+        int k;
+        memset(&wp, 0, sizeof wp);
+        memset(&ww, 0, sizeof ww);
+        memset(frame, 0xff, sizeof frame);
+        /* 挂到已存在的栈上 pool：ensure_pool 发现尺寸一致就直接复用。 */
+        wp.pool = sentinel;
+        wp.map = sentinel;
+        wp.buf_w = 4; wp.buf_h = 4;
+        wp.shm_fd = -1;
+        for (k = 0; k < 2; k++) { wp.busy[k] = 1; wp.bufs[k] = (void *)(uintptr_t)(0x40 + k); }
+        wp.surf_ver = 4;
+        /* 两个槽都 busy 时只 flush+pump：这里给出"无连接"的安全桩。 */
+        g_wl.flush = stub_flush_ok;
+        g_wl.pending = stub_pending_zero;
+        ww.plat = &wp;
+        ww.soft_px = frame;
+        ww.px_w = ww.px_h = 4;
+        ww.pt_w = ww.pt_h = 4;
+        CHECK(wl_present_soft(&ww) == NEOX_ERROR_BACKEND);
+        CHECK(wp.busy[0] && wp.busy[1]);          /* 没有被覆盖 */
+        CHECK(wp.bufs[0] == (void *)(uintptr_t)0x40 && wp.bufs[1] == (void *)(uintptr_t)0x41);
+        /* 连接死亡：同样的错误路径，不再尝试等待。 */
+        wp.dead = 1;
+        CHECK(wl_present_soft(&ww) == NEOX_ERROR_BACKEND);
+        CHECK(wp.busy[0] && wp.busy[1]);
+    }
+
     /* X11 CARD16 boundary and ConfigureNotify's exact physical dimensions. */
     memset(&w,0,sizeof(w));w.plat=&x;w.vt=nx_present_x11_vt();x.win=1;x.dpy=sentinel;
     OK(nx_win_set_geometry(&w,8,8,1));before=w;

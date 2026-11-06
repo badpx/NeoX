@@ -359,6 +359,7 @@ typedef struct nx_wl {
     void *toplevel;
     void *egl_window;
     uint32_t comp_ver, wm_ver, seat_ver, surf_ver;
+    int surf_enter_ready;      /* 已按 v5 注册 enter/leave（评审 4489969071） */
     int output_scale;          /* 当前 output 的整数 scale；0 = 未知（P1-6） */
     void *outputs[NX_WL_OUTPUTS]; /* 绑定的全部 wl_output（P1-6） */
     int output_scales[NX_WL_OUTPUTS];
@@ -366,7 +367,6 @@ typedef struct nx_wl {
     const void *enter_output;  /* wl_surface.enter 的当前 output（v5+） */
     int pointer_on;            /* 指针已进入本 surface */
     float pointer_x, pointer_y;/* 最近一次 enter/motion 的逻辑坐标（P1-2） */
-    int buf_busy_at_present;   /* 上次呈现时两个 slot 都 busy（P2-2） */
     int configured;
     int opened;
     int dead;
@@ -438,6 +438,30 @@ static uint32_t clamp_ver(uint32_t server, uint32_t cap)
     if (server < 1) return 1;
     return server < cap ? server : cap;
 }
+
+/* wl_surface 绑定版本 >= 5 才有 enter/leave 事件（wayland.xml）。 */
+static int nx_wl_surface_enter_ready(uint32_t surf_ver)
+{
+    return surf_ver >= 5;
+}
+
+/* 注册 enter/leave listener；返回 1 = 已注册（绑定版本支持 v5 事件）。 */
+static int nx_wl_register_enter(nx_wl *p, void *surface)
+{
+    static const struct {
+        void (*enter)(void *, void *, void *);
+        void (*leave)(void *, void *, void *);
+    } surf_lis = { on_surf_enter, on_surf_leave };
+    if (!p || !surface || !nx_wl_surface_enter_ready(p->surf_ver)) return 0;
+    g_wl.listen(surface, (void *)&surf_lis, p);
+    p->surf_enter_ready = 1;
+    return 1;
+}
+
+#ifdef NX_WL_TEST_HOOK
+int nx_wl_test_skip_open;
+int nx_wl_test_surf_enter_ready;
+#endif
 
 static int memfd_new(size_t size)
 {
@@ -664,6 +688,10 @@ static void apply_output_scale(nx_wl *p, int factor)
 {
     neox_window_event ev;
     if (!p || !p->win || p->win->scale_locked || !p->opened) return;
+    /* 评审 4489969163：wl_surface v<3 没有 set_buffer_scale，初始创建与
+     * resize/输出 scale 更新必须用同一约束——否则窗口仍会按输出 scale
+     * 放大像素尺寸，缓冲却被合成器再放大一次。 */
+    if (p->surf_ver < 3) factor = 1;
     if (p->win->scale == (float)factor) return;
     if (nx_win_set_geometry(p->win, p->win->pt_w, p->win->pt_h,
                             (float)factor) != NEOX_OK) return;
@@ -966,7 +994,11 @@ static void on_global(void *data, void *registry, uint32_t name,
 {
     nx_wl *p = (nx_wl *)data;
     if (!p->compositor && strcmp(interface, "wl_compositor") == 0) {
-        p->comp_ver = clamp_ver(version, 4);
+        /* wl_surface v5 才有 enter/leave 事件。旧实现把 compositor 绑成
+         * clamp(version, 4)，而 surf_ver 又取 comp_ver，导致 surf_ver >= 5
+         * 永远不成立、listener 永不注册（评审 4489969071）。这里按服务端
+         * 实际支持的版本（上限 5）绑定。 */
+        p->comp_ver = clamp_ver(version, 5);
         p->compositor = g_wl.marshal(registry, 0, g_wl.compositor, p->comp_ver, 0,
                                      name, interface, p->comp_ver, NULL);
     } else if (!p->shm && strcmp(interface, "wl_shm") == 0) {
@@ -1092,7 +1124,6 @@ static neox_result wl_present_soft(neox_window *w)
         nx_win_set_error("Wayland: no software frame");
         return NEOX_ERROR_INVALID_ARGUMENT;
     }
-    p->buf_busy_at_present = 0;
     if (p->dead) {
         nx_win_set_error("Wayland: display connection is gone");
         return NEOX_ERROR_BACKEND;
@@ -1108,7 +1139,6 @@ static neox_result wl_present_soft(neox_window *w)
             if (!p->busy[k]) { slot = k; break; }
     }
     if (slot < 0) {
-        p->buf_busy_at_present = 1;
         if (p->dead) {
             nx_win_set_error("Wayland: display connection is gone");
             return NEOX_ERROR_BACKEND;
@@ -1263,6 +1293,14 @@ static neox_result wl_open(neox_window *w)
         wl_close(w);
         return NEOX_ERROR_BACKEND;
     }
+#ifdef NX_WL_TEST_HOOK
+    /* 单测：跳过真正的 wl_surface 创建（没有合成器），把"注册 listener"的
+     * 决策与调用暴露出来。生产代码不走这里。 */
+    if (nx_wl_test_skip_open) {
+        nx_wl_test_surf_enter_ready = nx_wl_surface_enter_ready(p->comp_ver);
+        return NEOX_OK;
+    }
+#endif
     /* wl_surface 版本决定能否用整数倍缓冲（P2-1）：v<3 没有
      * set_buffer_scale，强制 1 倍——像素尺寸等于逻辑尺寸，缓冲不会被
      * 合成器再放大一次。 */
@@ -1279,13 +1317,9 @@ static neox_result wl_open(neox_window *w)
     }
 
     p->surface = g_wl.marshal(p->compositor, 0, g_wl.surface, p->surf_ver, 0, NULL);
-    if (p->surface && p->surf_ver >= 5) {
-        static const struct {
-            void (*enter)(void *, void *, void *);
-            void (*leave)(void *, void *, void *);
-        } surf_lis = { on_surf_enter, on_surf_leave };
-        g_wl.listen(p->surface, (void *)&surf_lis, p);
-    }
+    /* wl_surface.enter/leave 是 v5 事件：只有绑定的 surface 版本 >= 5 才
+     * 注册（注册即表示客户端愿意接收该版本的事件）。 */
+    (void)nx_wl_register_enter(p, p->surface);
     p->xdg_surface = g_wl.marshal(p->wm, 2, &xdg_surface_interface, p->wm_ver, 0,
                                   NULL, p->surface);
     if (!p->surface || !p->xdg_surface) {

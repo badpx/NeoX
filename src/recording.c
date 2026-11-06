@@ -77,10 +77,10 @@ void nx_commands_free(neox_context *ctx, nx_cmd *cmds, uint32_t n)
     }
 }
 
-/* PUSH：owns_layer 与执行期一致（§7，P1-8）。
- * 立即模式 push_state 的 blend 是「子绘制混合」，只在 opacity<1 或有裁剪时
- * 建隔离层；场景组（force_isolate）始终隔离，组 blend 仅在 POP 组合成，
- * 组内子绘制 SRC_OVER（nx_exec_isolated_blend）。 */
+/* PUSH：owns_layer 与执行期一致（§7 与 §7.1，P1-8）。
+ * 立即模式 push_state 的 blend 是「子绘制混合」（§7.1），只在 opacity<1 或
+ * 有裁剪时建隔离层；场景组（force_isolate）始终隔离，组 blend 仅在 POP
+ * 组合成，组内子绘制 SRC_OVER（nx_exec_isolated_blend）。 */
 static int push_needs_layer(float opacity, int32_t clip_idx, int force_isolate)
 {
     return force_isolate || opacity < 1.0f || clip_idx >= 0;

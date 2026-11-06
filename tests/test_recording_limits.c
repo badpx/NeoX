@@ -118,15 +118,31 @@ int main(void)
     }
     neox_frame_cancel(f);
 
-    /* P1-10：颜色边界拒绝越界 alpha/RGB；Soft 输出量化端仍然钳制。 */
-    OK(neox_frame_begin(dev,&target,&f));
-    paint.color=(neox_color){1,0,0,255.0f};
-    CHECK(neox_draw_path(f,path,&paint)==NEOX_ERROR_INVALID_ARGUMENT);
-    paint.color=(neox_color){-0.5f,0,0,1};
-    CHECK(neox_draw_path(f,path,&paint)==NEOX_ERROR_INVALID_ARGUMENT);
-    paint.color=(neox_color){2.0f,0,0,1};
-    CHECK(neox_draw_path(f,path,&paint)==NEOX_ERROR_INVALID_ARGUMENT);
-    neox_frame_cancel(f);
+    /* 评审 4489969132：颜色边界必须用**有效** path 验证，否则 draw_path 可能
+     * 因为句柄已失效而在检查颜色之前就返回 INVALID_ARGUMENT，断言形同虚设。
+     * 流程：新建 path → 合法颜色必须成功 → 只改 RGB/alpha 越界 → 释放。 */
+    {
+        uint8_t verbs2[]={NEOX_VERB_MOVE,NEOX_VERB_LINE,NEOX_VERB_LINE,NEOX_VERB_CLOSE};
+        float points2[]={0,0,1,0,0,1};
+        neox_path valid;
+        neox_path_desc vpd={verbs2,points2,4,3,NEOX_FILL_NONZERO};
+        OK(neox_path_create(dev,&vpd,&valid));
+        OK(neox_frame_begin(dev,&target,&f));
+        paint.color=(neox_color){1,0,0,1};
+        OK(neox_draw_path(f,valid,&paint));      /* 合法颜色：成功 */
+        CHECK(f->cmd_count==1);
+        paint.color=(neox_color){1,0,0,255.0f};
+        CHECK(neox_draw_path(f,valid,&paint)==NEOX_ERROR_INVALID_ARGUMENT);
+        paint.color=(neox_color){-0.5f,0,0,1};
+        CHECK(neox_draw_path(f,valid,&paint)==NEOX_ERROR_INVALID_ARGUMENT);
+        paint.color=(neox_color){2.0f,0,0,1};
+        CHECK(neox_draw_path(f,valid,&paint)==NEOX_ERROR_INVALID_ARGUMENT);
+        paint.color=(neox_color){0,0,0,NAN};
+        CHECK(neox_draw_path(f,valid,&paint)==NEOX_ERROR_INVALID_ARGUMENT);
+        CHECK(f->cmd_count==1);                  /* 失败的绘制没有进入命令流 */
+        neox_frame_cancel(f);
+        neox_path_release(dev,valid);
+    }
     {
         float over[4]={2.0f,0.0f,0.0f,2.0f}, nanv[4]={NAN,0.0f,0.0f,0.5f};
         uint8_t q[4];

@@ -3,6 +3,7 @@
  * other production modules normally. Restore injected counters before cleanup. */
 #include "../src/capture.c"
 #include <stdio.h>
+#include <math.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); exit(1); } } while (0)
 #define OK(x) CHECK((x) == NEOX_OK)
 #define OOM(x) CHECK((x) == NEOX_ERROR_OUT_OF_MEMORY)
@@ -94,6 +95,47 @@ int main(void)
     state.clip=&path;OOM(neox_push_state(f,&state));
     CHECK(ps->refcount==UINT32_MAX && !f->cmd_count && f->ctm_count==1);
     ps->refcount=0;neox_frame_cancel(f);neox_path_release(dev,path);
+
+    /* P1-9 / P2-4：立即模式与 CAP 回放使用同一 flags/blend 边界。 */
+    OK(neox_frame_begin(dev,&target,&f));
+    {
+        neox_state bad;
+        memset(&bad,0,sizeof bad);
+        bad.transform=nx_affine_identity();bad.opacity=1;
+        bad.flags=0x2u; /* 未定义位 */
+        CHECK(neox_push_state(f,&bad)==NEOX_ERROR_INVALID_ARGUMENT);
+        bad.flags=0;bad.blend=(neox_blend)-1; /* 负枚举 */
+        CHECK(neox_push_state(f,&bad)==NEOX_ERROR_INVALID_ARGUMENT);
+        bad.blend=(neox_blend)NEOX_BLEND_SRC_OVER;
+        bad.flags=NEOX_ALLOW_APPROXIMATE; /* 已定义位可接受 */
+        OK(neox_push_state(f,&bad));OK(neox_pop_state(f));
+        /* 场景节点同样拒绝负 blend。 */
+        scene=neox_scene_create(dev);CHECK(scene.id);
+        neox_node_desc nd={0};nd.kind=NEOX_NODE_GROUP;nd.transform=nx_affine_identity();
+        nd.opacity=1;nd.visible=1;nd.blend=(neox_blend)-3;
+        CHECK(neox_node_create(dev,scene,&nd,&node)==NEOX_ERROR_INVALID_ARGUMENT);
+        neox_scene_destroy(dev,scene);
+    }
+    neox_frame_cancel(f);
+
+    /* P1-10：颜色边界拒绝越界 alpha/RGB；Soft 输出量化端仍然钳制。 */
+    OK(neox_frame_begin(dev,&target,&f));
+    paint.color=(neox_color){1,0,0,255.0f};
+    CHECK(neox_draw_path(f,path,&paint)==NEOX_ERROR_INVALID_ARGUMENT);
+    paint.color=(neox_color){-0.5f,0,0,1};
+    CHECK(neox_draw_path(f,path,&paint)==NEOX_ERROR_INVALID_ARGUMENT);
+    paint.color=(neox_color){2.0f,0,0,1};
+    CHECK(neox_draw_path(f,path,&paint)==NEOX_ERROR_INVALID_ARGUMENT);
+    neox_frame_cancel(f);
+    {
+        float over[4]={2.0f,0.0f,0.0f,2.0f}, nanv[4]={NAN,0.0f,0.0f,0.5f};
+        uint8_t q[4];
+        nx_premul_linear_to_srgb8(over,q);
+        CHECK(q[0]==255 && q[3]==255);
+        nx_premul_linear_to_srgb8(nanv,q);
+        CHECK(q[0]==0 && q[1]==0 && q[2]==0 && q[3]==128);
+    }
+
     neox_texture_release(dev,tex);neox_device_destroy(dev);CHECK(!ctx->used);neox_context_destroy(ctx);
     puts("ALL PASS (recording count exhaustion, atomic pins, CAP and scene rollback)");
     return 0;

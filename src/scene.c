@@ -101,74 +101,52 @@ typedef struct nx_free_frame {
     uint32_t next_child;
 } nx_free_frame;
 
+/* 按"父先于子"释放整棵子树（也是递归释放的逆后序）。注意不能在遍历的
+ * 同时读父亲的孩子列表：nx_table_alloc 复用空闲槽前可能扩容槽数组并移动
+ * slots，而祖先的孩子列表里仍是旧下标的"正确"值——所以顺序必须是先拷贝
+ * 一层孩子、再释放父亲，然后才处理孩子。 */
 static void node_free_subtree(neox_device *dev, uint32_t idx)
 {
-    size_t cap = 64, depth = 0;
-    nx_free_frame *fs = (nx_free_frame *)malloc(cap * sizeof(nx_free_frame));
-    if (!fs) {
-        /* 工作栈分配失败（极端内存压力）：按广度优先直接释放每个节点，
-         * 同样是迭代的、不递归。孩子列表先拷贝再释放父节点。 */
-        uint32_t *q = (uint32_t *)malloc(16 * sizeof(uint32_t));
-        size_t qcap = q ? 16 : 0, qn = 0, qh = 0;
-        if (!q) {
-            node_free_one(dev, idx); /* 无内存可遍历：至少释放根节点 */
-            return;
-        }
-        q[qn++] = idx;
-        while (qh < qn) {
-            nx_node_slot *sn = &((nx_node_slot *)dev->nodes.slots)[q[qh]];
-            uint32_t nc = sn->child_count;
-            if (nc) {
-                if (qn + nc > qcap) {
-                    size_t ncap = qcap;
-                    uint32_t *nq;
-                    while (ncap < qn + nc) ncap *= 2;
-                    nq = (uint32_t *)realloc(q, ncap * sizeof(uint32_t));
-                    if (!nq) break; /* 放弃剩余节点（泄漏优于崩溃） */
-                    q = nq;
-                    qcap = ncap;
-                }
-                memcpy(q + qn, sn->children, (size_t)nc * sizeof(uint32_t));
-                qn += nc;
-            }
-            node_free_one(dev, q[qh]);
-            qh++;
-        }
-        free(q);
+    size_t cap = 64, n = 0;
+    uint32_t *work = (uint32_t *)malloc(cap * sizeof(uint32_t));
+    if (!work) {
+        /* 工作队列分配失败：只释放根节点（泄漏优于崩溃）。 */
+        node_free_one(dev, idx);
         return;
     }
-    fs[depth].node = idx;
-    fs[depth].next_child = 0;
-    depth = 1;
-    while (depth > 0) {
-        nx_free_frame *f = &fs[depth - 1];
-        nx_node_slot *sn = &((nx_node_slot *)dev->nodes.slots)[f->node];
-        /* 遍历期间不释放该节点的孩子列表（父节点最后释放），因此这里读到的
-         * children 指针始终有效。 */
-        if (f->next_child < sn->child_count) {
-            uint32_t child = sn->children[f->next_child++];
-            if (depth == cap) {
-                size_t ncap = cap * 2;
-                nx_free_frame *nf = (nx_free_frame *)realloc(fs, ncap * sizeof(*nf));
-                if (!nf) {
-                    /* 扩容失败：直接释放这个孩子（及其子树由后续广度遍历
-                     * 处理会更复杂；这里只释放本节点，深度受限的链已在
-                     * 栈上，保守处理比崩溃好）。 */
-                    node_free_one(dev, child);
+    work[n++] = idx;
+    while (n > 0) {
+        uint32_t cur = work[--n];
+        nx_node_slot *sn = &((nx_node_slot *)dev->nodes.slots)[cur];
+        uint32_t nc = sn->child_count, k;
+        if (nc) {
+            /* 先拷贝孩子下标，再释放父亲（父亲释放会归还孩子列表内存）。 */
+            uint32_t *kids = (uint32_t *)malloc((size_t)nc * sizeof(uint32_t));
+            if (kids) memcpy(kids, sn->children, (size_t)nc * sizeof(uint32_t));
+            node_free_one(dev, cur);
+            if (!kids) continue; /* 极端内存压力：放弃这棵子树 */
+            if (n + nc > cap) {
+                size_t ncap = cap;
+                uint32_t *nw;
+                while (ncap < n + nc) ncap *= 2;
+                nw = (uint32_t *)realloc(work, ncap * sizeof(uint32_t));
+                if (!nw) {
+                    /* 放弃剩余孩子（泄漏优于崩溃） */
+                    for (k = 0; k < nc; k++) { (void)k; }
+                    free(kids);
                     continue;
                 }
-                fs = nf;
+                work = nw;
                 cap = ncap;
             }
-            fs[depth].node = child;
-            fs[depth].next_child = 0;
-            depth++;
+            memcpy(work + n, kids, (size_t)nc * sizeof(uint32_t));
+            n += nc;
+            free(kids);
             continue;
         }
-        node_free_one(dev, f->node);
-        depth--;
+        node_free_one(dev, cur);
     }
-    free(fs);
+    free(work);
 }
 
 void neox_scene_destroy(neox_device *dev, neox_scene scene)

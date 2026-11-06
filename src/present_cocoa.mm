@@ -183,6 +183,8 @@ static neox_result cocoa_soft(neox_window *w)
     if(w->dev->active_frame || w->dev->pending_count)return NEOX_ERROR_INVALID_ARGUMENT;
     nx_cocoa *p=(nx_cocoa *)w->plat;
     @autoreleasepool {
+        /* 统一的不透明窗口策略（P1-5）：Soft 帧缓冲是预乘 RGBA，窗口不透明，
+         * 因此图像按 kCGImageAlphaNoneSkipLast 只取 RGB（预乘值）显示。 */
         CFDataRef data=CFDataCreate(kCFAllocatorDefault,w->soft_px,(CFIndex)((size_t)w->px_w*w->px_h*4));
         if(!data)return NEOX_ERROR_OUT_OF_MEMORY;
         CGDataProviderRef provider=CGDataProviderCreateWithCFData(data);CFRelease(data);
@@ -192,6 +194,9 @@ static neox_result cocoa_soft(neox_window *w)
         CGColorSpaceRelease(color);CGDataProviderRelease(provider);
         if(!image)return NEOX_ERROR_OUT_OF_MEMORY;
         if(p->image)CGImageRelease(p->image);p->image=image;p->image_w=w->px_w;p->image_h=w->px_h;
+        /* 不透明窗口（P1-5）：图层没有 alpha 通道，按预乘 RGB 绘制；图像
+         * 用 NoneSkipLast 解释，与 Soft/Wayland/X11/GL 同一规则。 */
+        p->view.layer.opaque=YES;
         p->view.layer.contents=(id)image;p->view.layer.contentsGravity=kCAGravityResize;
         [CATransaction flush];return NEOX_OK;
     }
@@ -202,7 +207,14 @@ static int cocoa_read(neox_window *w,uint8_t *out)
     if(!p->image || p->image_w!=w->px_w || p->image_h!=w->px_h)return -1;
     CFDataRef data=CGDataProviderCopyData(CGImageGetDataProvider(p->image));
     if(!data)return -1;
-    memcpy(out,CFDataGetBytePtr(data),(size_t)w->px_w*w->px_h*4);CFRelease(data);return 0;
+    {
+        const uint8_t *src=(const uint8_t *)CFDataGetBytePtr(data);
+        size_t n=(size_t)w->px_w*w->px_h;
+        /* Soft 帧缓冲本身已是预乘 RGBA（P1-5：不透明窗口按 RGB *= a 显示），
+         * 读回原样返回即可，与离屏/GL 读回同一语义。 */
+        memcpy(out,src,n*4);
+    }
+    CFRelease(data);return 0;
 }
 #if NEOX_ENABLE_METAL
 static int current(neox_window *w)
@@ -264,7 +276,10 @@ static neox_result cocoa_gpu_read(neox_window *w,uint8_t *out)
 }
 static void cocoa_gpu_detach(neox_window *w)
 {
-    nx_cocoa *p=(nx_cocoa *)w->plat;p->surface=NULL;p->width=p->height=0;p->target_valid=p->capture=p->captured=0;
+    /* Soft detach 保留 image/图层：present.c 只在 is_gpu 时调用本函数，
+     * 这里再防御一次（P2-3）。 */
+    nx_cocoa *p=(nx_cocoa *)w->plat;if(!w->is_gpu || !p)return;
+    p->surface=NULL;p->width=p->height=0;p->target_valid=p->capture=p->captured=0;
     @autoreleasepool {p->view.layer=[CALayer layer];[p->metal_layer release];p->metal_layer=nil;}
     if(p->image){CGImageRelease(p->image);p->image=NULL;}
 }

@@ -29,8 +29,9 @@
  *     ADR 0005 同款）。PLUS 的 clamp 非线性始终走 ping-pong（fill/glyph
  *     读 dst 算插值式写临时层再拷回；tex 覆盖二值，折源 + 整层 clamp）。
  *     组合成（§7）走 gl_blend_plain 真实 Porter-Duff。
- *   - 组不透明度：PUSH owns_layer → 渲染到离屏层纹理（RGBA32F SS），POP 时
- *     以 opacity × 裁剪掩码整体合成回父层（§7 隔离合成）。
+ *   - 组隔离：非默认 blend、半透明或有裁剪的组有自己的层（owns_layer，
+ *     P1-8）；层内子绘制一律 SRC_OVER（nx_exec_isolated_blend），POP 时以
+ *     opacity × 裁剪掩码 × 组混合整体合成回父层（§7）。
  *   - 裁剪：掩码在 push 期经 geom.c 急切光栅化（与 Soft 同一 CPU 覆盖率），
  *     执行期上传 R32F 纹理；绘制采样当前掩码（组合成时调制）。
  *   - draw_texture / draw_glyphs：纹理四边形 / 字形四边形；NEAREST/LINEAR 与
@@ -256,7 +257,20 @@ static const char *NX_GLSL_FS_CLAMP =
 
 /* 窗口呈现：resolve 纹理的第 0 行是设备顶行，但按 GL 纹素原点放在底边。
  * 真实窗口的底边是视觉底边，所以这里按高度翻转，让设备顶行出现在窗口顶边。
- * u_ss 复用为像素高度。离屏 read_pixels 不走这个 shader。 */
+ * u_ss 复用为像素高度。离屏 read_pixels 不走这个 shader。
+ *
+ * 颜色链（P1-5 + shader 类型修正）：surface 纹理在 gl_resolve / encode pass
+ * 已经做过**一次** sRGB 量化（NX_GLSL_FS_ENCODE；GL_FRAMEBUFFER_SRGB 恒关，
+ * 见 gl_device_init），是非预乘 sRGB8。present 在编码域乘 alpha 后输出，不能再做
+ * 一次 sRGB 编码（会二次编码、把 128 变成约 188）。
+ *
+ * 不透明窗口策略：与 Soft（X11/Wayland/Cocoa 的 RGB *= a、丢弃 alpha）和
+ * Metal（present 着色器 RGB *= a、a = 1）统一——呈现像素 = 预乘后的 RGB
+ * （sRGB 编码）+ 不透明 alpha 1。窗口缓冲的 alpha 恒为 255。
+ *
+ * 注意：这里只写标量分量，不调用任何 enc 函数。此前版本写成
+ * enc(clamp(p.rgb, ...)) 而 enc 只有 float 版本、外层 vec4 也缺一个分量，
+ * shader 编译失败会让 gl_device_init 无条件失败（包括离屏设备）。 */
 static const char *NX_GLSL_FS_PRESENT =
     "#version 410 core\n"
     "uniform sampler2D u_tex;\n"
@@ -265,7 +279,8 @@ static const char *NX_GLSL_FS_PRESENT =
     "void main(void)\n"
     "{\n"
     "    int y = int(u_ss) - 1 - int(gl_FragCoord.y);\n"
-    "    o_color = texelFetch(u_tex, ivec2(int(gl_FragCoord.x), y), 0);\n"
+    "    vec4 p = texelFetch(u_tex, ivec2(int(gl_FragCoord.x), y), 0);\n"
+    "    o_color = vec4(clamp(p.rgb, 0.0, 1.0) * clamp(p.a, 0.0, 1.0), 1.0);\n"
     "}\n";
 
 /* PLUS（§6.1）：clamp 非线性 + 覆盖率插值无法由固定功能因子表达。
@@ -541,13 +556,18 @@ struct neox_gl_surface {
     void *win_egl;              /* EGLSurface；离屏为 NULL */
     void *native_window;
     int vsync;
-    uint8_t *presented;         /* lazily allocated explicit snapshot, reused */
-    int capture_next, presented_valid;
+    uint8_t *presented;         /* 显式 request_readback 之后的窗口像素快照（复用） */
+    int presented_valid;
+    int capture_next;           /* 下一次 present 要捕获快照（request_readback 置位） */
+    int snapshot_seq;           /* 每次成功捕获递增（同一表面连续帧顺序，P1-12） */
 };
+
+typedef struct nx_gl_host_ctx nx_gl_host_ctx;
 
 typedef struct nx_gl_dev {
     neox_device *dev;
     nx_gl_ctx *ctx;             /* 平台上下文；shared_context 只加入共享组 */
+    nx_gl_host_ctx *host_ctx;   /* 本设备的外壳记账块（销毁时归还；P2-7） */
     int gl_ready;               /* 入口已解析，销毁时可以发 GL 调用 */
     int dual_ok;                /* GL_MAX_DUAL_SOURCE_DRAW_BUFFERS >= 1 且探测链接成功 */
     GLuint vao, vbo;
@@ -570,6 +590,16 @@ typedef struct nx_gl_dev {
     uint32_t max_tex;
     int failed;                 /* 执行期 GL 错误粘滞标记（跨 draw  early-exit） */
 } nx_gl_dev;
+
+/* 平台上下文外壳的记账块：紧挨在外壳之前由注入分配器分配，头部记住外壳
+ * 字节数、所属设备与归属上下文，并串进该设备的链表。释放只经设备自己的
+ * 链表/context，不存在进程级固定容量，也不依赖任何临时全局参数
+ * （评审 P2-7 的“把分配尺寸放进分配块头部/所属设备”要求）。 */
+struct nx_gl_host_ctx {
+    size_t bytes;               /* 外壳字节数（不含本头部） */
+    nx_gl_dev *owner;           /* 分配该外壳的设备 */
+    nx_gl_host_ctx *next;       /* 同一设备的其他外壳（当前最多一个） */
+};
 
 /* ------------------------------------------------------------------ GL 小工具 */
 
@@ -982,10 +1012,59 @@ static neox_result gl_tex_ensure(neox_context *ctx, nx_gl_dev *g,
 
 /* ------------------------------------------------------------------ 设备初始化 / 销毁 */
 
+/* 平台上下文外壳：宿主（本文件）经注入分配器分配，平台层只填字段
+ * （nx_gl_ctx_alloc_host）。外壳前放一个 nx_gl_host_ctx 头部，记录外壳
+ * 字节数与所属设备，并串进所属设备的 host_ctx 链：分配/释放都只经过
+ * context 的分配器和设备自身，不存在进程级固定槽位或临时全局参数，因此
+ * 同时存在的 GL 设备数不受任何固定上限限制（评审 P2-7）。
+ *
+ * 生命周期：平台层 nx_gl_ctx_destroy 只释放平台资源；外壳由宿主用
+ * nx_gl_ctx_free_host 释放一次（内部就是 gl_ctx_host_free），与 EGL/CGL
+ * 的约定一致。gl_ctx_host_free 只按头部归还内存，不解引用外壳。 */
+static void *gl_ctx_host_alloc(void *user, size_t bytes)
+{
+    neox_context *ctx = (neox_context *)user;
+    nx_gl_host_ctx *h;
+    nx_gl_dev *g = NULL;
+    neox_device *d;
+    uint8_t *raw;
+    if (bytes == 0 || bytes > SIZE_MAX - sizeof(nx_gl_host_ctx)) return NULL;
+    /* 归属：user 是分配器上下文；找到该 context 上尚未持有外壳的设备。 */
+    for (d = ctx->devices; d; d = d->next) {
+        if (d->vt != nx_backend_gl() || !d->bstate) continue;
+        g = (nx_gl_dev *)d->bstate;
+        if (!g->host_ctx) break;
+        g = NULL;
+    }
+    if (!g) return NULL;
+    if (g->gl_ready) return NULL; /* 外壳只在初始化阶段分配 */
+    raw = (uint8_t *)nx_alloc(ctx, sizeof(nx_gl_host_ctx) + bytes, 16);
+    if (!raw) return NULL;
+    h = (nx_gl_host_ctx *)raw;
+    h->bytes = bytes;
+    h->owner = g;
+    h->next = g->host_ctx;
+    g->host_ctx = h;
+    return raw + sizeof(nx_gl_host_ctx);
+}
+
+static void gl_ctx_host_free(void *user, void *p)
+{
+    nx_gl_host_ctx *h;
+    if (!p) return;
+    h = (nx_gl_host_ctx *)((uint8_t *)p - sizeof(nx_gl_host_ctx));
+    nx_free((neox_context *)user, h, sizeof(nx_gl_host_ctx) + h->bytes, 16);
+}
+
 static void gl_state_destroy(neox_context *ctx, nx_gl_dev *g)
 {
     uint32_t i;
-    if (g->ctx && g->gl_ready && gl_make_current(g)) {
+    int current = 0;
+    if (!g) return;
+    /* GL 对象只在 make-current 成功时才能释放；失败不能让随后的 CPU/平台
+     * 资源释放（表面外壳、EGL 上下文/display、分配器记账）被跳过。 */
+    if (g->ctx && g->gl_ready && gl_make_current(g)) current = 1;
+    if (current) {
         gl_prog_free(&g->p_fill);
         gl_prog_free(&g->p_clamp);
         gl_prog_free(&g->p_plusfill);
@@ -1006,19 +1085,24 @@ static void gl_state_destroy(neox_context *ctx, nx_gl_dev *g)
         for (i = 0; i < g->nrts; i++) gl_rt_destroy(&g->rts[i]);
         for (i = 0; i < g->ntexs; i++)
             if (g->texs[i].id) glDeleteTextures(1, &g->texs[i].id);
-        /* 表面注册表中仍存活的表面。窗口的 EGLSurface 不随 GL 上下文一起没，
-         * 必须先拆掉。颜色附件随后随上下文销毁。 */
-        for (i = 0; i < g->nsurfs; i++) {
-            neox_gl_surface *s = g->surfs[i];
-            if (s->win_egl) nx_gl_ctx_window_destroy(g->ctx, s->win_egl);
-            if (s->presented)
-                nx_free(ctx, s->presented, (size_t)s->w * s->h * 4, 16);
-            nx_free(ctx, s, sizeof(neox_gl_surface), 16);
-        }
     }
+    /* 表面注册表中仍存活的表面：颜色附件随上下文/驱动一起没，但 EGLSurface
+     * 与外壳必须显式释放。没有 current 也照样拆平台表面并归还 CPU 内存。 */
+    for (i = 0; i < g->nsurfs; i++) {
+        neox_gl_surface *s = g->surfs[i];
+        if (s->win_egl) nx_gl_ctx_window_destroy(g->ctx, s->win_egl);
+        if (s->presented)
+            nx_free(ctx, s->presented, (size_t)s->w * s->h * 4, 16);
+        nx_free(ctx, s, sizeof(neox_gl_surface), 16);
+    }
+    g->nsurfs = 0;
     if (g->ctx) {
+        /* 外壳由宿主释放一次：destroy 只拆平台资源（EGL/CGL），
+         * free_host 归还外壳；之后不能再读 g->ctx 的任何字段。 */
         nx_gl_ctx_destroy(g->ctx);
+        nx_gl_ctx_free_host(g->ctx);
         g->ctx = NULL;
+        g->host_ctx = NULL;
     }
     if (g->mask) nx_free(ctx, g->mask, (size_t)g->mask_w * g->mask_h * 4, 16);
     if (g->premul) nx_free(ctx, g->premul, (size_t)g->premul_w * g->premul_h * 16, 16);
@@ -1144,7 +1228,14 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
         NX_ERR(ctx,"invalid GL output mode",NEOX_ERROR_INVALID_ARGUMENT);
     }
     g->output_mode = gld.output_mode;
-    g->ctx = nx_gl_ctx_create(platform ? &gld : NULL);
+    (void)nx_gl_ctx_struct_size(); /* 外壳大小由平台层在其分配回调内使用 */
+    /* 外壳分配器按“该 context 上还没有外壳的 GL 设备”认领归属，所以
+     * bstate 必须先发布；init 之后任何失败都由 x 的 gl_state_destroy 统一
+     * 清理（此时 bstate 指回同一个 g）。core.c 的 neox_device_create 在
+     * init 前挂链、init 失败时摘链并释放设备（§10.1）。 */
+    dev->bstate = g;
+    g->ctx = nx_gl_ctx_create_hosted(platform ? &gld : NULL, gl_ctx_host_alloc,
+                                     gl_ctx_host_free, ctx);
     if (!g->ctx) {
         const char *e = nx_gl_ctx_last_error();
         gl_state_destroy(ctx, g);
@@ -1220,6 +1311,11 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
 #undef NX_BUILD_FS
 #undef NX_BUILD
 #undef NX_BUILD_MODE
+#ifdef NEOX_GL_SHADER_LIST_ONLY
+    /* （测试构建）只编译 GLSL 源码本身，不建程序/池。 */
+    (void)vs;
+    return NEOX_OK;
+#endif
     glDeleteShader(vs);
     if (gl_error(g) != GL_NO_ERROR) {
         gl_state_destroy(ctx, g);
@@ -1243,7 +1339,6 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
     glDisable(GL_BLEND);
     glDisable(GL_DITHER);          /* 浮点目标上本应是空操作；关掉以免量化抖动 */
     glDisable(GL_FRAMEBUFFER_SRGB); /* sRGB 编码由 resolve shader 手工完成 */
-    dev->bstate = g;
     return NEOX_OK;
 }
 
@@ -1359,6 +1454,7 @@ typedef struct gl_ex_state {
     neox_blend  blend;
     const float *clip;      /* 裁剪掩码（命令拥有，借用）；NULL = 无 */
     int32_t     layer;      /* 层池槽索引 */
+    int         owns_layer; /* 本作用域有隔离层：blend 只在 POP 组合成时生效 */
 } gl_ex_state;
 
 /* PLUS 混合后把层内容 clamp 到 [0,1]（§6：PLUS 逐通道 clamp；GL float
@@ -1883,12 +1979,13 @@ static neox_result gl_draw_glyphs(neox_device *dev, nx_gl_dev *g,
     return NEOX_OK;
 }
 
-/* 组/裁剪层整体合成回父层（§7：opacity × 裁剪掩码 × 组混合模式） */
-static void gl_composite(neox_context *ctx, nx_gl_dev *g,
-                         const nx_gl_rt *child,
-                         const nx_gl_rt *parent, float opacity,
-                         neox_blend blend, const nx_gl_rt *clip,
-                         uint32_t w, uint32_t h)
+/* 组/裁剪层整体合成回父层（§7：opacity × 裁剪掩码 × 组混合模式）。
+ * 返回 neox_result：PLUS 的整层 clamp 失败必须向执行器传播（P1-13）。 */
+static neox_result gl_composite(neox_context *ctx, nx_gl_dev *g,
+                                const nx_gl_rt *child,
+                                const nx_gl_rt *parent, float opacity,
+                                neox_blend blend, const nx_gl_rt *clip,
+                                uint32_t w, uint32_t h)
 {
     uint32_t SSW = w * NEOX_GL_SS, SSH = h * NEOX_GL_SS;
     glBindFramebuffer(GL_FRAMEBUFFER, parent->fbo);
@@ -1911,8 +2008,17 @@ static void gl_composite(neox_context *ctx, nx_gl_dev *g,
     gl_draw_full(g, &g->p_comp, (float)SSW, (float)SSH,
                  2.0f / (float)SSW, 2.0f / (float)SSH);
     glActiveTexture(GL_TEXTURE0);
-    if (blend == NEOX_BLEND_PLUS)
-        (void)gl_clamp_layer(ctx, g, parent, w, h); /* ex_composite 对 PLUS 逐步 clamp */
+    if (blend == NEOX_BLEND_PLUS) {
+        /* ex_composite 对 PLUS 逐步 clamp：整层钳制的结果（及其 GL 错误）
+         * 必须回给调用方，不能被丢掉（P1-13）。 */
+        neox_result r = gl_clamp_layer(ctx, g, parent, w, h);
+        if (r != NEOX_OK) return r;
+    }
+    if (gl_error(g) != GL_NO_ERROR) {
+        ctx->last_error = "GL group composite failed";
+        return NEOX_ERROR_BACKEND;
+    }
+    return NEOX_OK;
 }
 
 /* 基底装载：fr->base（W×H 预乘线性）→ 快照纹理 → 放大 blit 进基底层 */
@@ -2082,6 +2188,7 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
         stk[0].blend = NEOX_BLEND_SRC_OVER;
         stk[0].clip = NULL;
         stk[0].layer = 0;
+        stk[0].owns_layer = 0;
         nstk = 1;
     }
     /* 基底：清屏色或快照内容 → 基底层 */
@@ -2150,6 +2257,7 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
             r = nx_execution_clip_push(dev, &execution_clips, c, sub->width, sub->height, &stk[nstk].clip);
             if (r != NEOX_OK) goto cleanup;
             stk[nstk].layer = layer_idx;
+            stk[nstk].owns_layer = c->owns_layer;
             nstk++;
             break;
         }
@@ -2178,9 +2286,23 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
                     clips = nc;
                     clips[nclips++] = clip_rt;
                 }
-                gl_composite(ctx, g, layers[top2->layer],
-                             layers[parent->layer],
-                             top2->opacity, top2->blend, clip_rt, W, H);
+                {
+                    neox_result cr = gl_composite(ctx, g, layers[top2->layer],
+                                                  layers[parent->layer],
+                                                  top2->opacity, top2->blend,
+                                                  clip_rt, W, H);
+                    if (cr != NEOX_OK) {
+                        if (clip_rt) {
+                            clips[nclips - 1] = NULL;
+                            nclips--;
+                            gl_rt_release(clip_rt);
+                        }
+                        gl_rt_release(layers[top2->layer]);
+                        nlayers--;
+                        r = cr;
+                        goto cleanup;
+                    }
+                }
                 if (clip_rt) {
                     clips[nclips - 1] = NULL;
                     nclips--;
@@ -2196,7 +2318,8 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
         case NXC_PATH: {
             const nx_path_slot *ps =
                 &((nx_path_slot *)dev->paths.slots)[c->res_idx];
-            r = gl_fill_path(dev, g, ps, top->ctm, &c->color, top->blend,
+            r = gl_fill_path(dev, g, ps, top->ctm, &c->color,
+                             nx_exec_isolated_blend(top->blend, top->owns_layer),
                              layers[top->layer], W, H);
             if (r != NEOX_OK) goto cleanup;
             GL_CHECK("GL error during path fill");
@@ -2205,7 +2328,8 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
         case NXC_TEX: {
             const nx_tex_slot *tx =
                 &((nx_tex_slot *)dev->textures.slots)[c->res_idx];
-            r = gl_draw_tex(dev, g, tx, c, top->ctm, top->blend,
+            r = gl_draw_tex(dev, g, tx, c, top->ctm,
+                            nx_exec_isolated_blend(top->blend, top->owns_layer),
                             layers[top->layer], W, H);
             if (r != NEOX_OK) goto cleanup;
             GL_CHECK("GL error during texture draw");
@@ -2214,7 +2338,8 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
         case NXC_GLYPHS: {
             const nx_tex_slot *at =
                 &((nx_tex_slot *)dev->textures.slots)[c->res_idx];
-            r = gl_draw_glyphs(dev, g, at, c, top->ctm, top->blend,
+            r = gl_draw_glyphs(dev, g, at, c, top->ctm,
+                               nx_exec_isolated_blend(top->blend, top->owns_layer),
                                layers[top->layer], W, H);
             if (r != NEOX_OK) goto cleanup;
             GL_CHECK("GL error during glyph draw");
@@ -2347,6 +2472,9 @@ void neox_gl_surface_destroy(neox_device *dev, neox_gl_surface *surface)
     }
     g = (nx_gl_dev *)dev->bstate;
     if (!g) return;
+    /* P2-6：GL 对象只能在 make-current 成功时释放；但 CPU 侧与平台侧资源
+     * 的释放不能再受这个条件约束——上下文丢失后仍必须拆掉 EGLSurface、
+     * 归还快照与表面外壳，否则表面泄漏且从注册表消失。 */
     if (gl_make_current(g))
         gl_surface_release_color(surface);
     if (g->ctx && surface->win_egl)
@@ -2514,7 +2642,26 @@ neox_result neox_gl_surface_request_readback(neox_gl_surface *surface)
     if (!surface || !surface->dev) return NEOX_ERROR_INVALID_ARGUMENT;
     if (nx_device_check_live(surface->dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
     if (!surface->win_egl) return NEOX_ERROR_UNSUPPORTED;
+    /* 契约（include/neox_present.h）：只有显式 request 之后的那次 present
+     * 捕获窗口像素；普通 present 不读回、不分配。 */
     surface->capture_next = 1;
+    return NEOX_OK;
+}
+
+/* 公开读回 API 的单一实现：present.c（窗口层）与 GL 表面 API 都经这里读
+ * 快照，避免每个编译单元各自内联一份表面布局逻辑（同一 .a 里 -O0 下
+ * 多翻译单元仍可能给出不一致的内联结果，见 tests/test_present.c 的
+ * “普通 present 不捕获”断言）。 */
+neox_result nx_gl_surface_read_presented_impl(neox_gl_surface *surface,
+                                              uint8_t *out_pixels)
+{
+    if (!surface || !out_pixels) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (nx_device_check_live(surface->dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
+    /* 只有 request_readback 之后的那次 window present 才留下快照；普通
+     * present 不捕获，读回继续返回 UNSUPPORTED（既有契约）。 */
+    if (!surface->presented_valid)
+        return NEOX_ERROR_UNSUPPORTED;
+    memcpy(out_pixels, surface->presented, (size_t)surface->w * surface->h * 4);
     return NEOX_OK;
 }
 
@@ -2525,6 +2672,8 @@ neox_result neox_gl_surface_present(neox_gl_surface *surface)
     uint32_t w, h;
     neox_result result = NEOX_OK;
     float v[6];
+    /* 先取本帧要用的字段：捕获标志只在开 GL 通道之前使用。 */
+    int capture;
     if (!surface || !surface->dev) return NEOX_ERROR_INVALID_ARGUMENT;
     if (nx_device_check_live(surface->dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
     if (!surface->win_egl) return NEOX_ERROR_UNSUPPORTED;
@@ -2532,13 +2681,19 @@ neox_result neox_gl_surface_present(neox_gl_surface *surface)
     ctx = surface->dev->ctx;
     if (!g || !g->p_present.id) return gl_failure(g);
     w = surface->w; h = surface->h;
+    capture = surface->capture_next;
+    /* 一次性捕获：只有 request_readback 之后的这一次 present 捕获（并在
+     * 交换成功后发布）；任何一次 present 都先撤销上一次发布的状态，下一次
+     * 普通 present 之后读回返回 UNSUPPORTED（既有契约，评审 4489969103）。 */
     surface->presented_valid = 0;
-    /* Normal presentation allocates nothing and performs no CPU readback.
-     * Snapshot storage is retained until resize/destroy and reused on demand. */
-    if (surface->capture_next && !surface->presented) {
+    /* 普通呈现不分配、不做 CPU 读回；只有请求过 readback 的那一次才保存
+     * 窗口缓冲。快照存储复用，直到 resize/销毁才归还。分配失败必须
+     * 返回 OOM，并保留请求供调用方重试，不能把未完成的捕获报告为成功。 */
+    if (capture && !surface->presented) {
         surface->presented = nx_alloc(ctx,(size_t)w*h*4,16);
-        if (!surface->presented)
-            NX_ERR(ctx,"snapshot allocation failed",NEOX_ERROR_OUT_OF_MEMORY);
+        if (!surface->presented) {
+            NX_ERR(ctx, "snapshot allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
+        }
     }
     if (!nx_gl_ctx_window_make_current(g->ctx, surface->win_egl))
         NX_ERR(ctx,"GL: could not make window current",gl_failure(g));
@@ -2556,10 +2711,12 @@ neox_result neox_gl_surface_present(neox_gl_surface *surface)
     v[2] = 2.0f * (float)w; v[3] = 0.0f;
     v[4] = 0.0f; v[5] = 2.0f * (float)h;
     gl_draw(g, v, 3);
-    if (surface->capture_next) {
+    if (capture) {
         glPixelStorei(GL_PACK_ALIGNMENT,4);
         g->stats.pixel_readback_bytes+=(uint64_t)w*h*4;g->stats.readback_calls++;
         glReadPixels(0,0,(GLsizei)w,(GLsizei)h,GL_RGBA,GL_UNSIGNED_BYTE,surface->presented);
+        /* 窗口缓冲即屏幕像素（不透明窗口）：present 着色器已写入 alpha = 1，
+         * RGB 是预乘 sRGB（只编码一次）。 */
         /* In-place row reversal needs no second full-window allocation. */
         for (uint32_t y=0;y<h/2;y++) {
             uint8_t *top=surface->presented+(size_t)y*w*4;
@@ -2576,11 +2733,14 @@ neox_result neox_gl_surface_present(neox_gl_surface *surface)
         if (!nx_gl_ctx_window_swap(g->ctx,surface->win_egl)) {
             ctx->last_error="EGL window swap failed";
             result=gl_failure(g);
-        } else {
-            surface->presented_valid=surface->capture_next;
-            surface->capture_next=0;
+        } else if (capture) {
+            /* 快照与本次交换同属一帧：交换成功才发布。 */
+            surface->presented_valid = 1;
+            surface->snapshot_seq++;
         }
     }
+    /* 请求是一次性的：无论成败，下一次 present 默认不再捕获。 */
+    surface->capture_next = 0;
     /* Restore even on readback/draw failure so later rendering can recover. */
     if (!gl_make_current(g))
         NX_ERR(ctx,"GL: could not restore offscreen current",gl_failure(g));
@@ -2590,11 +2750,7 @@ neox_result neox_gl_surface_present(neox_gl_surface *surface)
 neox_result neox_gl_surface_read_presented(neox_gl_surface *surface,
                                            uint8_t *out_pixels)
 {
-    if (!surface || !out_pixels) return NEOX_ERROR_INVALID_ARGUMENT;
-    if (nx_device_check_live(surface->dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
-    if (!surface->presented_valid) return NEOX_ERROR_UNSUPPORTED;
-    memcpy(out_pixels, surface->presented, (size_t)surface->w * surface->h * 4);
-    return NEOX_OK;
+    return nx_gl_surface_read_presented_impl(surface, out_pixels);
 }
 
 neox_result neox_gl_device_native_visual(neox_device *dev, uint32_t *out_visual_id)

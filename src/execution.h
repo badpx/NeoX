@@ -7,6 +7,15 @@ extern "C" {
 /* Reference executors share this implementation, not its storage in the IR.
  * Only active clip scopes retain full/conditional masks. */
 typedef struct nx_clip_scope { float *full, *conditional; } nx_clip_scope;
+/* 隔离层内子绘制一律 SRC_OVER；组 blend 只在 POP 组合成时使用（P1-8）。
+ * 没有隔离层的作用域（SRC_OVER、不透明、无裁剪）直接以自身 blend 绘制到
+ * 父层，与组合成前的层内结果相同。Soft/GL/Metal 三个执行器共用本判定。 */
+static inline neox_blend nx_exec_isolated_blend(neox_blend group_blend, int owns_layer)
+{
+    (void)group_blend;
+    return owns_layer ? NEOX_BLEND_SRC_OVER : group_blend;
+}
+
 typedef struct nx_execution_clips {
     nx_clip_path *paths;
     nx_clip_scope *scopes;

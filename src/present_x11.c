@@ -1,16 +1,23 @@
 /* ===========================================================================
  * present_x11.c — X11 呈现。运行期 dlopen("libX11.so.6")，不包含 Xlib.h。
  *
- * 结构偏移按 LP64（本机已核对）：XEvent 192，XImage 136，XVisualInfo 64。
+ * 结构偏移按 LP64（本机已核对）：XEvent 192，XImage 136，XVisualInfo 64，
+ * XSizeHints 80，XWindowAttributes 136（width 8，height 12，map_state 92）。
  * 其它 ABI 在 open 时直接拒绝，避免读错事件。
  * 像素经 XPutImage / XGetImage，GL 走同一窗口上的 EGL window surface。
+ * 窗口管理器异步映射：须等到 IsViewable 再读写屏幕，否则 XGetImage
+ * 会 BadMatch，或被个别服务器交回空白图。
  * =========================================================================*/
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "present_internal.h"
 
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define NX_XEVENT 192
 #define NX_XIMAGE_DATA 16
@@ -65,6 +72,8 @@ typedef void *(*PFN_vinfo)(void *, long, void *, int *);
 typedef unsigned long (*PFN_cwin)(void *, unsigned long, int, int, unsigned int,
                                   unsigned int, unsigned int, int, unsigned int,
                                   void *, unsigned long, void *);
+typedef int (*PFN_getattr)(void *, unsigned long, void *);
+typedef void (*PFN_hints)(void *, unsigned long, void *);
 
 static struct {
     void *lib;
@@ -103,9 +112,42 @@ static struct {
     PFN_freecmap freecmap;
     PFN_vinfo vinfo;
     PFN_cwin cwin;
+    PFN_getattr getattr;
+    PFN_hints hints;
 } g_x;
 
 static int g_handlers;
+
+/* 加载状态：未尝试 / 成功 / 失败。校验失败时 dlclose 并清空整张函数表，
+ * 绝不让第二次调用把第一次的失败当成成功。 */
+enum { NX_X_LOAD_UNTRIED = 0, NX_X_LOAD_OK = 1, NX_X_LOAD_FAILED = 2 };
+static int g_x_state = NX_X_LOAD_UNTRIED;
+
+#ifndef NX_TEST_HOOK_DLOPEN
+#define NX_TEST_HOOK_DLOPEN 0
+#endif
+#if NX_TEST_HOOK_DLOPEN
+extern void *nx_test_x11_dlopen(const char *name, int flags);
+extern void *nx_test_x11_dlsym(void *handle, const char *symbol);
+#define nx_x_dlopen(n, f) nx_test_x11_dlopen((n), (f))
+#define nx_x_dlsym(h, s) nx_test_x11_dlsym((h), (s))
+#else
+#define nx_x_dlopen(n, f) dlopen((n), (f))
+#define nx_x_dlsym(h, s) dlsym((h), (s))
+#endif
+#if NX_TEST_HOOK_DLOPEN
+extern int nx_test_x11_dlclose(void *handle);
+#define nx_x_dlclose(h) nx_test_x11_dlclose((h))
+#else
+#define nx_x_dlclose(h) ((h) ? dlclose((h)) : 0)
+#endif
+
+/* Xlib 的请求错误处理器是进程级全局状态：任何一次 X 请求失败都会到这里。
+ * 协议错误不能被吞掉（P1-3）：记下"自上次 XSync 之后发生过错误"以及失败的
+ * 请求序号，呈现/读回路径在 XSync 之后比较并返回 NEOX_ERROR_BACKEND。 */
+static uint32_t g_x_errors;
+static uint32_t g_x_last_error;
+static uint32_t g_x_last_code;
 
 static int on_xerr(void *dpy, void *ev)
 {
@@ -113,8 +155,36 @@ static int on_xerr(void *dpy, void *ev)
     unsigned char code = e ? e[32] : 0;
     unsigned char req = e ? e[33] : 0;
     (void)dpy;
-    fprintf(stderr, "X error code=%u request=%u\n", code, req);
+    g_x_errors++;
+    g_x_last_error = req;
+    g_x_last_code = code;
+    /* 错误详情经 x11_take_error 进入窗口错误串（nx_win_set_error），不再
+     * 无条件写 stderr：多窗口/并行测试下会刷屏，也无法被调用方处理。 */
+    (void)code;
     return 0;
+}
+
+/* XSync 之前取一次代数；之后比较：有变化即说明本次请求序列里出现过
+ * 协议错误。错误处理器返回 0 表示已处理，Xlib 不会终止进程。 */
+static uint32_t x11_error_mark(void) { return g_x_errors; }
+
+static int x11_take_error(uint32_t mark, const char *what)
+{
+    if (g_x_errors == mark) return 0;
+    {
+        char buf[128];
+        snprintf(buf, sizeof buf,
+                 "X11: %s failed (X protocol error %u, request %u)",
+                 what, (unsigned)g_x_last_code, (unsigned)g_x_last_error);
+        nx_win_set_error(buf);
+    }
+    return 1;
+}
+
+static neox_result x11_sync_or_fail(void *dpy, uint32_t mark, const char *what)
+{
+    g_x.sync(dpy, 0);
+    return x11_take_error(mark, what) ? NEOX_ERROR_BACKEND : NEOX_OK;
 }
 
 static int on_xio(void *dpy)
@@ -123,11 +193,19 @@ static int on_xio(void *dpy)
     return 0;
 }
 
+static void unload_x11(void)
+{
+    if (g_x.lib) nx_x_dlclose(g_x.lib);
+    memset(&g_x, 0, sizeof g_x);
+    g_x_state = NX_X_LOAD_FAILED;
+}
+
 static int load_x11(void)
 {
-    if (g_x.lib) return 1;
-    g_x.lib = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
-    if (!g_x.lib) g_x.lib = dlopen("libX11.so", RTLD_NOW | RTLD_LOCAL);
+    if (g_x_state == NX_X_LOAD_OK && g_x.lib) return 1;
+    g_x_state = NX_X_LOAD_FAILED;
+    g_x.lib = nx_x_dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+    if (!g_x.lib) g_x.lib = nx_x_dlopen("libX11.so", RTLD_NOW | RTLD_LOCAL);
     if (!g_x.lib) {
         const char *de = dlerror();
         char buf[256];
@@ -138,7 +216,7 @@ static int load_x11(void)
     }
 #define NX_DLSYM(field, type, sym) do { \
         union { void *vp; type fp; } u_; \
-        u_.vp = dlsym(g_x.lib, sym); \
+        u_.vp = nx_x_dlsym(g_x.lib, sym); \
         g_x.field = u_.fp; \
     } while (0)
     NX_DLSYM(open, PFN_open, "XOpenDisplay");
@@ -176,13 +254,17 @@ static int load_x11(void)
     NX_DLSYM(freecmap, PFN_freecmap, "XFreeColormap");
     NX_DLSYM(vinfo, PFN_vinfo, "XGetVisualInfo");
     NX_DLSYM(cwin, PFN_cwin, "XCreateWindow");
+    NX_DLSYM(getattr, PFN_getattr, "XGetWindowAttributes");
+    NX_DLSYM(hints, PFN_hints, "XSetWMNormalHints");
 #undef NX_DLSYM
     if (!g_x.open || !g_x.close || !g_x.screen || !g_x.root || !g_x.simple ||
         !g_x.map || !g_x.select || !g_x.sync || !g_x.pending || !g_x.next ||
         !g_x.atom || !g_x.proto || !g_x.resize || !g_x.gc || !g_x.image ||
         !g_x.put || !g_x.get || !g_x.putpx || !g_x.getpx || !g_x.freeimg ||
         !g_x.keysym || !g_x.visual || !g_x.depth || !g_x.black || !g_x.destroy ||
-        !g_x.cwin || !g_x.cmap || !g_x.vinfo || !g_x.xfree) {
+        !g_x.cwin || !g_x.cmap || !g_x.vinfo || !g_x.xfree ||
+        !g_x.getattr || !g_x.hints) {
+        unload_x11();
         nx_win_set_error("X11: libX11 is missing a required entry point");
         return 0;
     }
@@ -191,6 +273,7 @@ static int load_x11(void)
         g_x.setio(on_xio);
         g_handlers = 1;
     }
+    g_x_state = NX_X_LOAD_OK;
     return 1;
 }
 
@@ -207,6 +290,7 @@ typedef struct nx_x11 {
     int screen;
     int depth;
     int iw, ih;
+    int hold_size; /* 等待映射期间，拒绝窗口管理器改掉请求的像素尺寸 */
     uint32_t buttons;
 } nx_x11;
 
@@ -323,15 +407,92 @@ static unsigned long visual_id_of(nx_x11 *p, void *visual)
     return found;
 }
 
-static void decorate(nx_x11 *p, neox_window *w)
+static int x11_poll(neox_window *w);
+
+/* PSize | PMinSize | PMaxSize | PBaseSize. 把窗口锁在请求的像素尺寸上，
+ * 与 Wayland 的 xdg min/max 同一策略。 */
+static void apply_size_hints(nx_x11 *p, const neox_window *w)
+{
+    _Alignas(8) unsigned char hints[80];
+    long flags = 312L;
+    int dim_w, dim_h;
+    if (!p || !p->win || !g_x.hints) return;
+    memset(hints, 0, sizeof hints);
+    dim_w = (int)w->px_w;
+    dim_h = (int)w->px_h;
+    memcpy(hints + 0, &flags, sizeof flags);
+    memcpy(hints + 16, &dim_w, sizeof dim_w);
+    memcpy(hints + 20, &dim_h, sizeof dim_h);
+    memcpy(hints + 24, &dim_w, sizeof dim_w);
+    memcpy(hints + 28, &dim_h, sizeof dim_h);
+    memcpy(hints + 32, &dim_w, sizeof dim_w);
+    memcpy(hints + 36, &dim_h, sizeof dim_h);
+    memcpy(hints + 64, &dim_w, sizeof dim_w);
+    memcpy(hints + 68, &dim_h, sizeof dim_h);
+    g_x.hints(p->dpy, p->win, hints);
+}
+
+/* 1 = 读到了属性。viewable 为 IsViewable。getattr 失败返回 0。 */
+static int window_metrics(nx_x11 *p, int *width, int *height, int *viewable)
+{
+    _Alignas(16) unsigned char attr[136];
+    int state = 0;
+    if (!p || !p->win || !g_x.getattr) return 0;
+    memset(attr, 0, sizeof attr);
+    if (!g_x.getattr(p->dpy, p->win, attr)) return 0;
+    memcpy(width, attr + 8, sizeof *width);
+    memcpy(height, attr + 12, sizeof *height);
+    memcpy(&state, attr + 92, sizeof state);
+    *viewable = state == 2;
+    return 1;
+}
+
+/* 无 XGetWindowAttributes（单测桩）时直接成功。真实显示上最多等约 2 秒。 */
+static neox_result x11_wait_ready(neox_window *w)
+{
+    nx_x11 *p = (nx_x11 *)w->plat;
+    int i;
+    if (!p || !g_x.getattr) return NEOX_OK;
+    p->hold_size = 1;
+    for (i = 0; i < 100; i++) {
+        int width = 0, height = 0, viewable = 0;
+        struct timespec ts;
+        if (g_x.pending) x11_poll(w);
+        if (!window_metrics(p, &width, &height, &viewable)) {
+            p->hold_size = 0;
+            nx_win_set_error("X11: XGetWindowAttributes failed");
+            return NEOX_ERROR_BACKEND;
+        }
+        if (viewable && width == (int)w->px_w && height == (int)w->px_h) {
+            p->hold_size = 0;
+            return NEOX_OK;
+        }
+        if (g_x.resize && (width != (int)w->px_w || height != (int)w->px_h))
+            g_x.resize(p->dpy, p->win, w->px_w, w->px_h);
+        ts.tv_sec = 0;
+        ts.tv_nsec = 20000000L;
+        nanosleep(&ts, NULL);
+    }
+    p->hold_size = 0;
+    nx_win_set_error("X11: window was not viewable at the requested size");
+    return NEOX_ERROR_BACKEND;
+}
+
+static neox_result decorate(nx_x11 *p, neox_window *w)
 {
     long mask = 1L | 2L | 4L | 8L | 64L | 131072L;
     p->wm_delete = g_x.atom(p->dpy, "WM_DELETE_WINDOW", 0);
     g_x.proto(p->dpy, p->win, &p->wm_delete, 1);
     g_x.name(p->dpy, p->win, w->title);
-    g_x.select(p->dpy, p->win, mask);
-    g_x.map(p->dpy, p->win);
-    g_x.sync(p->dpy, 0);
+    {
+        uint32_t mark = x11_error_mark();
+        g_x.select(p->dpy, p->win, mask);
+        apply_size_hints(p, w);
+        g_x.map(p->dpy, p->win);
+        if (x11_sync_or_fail(p->dpy, mark, "mapping the window") != NEOX_OK)
+            return NEOX_ERROR_BACKEND;
+    }
+    return x11_wait_ready(w);
 }
 
 static void drop_image(nx_x11 *p)
@@ -413,7 +574,10 @@ static neox_result x11_open(neox_window *w)
         x11_close(w);
         return NEOX_ERROR_BACKEND;
     }
-    decorate(p, w);
+    if (decorate(p, w) != NEOX_OK) {
+        x11_close(w);
+        return NEOX_ERROR_BACKEND;
+    }
     return NEOX_OK;
 }
 
@@ -473,7 +637,7 @@ static void x11_use_visual(neox_window *w, unsigned long visual_id)
     p->visual_id = visual_id;
     p->depth = depth;
     p->gc = g_x.gc(p->dpy, p->win, 0, NULL);
-    decorate(p, w);
+    if (decorate(p, w) != NEOX_OK) return;
 }
 
 static int x11_poll(neox_window *w)
@@ -514,6 +678,10 @@ static int x11_poll(neox_window *w)
             if (npt_w < 1) npt_w = 1;
             if (npt_h < 1) npt_h = 1;
             if ((uint32_t)width == w->px_w && (uint32_t)height == w->px_h) continue;
+            if (p->hold_size) {
+                if (g_x.resize) g_x.resize(p->dpy, p->win, w->px_w, w->px_h);
+                continue;
+            }
             if (nx_win_set_geometry(w, npt_w, npt_h, w->scale) != NEOX_OK) continue;
             /* ConfigureNotify reports the actual pixel extent. Rounding a
              * logical size back to pixels need not reproduce it exactly. */
@@ -565,9 +733,13 @@ static neox_result x11_resize(neox_window *w, uint32_t pt_w, uint32_t pt_h)
         nx_win_set_error("X11 window dimensions exceed CARD16");
         return NEOX_ERROR_INVALID_ARGUMENT;
     }
-    g_x.resize(p->dpy, p->win, w->px_w, w->px_h);
-    g_x.sync(p->dpy, 0);
-    return NEOX_OK;
+    apply_size_hints(p, w);
+    {
+        uint32_t mark = x11_error_mark();
+        g_x.resize(p->dpy, p->win, w->px_w, w->px_h);
+        if (x11_sync_or_fail(p->dpy, mark, "XResizeWindow") != NEOX_OK) return NEOX_ERROR_BACKEND;
+    }
+    return x11_wait_ready(w);
 }
 
 static int ensure_image(nx_x11 *p, uint32_t w, uint32_t h)
@@ -606,6 +778,7 @@ static neox_result x11_present_soft(neox_window *w)
         nx_win_set_error("X11: no software frame");
         return NEOX_ERROR_INVALID_ARGUMENT;
     }
+    if (x11_wait_ready(w) != NEOX_OK) return NEOX_ERROR_BACKEND;
     if (!ensure_image(p, w->px_w, w->px_h)) {
         nx_win_set_error("X11: XCreateImage failed");
         return NEOX_ERROR_BACKEND;
@@ -616,20 +789,21 @@ static neox_result x11_present_soft(neox_window *w)
     for (y = 0; y < w->px_h; y++) {
         for (x = 0; x < w->px_w; x++) {
             const uint8_t *s = w->soft_px + ((size_t)y * w->px_w + x) * 4u;
-            unsigned r = s[0], g = s[1], b = s[2], a = s[3];
+            /* 统一的不透明窗口策略（P1-5）：RGB *= a，alpha 丢弃（窗口恒不透明）。 */
+            unsigned a = s[3];
+            unsigned r = s[0] * a / 255u;
+            unsigned g = s[1] * a / 255u;
+            unsigned b = s[2] * a / 255u;
             unsigned long pix;
-            if (a < 255u) {
-                r = r * a / 255u;
-                g = g * a / 255u;
-                b = b * a / 255u;
-            }
             pix = pack_chan(red, r) | pack_chan(green, g) | pack_chan(blue, b);
             g_x.putpx(p->image, (int)x, (int)y, pix);
         }
     }
-    g_x.put(p->dpy, p->win, p->gc, p->image, 0, 0, 0, 0, w->px_w, w->px_h);
-    g_x.sync(p->dpy, 0);
-    return NEOX_OK;
+    {
+        uint32_t mark = x11_error_mark();
+        g_x.put(p->dpy, p->win, p->gc, p->image, 0, 0, 0, 0, w->px_w, w->px_h);
+        return x11_sync_or_fail(p->dpy, mark, "XPutImage");
+    }
 }
 
 static int x11_read_screen(neox_window *w, uint8_t *out)
@@ -639,9 +813,20 @@ static int x11_read_screen(neox_window *w, uint8_t *out)
     unsigned long red, green, blue;
     uint32_t x, y;
     if (!p) return -1;
-    g_x.sync(p->dpy, 0);
-    img = g_x.get(p->dpy, p->win, 0, 0, w->px_w, w->px_h, ~(unsigned long)0, 2);
-    if (!img) return -1;
+    if (x11_wait_ready(w) != NEOX_OK) return -1;
+    {
+        uint32_t mark = x11_error_mark();
+        g_x.sync(p->dpy, 0);
+        if (x11_take_error(mark, "XSync before readback")) return -1;
+        img = g_x.get(p->dpy, p->win, 0, 0, w->px_w, w->px_h, ~(unsigned long)0, 2);
+        /* XGetImage 失败（如 BadMatch）经错误处理器报告，不返回 NULL。 */
+        g_x.sync(p->dpy, 0);
+        if (x11_take_error(mark, "XGetImage")) {
+            if (img) g_x.freeimg(img);
+            return -1;
+        }
+        if (!img) return -1;
+    }
     red = img_ul(img, NX_XIMAGE_RED);
     green = img_ul(img, NX_XIMAGE_GREEN);
     blue = img_ul(img, NX_XIMAGE_BLUE);

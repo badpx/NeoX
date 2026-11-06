@@ -3,6 +3,7 @@
  * other production modules normally. Restore injected counters before cleanup. */
 #include "../src/capture.c"
 #include <stdio.h>
+#include <math.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); exit(1); } } while (0)
 #define OK(x) CHECK((x) == NEOX_OK)
 #define OOM(x) CHECK((x) == NEOX_ERROR_OUT_OF_MEMORY)
@@ -94,6 +95,63 @@ int main(void)
     state.clip=&path;OOM(neox_push_state(f,&state));
     CHECK(ps->refcount==UINT32_MAX && !f->cmd_count && f->ctm_count==1);
     ps->refcount=0;neox_frame_cancel(f);neox_path_release(dev,path);
+
+    /* P1-9 / P2-4：立即模式与 CAP 回放使用同一 flags/blend 边界。 */
+    OK(neox_frame_begin(dev,&target,&f));
+    {
+        neox_state bad;
+        memset(&bad,0,sizeof bad);
+        bad.transform=nx_affine_identity();bad.opacity=1;
+        bad.flags=0x2u; /* 未定义位 */
+        CHECK(neox_push_state(f,&bad)==NEOX_ERROR_INVALID_ARGUMENT);
+        bad.flags=0;bad.blend=(neox_blend)-1; /* 负枚举 */
+        CHECK(neox_push_state(f,&bad)==NEOX_ERROR_INVALID_ARGUMENT);
+        bad.blend=(neox_blend)NEOX_BLEND_SRC_OVER;
+        bad.flags=NEOX_ALLOW_APPROXIMATE; /* 已定义位可接受 */
+        OK(neox_push_state(f,&bad));OK(neox_pop_state(f));
+        /* 场景节点同样拒绝负 blend。 */
+        scene=neox_scene_create(dev);CHECK(scene.id);
+        neox_node_desc nd={0};nd.kind=NEOX_NODE_GROUP;nd.transform=nx_affine_identity();
+        nd.opacity=1;nd.visible=1;nd.blend=(neox_blend)-3;
+        CHECK(neox_node_create(dev,scene,&nd,&node)==NEOX_ERROR_INVALID_ARGUMENT);
+        neox_scene_destroy(dev,scene);
+    }
+    neox_frame_cancel(f);
+
+    /* 评审 4489969132：颜色边界必须用**有效** path 验证，否则 draw_path 可能
+     * 因为句柄已失效而在检查颜色之前就返回 INVALID_ARGUMENT，断言形同虚设。
+     * 流程：新建 path → 合法颜色必须成功 → 只改 RGB/alpha 越界 → 释放。 */
+    {
+        uint8_t verbs2[]={NEOX_VERB_MOVE,NEOX_VERB_LINE,NEOX_VERB_LINE,NEOX_VERB_CLOSE};
+        float points2[]={0,0,1,0,0,1};
+        neox_path valid;
+        neox_path_desc vpd={verbs2,points2,4,3,NEOX_FILL_NONZERO};
+        OK(neox_path_create(dev,&vpd,&valid));
+        OK(neox_frame_begin(dev,&target,&f));
+        paint.color=(neox_color){1,0,0,1};
+        OK(neox_draw_path(f,valid,&paint));      /* 合法颜色：成功 */
+        CHECK(f->cmd_count==1);
+        paint.color=(neox_color){1,0,0,255.0f};
+        CHECK(neox_draw_path(f,valid,&paint)==NEOX_ERROR_INVALID_ARGUMENT);
+        paint.color=(neox_color){-0.5f,0,0,1};
+        CHECK(neox_draw_path(f,valid,&paint)==NEOX_ERROR_INVALID_ARGUMENT);
+        paint.color=(neox_color){2.0f,0,0,1};
+        CHECK(neox_draw_path(f,valid,&paint)==NEOX_ERROR_INVALID_ARGUMENT);
+        paint.color=(neox_color){0,0,0,NAN};
+        CHECK(neox_draw_path(f,valid,&paint)==NEOX_ERROR_INVALID_ARGUMENT);
+        CHECK(f->cmd_count==1);                  /* 失败的绘制没有进入命令流 */
+        neox_frame_cancel(f);
+        neox_path_release(dev,valid);
+    }
+    {
+        float over[4]={2.0f,0.0f,0.0f,2.0f}, nanv[4]={NAN,0.0f,0.0f,0.5f};
+        uint8_t q[4];
+        nx_premul_linear_to_srgb8(over,q);
+        CHECK(q[0]==255 && q[3]==255);
+        nx_premul_linear_to_srgb8(nanv,q);
+        CHECK(q[0]==0 && q[1]==0 && q[2]==0 && q[3]==128);
+    }
+
     neox_texture_release(dev,tex);neox_device_destroy(dev);CHECK(!ctx->used);neox_context_destroy(ctx);
     puts("ALL PASS (recording count exhaustion, atomic pins, CAP and scene rollback)");
     return 0;

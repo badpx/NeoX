@@ -166,6 +166,7 @@ typedef struct nx_node_slot {
     uint32_t   *children;       /* 子节点槽索引数组（文档顺序） */
     uint32_t    child_count, child_cap;
     uint32_t    dirty;          /* 定点修改的脏位（当前粗粒度重绘，见 scene.c 注释） */
+    uint32_t    height;         /* 子树高度：叶节点为 0（P1-11 深度上限用） */
     /* 内容（*_id 为创建时句柄的副本：渲染期重校验，资源释放后再渲染为契约错误） */
     union {
         struct { uint32_t path_idx; uint64_t path_id; neox_paint paint; } path;
@@ -329,18 +330,35 @@ static inline void nx_paint_to_premul_linear(neox_color c, float out[4])
 
 /* 预乘线性 → sRGB8 非预乘量化（§9：round-to-nearest, ties-to-even）。
  * a==0 时输出全零（非预乘除法无定义，取最不惊讶的零）。 */
+static inline uint8_t nx_quant_u8(float v)
+{
+    /* 负值/NaN 归零，>1 饱和；舍入后仍钳到 [0,255]，保证不会转换成
+     * 未定义的整数（P1-10：alpha 与 RGB 在量化处同样钳制，而不是靠
+     * 输入此时已被校验）。 */
+    float q;
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    q = lrintf(v * 255.0f);
+    if (q < 0.0f) return 0;
+    if (q > 255.0f) return 255;
+    return (uint8_t)q;
+}
+
 static inline void nx_premul_linear_to_srgb8(const float p[4], uint8_t out[4])
 {
-    if (p[3] <= 0.0f) { out[0] = out[1] = out[2] = out[3] = 0; return; }
+    if (!(p[3] > 0.0f)) { out[0] = out[1] = out[2] = out[3] = 0; return; }
     float ia = 1.0f / p[3];
     float r = p[0] * ia, g = p[1] * ia, b = p[2] * ia;
     if (r > 1.0f) r = 1.0f;
     if (g > 1.0f) g = 1.0f;
     if (b > 1.0f) b = 1.0f;
-    out[0] = (uint8_t)lrintf(nx_linear_to_srgb(r) * 255.0f);
-    out[1] = (uint8_t)lrintf(nx_linear_to_srgb(g) * 255.0f);
-    out[2] = (uint8_t)lrintf(nx_linear_to_srgb(b) * 255.0f);
-    out[3] = (uint8_t)lrintf(p[3] * 255.0f);
+    if (r < 0.0f) r = 0.0f;
+    if (g < 0.0f) g = 0.0f;
+    if (b < 0.0f) b = 0.0f;
+    out[0] = nx_quant_u8(nx_linear_to_srgb(r));
+    out[1] = nx_quant_u8(nx_linear_to_srgb(g));
+    out[2] = nx_quant_u8(nx_linear_to_srgb(b));
+    out[3] = nx_quant_u8(p[3] > 1.0f ? 1.0f : p[3]);
 }
 
 /* ------------------------------------------------------------------ 仿射（规范 §3） */
@@ -647,10 +665,15 @@ void nx_texture_expand_row(const nx_tex_slot *slot, const nx_tex_data *data, uin
 
 /* Backend-neutral recording/resource module boundaries (private API). */
 #define NX_MAX_TEXTURE_SIZE 16384u
+/* 颜色边界（P1-10）：分量必须在 [0,1]。NaN/Inf、负值与 >1 都拒绝——旧实现
+ * 只拒绝 NaN，量化路径直接截断：alpha=255 会被当成 0（整笔消失），
+ * RGB>1 会让 Soft 输出饱和、GL/Metal 浮点层越界。 */
 static inline int nx_color_is_bad(neox_color c)
 {
     return nx_float_bad(c.r) || nx_float_bad(c.g) ||
-           nx_float_bad(c.b) || nx_float_bad(c.a);
+           nx_float_bad(c.b) || nx_float_bad(c.a) ||
+           c.r < 0.0f || c.r > 1.0f || c.g < 0.0f || c.g > 1.0f ||
+           c.b < 0.0f || c.b > 1.0f || c.a < 0.0f || c.a > 1.0f;
 }
 void nx_reap_resources(neox_device *dev);
 neox_result nx_texture_from_linear(neox_device *dev, uint32_t w, uint32_t h,
@@ -661,7 +684,8 @@ neox_result nx_validate_glyphs(neox_device *dev, uint32_t idx,
         const neox_glyph_style *style);
 neox_result nx_emit_push(neox_frame *fr, neox_affine ctm, float opacity,
                              neox_blend blend, uint32_t flags,
-                             int32_t clip_idx, uint64_t clip_id);
+                             int32_t clip_idx, uint64_t clip_id,
+                             int force_isolate);
 void nx_commands_free(neox_context *ctx, nx_cmd *cmds, uint32_t n);
 neox_result nx_cmd_ref(neox_device *dev, const nx_cmd *c, int acquire);
 void nx_frame_destroy(neox_device *dev, neox_frame *fr);

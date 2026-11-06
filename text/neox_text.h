@@ -52,7 +52,13 @@ typedef struct nx_font nx_font;
 /* [own] 从文件加载（整个文件读入模块缓冲，随字体存活） */
 neox_result nx_font_load_file(nx_text_context *tctx, const char *path,
                               int ttc_index, nx_font **out_font);
-/* [own] 从内存加载（data 在 [borrow]；模块内部拷贝，调用方可立即释放） */
+/* [own] 从内存加载（data 在 [borrow]；模块内部拷贝，调用方可立即释放）
+ * 不可信输入的部分加固（不是完整的字体安全边界）：进入 stb_truetype 之前
+ * 做长度感知的结构校验——sfnt/TTC 头与表目录全部在缓冲内；必需表
+ * cmap/head/hhea/maxp/hmtx 齐全且达到最小长度；glyf+loca 或 CFF 存在；
+ * loca 覆盖 numGlyphs 且偏移单调、落在 glyf 内；cmap 子表头部与声明长度
+ * 在表内；hmtx 长度与 hhea/maxp 一致。任何一项失败返回 INVALID_ARGUMENT。
+ * 仍未逐项校验 stb 内部访问的每个可选表（如 kern、GSUB）。 */
 neox_result nx_font_load_memory(nx_text_context *tctx, const void *data,
                                 size_t size, int ttc_index, nx_font **out_font);
 /* [own] 显式销毁（亦可随文本上下文级联销毁）。先销毁借用此字体的 layout。
@@ -117,22 +123,30 @@ typedef struct nx_laid_glyph {
 typedef struct nx_layout {
     nx_laid_glyph *glyphs;
     uint32_t glyph_count;
-    float width, height;             /* 内容包围盒（已含对齐偏移） */
+    float width;                     /* 内容宽度 = bbox_x1 − bbox_x0（P1-15/16） */
+    float height;                    /* 内容包围盒（已含对齐偏移） */
     float ascent, descent, line_gap; /* 该字号行度量 */
     float line_height;
     uint32_t line_count;
     float size_px;
+    float bbox_x0, bbox_x1;          /* 含对齐偏移的水平范围（nx_text_measure） */
+    uint8_t *blank;                  /* 逐字形空白标记（构建期使用；nx_layout 拥有） */
+    uint32_t blank_cap;
+    uint32_t line_trail_glyphs;      /* 构建期：当前行末尾空白字形数 */
     nx_font *font;                   /* [borrow] 字体必须比此布局存活更久 */
     /* —— 内部字段（实现使用，调用方勿依赖，v0 后为不透明化预留） —— */
     uint32_t glyph_cap;
-    struct nx_line_info *line;       /* 行表：范围 + 自然宽度（对齐前） */
+    struct nx_line_info *line;       /* 行表：范围 + 内容宽（不含行尾空白） */
     uint32_t line_cap;
     struct nx_text_context *tctx;
 } nx_layout;
 
 /* [own] 简化排版：UTF-8 解码（非法序列替换为 U+FFFD）→ cmap → 字距 →
  * LTR 贪心断行（CJK 逐字可断、拉丁按词；'\n' 强制断行）→ 对齐。
- * size_px/max_width 须有限，size_px > 0；max_width <= 0 表示不换行。
+ * size_px/max_width 须有限且 size_px > 0；字号按 1/4 像素量化，量化到 0 的
+ * 极端小字号（< 0.125px）在图集里钳到 0.25px 并给出 last_error。
+ * max_width <= 0 表示不换行。行尾的 ASCII 空格/制表不计入行宽（对齐按
+ * 内容宽），行内空白照常计入。
  * 度量/字距或累计坐标无法表示为有限 float 时返回 INVALID_ARGUMENT，
  * 分配失败返回 OUT_OF_MEMORY；失败不返回部分 layout。
  * font 必须属于 tctx；布局须先于字体和 tctx 销毁。 */
@@ -141,7 +155,8 @@ neox_result nx_text_layout(nx_text_context *tctx, nx_font *font, float size_px,
                            nx_text_align align, nx_layout **out_layout);
 void nx_layout_destroy(nx_layout *layout);
 
-/* 排版结果包围盒 [x0, y0, x1, y1]（布局坐标系，y 向下） */
+/* 排版结果包围盒 [x0, y0, x1, y1]（布局坐标系，y 向下）。
+ * 失败（layout 为 NULL、度量非有限）时不写 out_bbox，调用方原值保留。 */
 neox_result nx_text_measure(const nx_layout *layout, float out_bbox[4]);
 
 /* ------------------------------------------------------------------ 动态图集

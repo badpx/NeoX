@@ -206,7 +206,10 @@ neox_result neox_window_create(const neox_present_desc *desc, neox_window **out)
 static void window_device_detached(void *owner)
 {
     neox_window *win = owner;
-    if (win->vt->gpu && win->vt->gpu->detach) win->vt->gpu->detach(win);
+    /* 只有 GPU 窗口才走 GPU detach：Cocoa 的 detach 会拆 CAMetalLayer 并把
+     * 图层换回空 CALayer，Soft 窗口误走一次就会丢掉 image/layer（P2-3）。 */
+    if (win->is_gpu && win->vt->gpu && win->vt->gpu->detach)
+        win->vt->gpu->detach(win);
     win->dev = NULL; win->ctx = NULL; win->is_gpu = 0;
     win->soft_w = win->soft_h = 0;
 #if NEOX_ENABLE_GL
@@ -506,7 +509,12 @@ neox_result neox_window_read_pixels(neox_window *win, uint8_t *out_pixels)
     if (win->is_gpu) {
         if (!win->gl_surf || win->gl_w != win->px_w || win->gl_h != win->px_h)
             return NEOX_ERROR_INVALID_ARGUMENT;
-        return neox_gl_surface_read_presented(win->gl_surf, out_pixels);
+        neox_result r = nx_gl_surface_read_presented_impl(win->gl_surf, out_pixels);
+        if (r != NEOX_OK)
+            nx_win_set_error(r == NEOX_ERROR_UNSUPPORTED
+                             ? "no requested GPU snapshot (call request_readback before present)"
+                             : "GPU snapshot readback failed");
+        return r;
     }
 #endif
     if (!win->is_gpu && !soft_target_current(win)) {

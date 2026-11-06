@@ -15,7 +15,19 @@ set(package_hint)
 if(NOT NEOX_PACKAGE_DIR MATCHES "^(lib|lib64)/cmake/NeoX$")
   list(APPEND package_hint "-DNeoX_DIR=${root}/relocated/${NEOX_PACKAGE_DIR}")
 endif()
-run("${CMAKE_COMMAND}" -S "${root}/source" -B "${root}/build"
+set(toolchain_hint)
+if(NEOX_CONSUMER_GENERATOR)
+  list(APPEND toolchain_hint "-G" "${NEOX_CONSUMER_GENERATOR}")
+endif()
+# make 程序只在 Makefile 生成器下由外层给定；Ninja 等生成器由 CMake 自行
+# 定位可执行文件，本测试不宣称覆盖“外部指定 Ninja 路径”的场景。
+if(NEOX_CONSUMER_MAKE_PROGRAM AND NEOX_CONSUMER_GENERATOR MATCHES "Makefiles")
+  list(APPEND toolchain_hint "-DCMAKE_MAKE_PROGRAM=${NEOX_CONSUMER_MAKE_PROGRAM}")
+endif()
+if(NEOX_CONSUMER_C_COMPILER)
+  list(APPEND toolchain_hint "-DCMAKE_C_COMPILER=${NEOX_CONSUMER_C_COMPILER}")
+endif()
+run("${CMAKE_COMMAND}" -S "${root}/source" -B "${root}/build" ${toolchain_hint}
   ${package_hint} "-DCMAKE_PREFIX_PATH=${root}/relocated" "-DCMAKE_BUILD_TYPE=${NEOX_CONFIG}")
 run("${CMAKE_COMMAND}" --build "${root}/build" --config "${NEOX_CONFIG}")
 run("${CMAKE_CTEST_COMMAND}" --test-dir "${root}/build" -C "${NEOX_CONFIG}" --output-on-failure)

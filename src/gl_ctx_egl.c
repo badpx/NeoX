@@ -95,6 +95,8 @@ struct nx_gl_ctx {
     int can_window;
     int lost;
     const char *kind;
+    void (*dealloc)(void *, void *); /* 外壳的释放器（注入分配器）；NULL=平台自建 */
+    void *alloc_user;
 };
 
 #define NX_NATIVE_MAX 4
@@ -132,6 +134,34 @@ static PFN_eglSwapInterval         p_swapInterval;
 static PFN_eglGetPlatformDisplay   p_getPlatformDisplay;
 static PFN_eglGetConfigAttrib      p_getConfigAttrib;
 
+/* 加载状态：未尝试 / 成功 / 失败。任一入口缺失即 dlclose 并清空整张函数表；
+ * 失败后再次调用会重新尝试，绝不会把"库句柄非空"误判为"入口齐全"。 */
+#define NX_EGL_LOAD_UNTRIED 0
+#define NX_EGL_LOAD_OK      1
+#define NX_EGL_LOAD_FAILED  2
+static int g_load_state = NX_EGL_LOAD_UNTRIED;
+
+#ifndef NX_TEST_HOOK_DLOPEN
+#define NX_TEST_HOOK_DLOPEN 0
+#endif
+#if NX_TEST_HOOK_DLOPEN
+extern void *nx_test_egl_dlopen(const char *name, int flags);
+extern void *nx_test_egl_dlsym(void *handle, const char *symbol);
+#define nx_egl_dlopen(n, f) nx_test_egl_dlopen((n), (f))
+#define nx_egl_dlsym(h, s) nx_test_egl_dlsym((h), (s))
+#else
+#define nx_egl_dlopen(n, f) dlopen((n), (f))
+#define nx_egl_dlsym(h, s) dlsym((h), (s))
+#endif
+#if NX_TEST_HOOK_DLOPEN
+extern int nx_test_egl_dlclose(void *handle);
+#define nx_egl_dlclose(h) nx_test_egl_dlclose((h))
+#else
+#define nx_egl_dlclose(h) ((h) ? dlclose((h)) : 0)
+#endif
+
+size_t nx_gl_ctx_struct_size(void) { return sizeof(struct nx_gl_ctx); }
+
 const char *nx_gl_ctx_last_error(void) { return g_err; }
 const char *nx_gl_ctx_kind(const nx_gl_ctx *ctx)
 {
@@ -139,6 +169,31 @@ const char *nx_gl_ctx_kind(const nx_gl_ctx *ctx)
 }
 
 static void set_err(const char *msg) { g_err = msg; }
+
+/* 上下文外壳由调用方（gl.c）经注入分配器分配后交给平台层填充字段，
+ * 平台层不再自行 malloc，保证 CPU 内存全量经过 neox 分配器记账。
+ * 外壳的释放同样由调用方用同一分配器完成（nx_gl_ctx_destroy 只释放
+ * 平台资源，不 free 外壳）。 */
+nx_gl_ctx *nx_gl_ctx_alloc_host(void *(*alloc)(void *, size_t),
+                                void (*dealloc)(void *, void *), void *user)
+{
+    nx_gl_ctx *ctx;
+    if (!!alloc != !!dealloc) return NULL;
+    ctx = alloc ? (nx_gl_ctx *)alloc(user, sizeof(*ctx))
+                : (nx_gl_ctx *)malloc(sizeof(*ctx));
+    if (!ctx) return NULL;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->dealloc = dealloc;
+    ctx->alloc_user = user;
+    return ctx;
+}
+
+void nx_gl_ctx_free_host(nx_gl_ctx *ctx)
+{
+    if (!ctx) return;
+    if (ctx->dealloc) ctx->dealloc(ctx->alloc_user, ctx);
+    else free(ctx);
+}
 
 static void set_err_egl(const char *prefix)
 {
@@ -173,11 +228,25 @@ static int ext_has(const char *ext, const char *name)
     return 0;
 }
 
+static void unload_lib(void)
+{
+    if (g_lib) nx_egl_dlclose(g_lib);
+    g_lib = NULL;
+    p_getProc = NULL; p_getDisplay = NULL; p_initialize = NULL;
+    p_terminate = NULL; p_bindAPI = NULL; p_chooseConfig = NULL;
+    p_createContext = NULL; p_destroyContext = NULL; p_makeCurrent = NULL;
+    p_getError = NULL; p_queryString = NULL; p_createPbuffer = NULL;
+    p_createWindow = NULL; p_destroySurface = NULL; p_swapBuffers = NULL;
+    p_swapInterval = NULL; p_getPlatformDisplay = NULL; p_getConfigAttrib = NULL;
+    g_load_state = NX_EGL_LOAD_FAILED;
+}
+
 static int load_lib(void)
 {
-    if (g_lib) return 1;
-    g_lib = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (!g_lib) g_lib = dlopen("libEGL.so", RTLD_NOW | RTLD_LOCAL);
+    if (g_load_state == NX_EGL_LOAD_OK && g_lib) return 1;
+    g_load_state = NX_EGL_LOAD_FAILED;
+    g_lib = nx_egl_dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!g_lib) g_lib = nx_egl_dlopen("libEGL.so", RTLD_NOW | RTLD_LOCAL);
     if (!g_lib) {
         const char *de = dlerror();
         snprintf(g_errbuf, sizeof g_errbuf, "EGL: dlopen libEGL.so.1 failed%s%s",
@@ -188,7 +257,7 @@ static int load_lib(void)
     /* dlsym 返回对象指针。经 union 转到函数指针，避免 -Wcast-function-type。 */
 #define NX_DLSYM(dst, type, sym) do { \
         union { void *vp; type fp; } u_; \
-        u_.vp = dlsym(g_lib, sym); \
+        u_.vp = nx_egl_dlsym(g_lib, sym); \
         dst = u_.fp; \
     } while (0)
     NX_DLSYM(p_getProc, PFN_eglGetProcAddress, "eglGetProcAddress");
@@ -211,6 +280,7 @@ static int load_lib(void)
         !p_bindAPI || !p_chooseConfig || !p_createContext || !p_destroyContext ||
         !p_makeCurrent || !p_getError || !p_createPbuffer || !p_destroySurface ||
         !p_createWindow || !p_swapBuffers) {
+        unload_lib();
         set_err("EGL: libEGL is missing a required entry point");
         return 0;
     }
@@ -223,6 +293,7 @@ static int load_lib(void)
         p_getPlatformDisplay = u.plat;
     }
 #undef NX_DLSYM
+    g_load_state = NX_EGL_LOAD_OK;
     return 1;
 }
 
@@ -441,7 +512,15 @@ static int make_current_or_pbuffer(EGLDisplay dpy, EGLContext *glctx,
     return 1;
 }
 
+
 nx_gl_ctx *nx_gl_ctx_create(const neox_gl_device_desc *desc)
+{
+    return nx_gl_ctx_create_hosted(desc, NULL, NULL, NULL);
+}
+
+nx_gl_ctx *nx_gl_ctx_create_hosted(const neox_gl_device_desc *desc,
+                                   nx_gl_host_alloc alloc,
+                                   nx_gl_host_free dealloc, void *user)
 {
     EGLConfig cfg = NULL;
     EGLContext share;
@@ -478,7 +557,7 @@ nx_gl_ctx *nx_gl_ctx_create(const neox_gl_device_desc *desc)
             return NULL;
     }
 
-    out = (nx_gl_ctx *)calloc(1, sizeof(*out));
+    out = nx_gl_ctx_alloc_host(alloc, dealloc, user);
     if (!out) {
         drop_ctx(dpy, glctx, surf);
         if (native) native_release(dpy);
@@ -591,7 +670,8 @@ void nx_gl_ctx_destroy(nx_gl_ctx *ctx)
     native = ctx->native;
     if (dpy != EGL_NO_DISPLAY)
         drop_ctx(dpy, ctx->ctx, ctx->surface);
-    free(ctx);
+    /* 外壳由宿主分配、宿主释放（nx_gl_ctx_free_host）；这里不能读 ctx 的
+     * 任何字段，也不 free 外壳。 */
     if (native) {
         native_release(dpy);
         return;

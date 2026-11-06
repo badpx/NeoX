@@ -45,6 +45,16 @@ static uint32_t delayed_poll(neox_device *d) {
     return 0;
 }
 int main(void) {
+    /* 评审 4489969184：neox_context_desc.flags 是保留字段，契约要求 0（
+     * include/neox.h）。非零必须拒绝、输出置 NULL，且没有 context 可承载
+     * 详情时 neox_get_error_detail(NULL) 给出静态说明。 */
+    {
+        neox_context_desc bad = { NULL, 0, 1 };
+        neox_context *out = (neox_context *)(uintptr_t)1;
+        CHECK(neox_context_create(&bad, &out) == NEOX_ERROR_INVALID_ARGUMENT);
+        CHECK(out == NULL);
+        CHECK(neox_get_error_detail(NULL) != NULL);
+    }
     tracker tr={0}; neox_allocator al={&tr,alloc,release};
     neox_context_desc cd={&al,0,0}; neox_context *ctx,*other;
     neox_device *d,*d2; neox_submission sub, stale_sub;

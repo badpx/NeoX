@@ -13,6 +13,7 @@
  * 内存：持久与 stb 临时分配均经注入分配器，并计入所属核心 context 预算。
  * =========================================================================*/
 #include "neox_text.h"
+
 #include "module.h"
 #include <float.h>
 
@@ -65,6 +66,10 @@ static void *tx_array_grow(nx_text_context *t, void *arr, size_t elem,
 }
 
 #define TX_ERR(t, msg, code) do { (t)->last_error = (msg); return (code); } while (0)
+/* API 边界（P2-9）：确认 out 非空后立刻清空输出指针，之后任何早期失败都
+ * 不会把上一份/垃圾布局指针留给调用方。 */
+#define TM_ERR(t, out, msg, code) \
+    do { *(out) = NULL; TX_ERR(t, msg, code); } while (0)
 
 static int tx_float_range(double x)
 {
@@ -589,6 +594,225 @@ static uint32_t font_glyph_index(nx_font *f, uint32_t codepoint)
     return (uint32_t)stbtt_FindGlyphIndex(&f->stb, (int)codepoint);
 }
 
+/* ------------------------------------------------------------------ 字体头校验
+ * stb_truetype 假定输入是可信字体：ttcf 头里任意的表偏移/长度都会被直接
+ * 用于越界读取。Text 层在把数据交给 stb 之前做长度感知的结构校验：
+ *   - sfnt 头（0x00010000 / 'true' / 'OTTO'）或 'ttcf' 集合头；
+ *   - TTC 目录与 offset table（numTables、各表 offset/length）全部在缓冲内；
+ *   - 每个表目录项的 offset 与 length 均不超过文件长度，且不溢出。
+ * 任何一项失败都返回 INVALID_ARGUMENT，绝不进入 stbtt_InitFont（P0-3）。 */
+#define NX_SFNT_MAX_TABLES 512u
+
+static uint32_t tx_rd_u16(const uint8_t *p) { return (uint32_t)p[0] << 8 | p[1]; }
+static uint32_t tx_rd_u32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static int tx_sfnt_tag_ok(uint32_t tag)
+{
+    return tag == 0x00010000u || tag == 0x4F54544Fu /* 'OTTO' */ ||
+           tag == 0x74727565u /* 'true' */ || tag == 0x74797031u /* 'typ1' */;
+}
+
+typedef struct tx_sfnt_table {
+    uint32_t tag;
+    uint32_t off;      /* 相对文件开头 */
+    uint32_t len;
+} tx_sfnt_table;
+
+/* 读 16 位元素的偏移（相对表起点）：base + idx*2 + 2 <= size 才合法。 */
+static int tx_in(const uint8_t *d, size_t size, uint64_t base, uint64_t rel, uint64_t n)
+{
+    (void)d;
+    return base <= size && rel <= size - base && n <= size - base - rel;
+}
+
+/* 必需表的最小长度：
+ *   head  : 54 字节（indexToLocFormat 在 +50）
+ *   hhea  : 36 字节（numberOfHMetrics 在 +34）
+ *   maxp  : 6 字节（numGlyphs 在 +4）
+ *   hmtx  : 4 × numberOfHMetrics + 2 × (numGlyphs − numberOfHMetrics)
+ *   loca  : 2/4 × (numGlyphs + 1)
+ *   glyf  : 0（可为空，但 loca 的偏移都必须落在表内）
+ *   cmap  : 4 字节头部，编码记录及子表按各自格式检查
+ * CFF 字体（'OTTO'）以 'CFF '/'CFF2' 代替 glyf/loca。 */
+static int tx_check_required_tables(const uint8_t *d, size_t size,
+                                    const tx_sfnt_table *tbl, uint32_t n)
+{
+    const tx_sfnt_table *head = NULL, *hhea = NULL, *maxp = NULL, *hmtx = NULL;
+    const tx_sfnt_table *cmap = NULL, *glyf = NULL, *loca = NULL, *cff = NULL;
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        switch (tbl[i].tag) {
+        case 0x68656164u: head = &tbl[i]; break; /* 'head' */
+        case 0x68686561u: hhea = &tbl[i]; break; /* 'hhea' */
+        case 0x6D617870u: maxp = &tbl[i]; break; /* 'maxp' */
+        case 0x686D7478u: hmtx = &tbl[i]; break; /* 'hmtx' */
+        case 0x636D6170u: cmap = &tbl[i]; break; /* 'cmap' */
+        case 0x676C7966u: glyf = &tbl[i]; break; /* 'glyf' */
+        case 0x6C6F6361u: loca = &tbl[i]; break; /* 'loca' */
+        case 0x43464620u: /* 'CFF ' */
+        case 0x43464632u: cff = &tbl[i]; break; /* 'CFF2' */
+        default: break;
+        }
+    }
+    if (!head || !hhea || !maxp || !hmtx || !cmap) return 0;
+    if (head->len < 54 || hhea->len < 36 || maxp->len < 6 || cmap->len < 4)
+        return 0;
+    {
+        uint32_t num_glyphs = tx_rd_u16(d + maxp->off + 4);
+        uint32_t nhm = tx_rd_u16(d + hhea->off + 34);
+        int16_t loc_format = (int16_t)tx_rd_u16(d + head->off + 50);
+        uint64_t hmtx_need;
+        if (num_glyphs == 0) return 0;
+        if (nhm == 0 || nhm > num_glyphs) return 0;
+        hmtx_need = (uint64_t)nhm * 4u + (uint64_t)(num_glyphs - nhm) * 2u;
+        if ((uint64_t)hmtx->len < hmtx_need) return 0;
+        if (loc_format != 0 && loc_format != 1) return 0;
+        if (!glyf && !cff) return 0;
+        if (glyf || loca) {
+            uint64_t loca_need, last;
+            uint32_t k;
+            if (!glyf || !loca) return 0;
+            loca_need = (loc_format == 0 ? 2u : 4u) * ((uint64_t)num_glyphs + 1u);
+            if ((uint64_t)loca->len < loca_need) return 0;
+            /* glyf 内的偏移必须单调且落在 glyf 表内（loca 的最后一项可以不
+             * 指向表尾，但任何一项都不能越过表尾）。 */
+            last = 0;
+            for (k = 0; k <= num_glyphs; k++) {
+                uint64_t v = loc_format == 0
+                    ? (uint64_t)tx_rd_u16(d + loca->off + k * 2u) * 2u
+                    : (uint64_t)tx_rd_u32(d + loca->off + k * 4u);
+                if (v > (uint64_t)glyf->len) return 0;
+                if (k > 0 && v < last) return 0;
+                last = v;
+            }
+        }
+        /* cmap：numTables 与每张子表（format / length）都必须落在表内。 */
+        {
+            uint32_t nt = tx_rd_u16(d + cmap->off + 2);
+            uint32_t k;
+            if (nt == 0) return 0;
+            if (nt > (cmap->len - 4u) / 8u) return 0;
+            if (!tx_in(d, size, cmap->off, 4u, (uint64_t)nt * 8u)) return 0;
+            for (k = 0; k < nt; k++) {
+                uint32_t sub = tx_rd_u32(d + cmap->off + 4u + k * 8u + 4u);
+                uint32_t fmt, len, header;
+                const uint8_t *p;
+                if ((uint64_t)sub + 4u > cmap->len) return 0;
+                if (!tx_in(d, size, cmap->off, sub, 4u)) return 0;
+                fmt = tx_rd_u16(d + cmap->off + sub);
+                p = d + cmap->off + sub;
+                switch (fmt) {
+                case 10: header = 20; break;
+                case 12: case 13: header = 16; break;
+                case 14: header = 10; break;
+                case 0: header = 262; break;
+                case 4: header = 16; break;
+                case 6: header = 10; break;
+                default: header = 4; break;
+                }
+                if (header > cmap->len - sub) return 0;
+                switch (fmt) {
+                case 10: case 12: case 13:
+                    len = tx_rd_u32(p + 4);
+                    break;
+                case 14:
+                    len = tx_rd_u32(p + 2);
+                    break;
+                default:
+                    len = tx_rd_u16(p + 2);
+                    break;
+                }
+                if (len < header || len > cmap->len - sub) return 0;
+                /* Counted arrays must fit in their own subtable, not merely the
+                 * font buffer. This is structural hardening, not a validator
+                 * for every nested reference used by the font parser. */
+                switch (fmt) {
+                case 4: {
+                    uint32_t seg2 = tx_rd_u16(p + 6);
+                    if (!seg2 || (seg2 & 1u) || seg2 / 2u > (len - 16u) / 8u)
+                        return 0;
+                    break;
+                }
+                case 6:
+                    if (tx_rd_u16(p + 8) > (len - 10u) / 2u) return 0;
+                    break;
+                case 10:
+                    if (tx_rd_u32(p + 16) > (len - 20u) / 2u) return 0;
+                    break;
+                case 12: case 13:
+                    if (tx_rd_u32(p + 12) > (len - 16u) / 12u) return 0;
+                    break;
+                case 14:
+                    if (tx_rd_u32(p + 6) > (len - 10u) / 11u) return 0;
+                    break;
+                default: break;
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+/* 校验 offset 处的 SFNT 头与表目录；返回 1 = 合法。 */
+static int tx_check_sfnt(const uint8_t *d, size_t size, size_t offset)
+{
+    uint32_t num_tables, i;
+    size_t dir_start;
+    tx_sfnt_table tbl[NX_SFNT_MAX_TABLES]; /* 512 × 12B = 6 KiB 栈上临时表 */
+    int ok;
+    if (offset > size || size - offset < 12) return 0;
+    if (!tx_sfnt_tag_ok(tx_rd_u32(d + offset))) return 0;
+    num_tables = tx_rd_u16(d + offset + 4);
+    if (num_tables == 0 || num_tables > NX_SFNT_MAX_TABLES) return 0;
+    dir_start = offset + 12;
+    /* numTables × 16 字节目录；用除法形式避免 32 位乘法溢出。 */
+    if ((size - dir_start) / 16u < num_tables) return 0;
+    ok = 1;
+    for (i = 0; i < num_tables; i++) {
+        const uint8_t *rec = d + dir_start + (size_t)i * 16u;
+        uint32_t off = tx_rd_u32(rec + 8);
+        uint32_t len = tx_rd_u32(rec + 12);
+        /* 目录项本身、表偏移与长度都必须在缓冲内且不溢出；
+         * 表不能落在 SFNT 头之前（评审 4489969086 的 108 字节反例正是
+         * offset == size、length == 0，表体为空）。 */
+        if ((uint64_t)off + (uint64_t)len > (uint64_t)size) { ok = 0; break; }
+        if (off < offset) { ok = 0; break; }
+        tbl[i].tag = tx_rd_u32(rec);
+        tbl[i].off = off;
+        tbl[i].len = len;
+    }
+    if (ok) ok = tx_check_required_tables(d, size, tbl, num_tables);
+    return ok;
+}
+
+/* 校验整份字体（TTC 目录 + 指定 index 的 SFNT 头）；返回 1 = 合法。 */
+static int tx_font_header_ok(const uint8_t *d, size_t size, int ttc_index)
+{
+    if (!d || size < 12) return 0;
+    if (tx_rd_u32(d) == 0x74746366u /* 'ttcf' */) {
+        uint32_t num_fonts, i;
+        uint32_t want;
+        if (size < 16) return 0;
+        num_fonts = tx_rd_u32(d + 8);
+        if (num_fonts == 0 || num_fonts > 0xFFFFu) return 0;
+        if ((size - 12u) / 4u < num_fonts) return 0;
+        if ((uint32_t)ttc_index >= num_fonts) return 0;
+        want = tx_rd_u32(d + 12 + (size_t)ttc_index * 4u);
+        for (i = 0; i < num_fonts; i++) {
+            uint32_t off = tx_rd_u32(d + 12 + (size_t)i * 4u);
+            if (off >= size) return 0;
+        }
+        return tx_check_sfnt(d, size, (size_t)want);
+    }
+    /* 非集合：只有 index 0 合法（stbtt_GetFontOffsetForIndex 返回 -1 否则）。 */
+    if (ttc_index != 0) return 0;
+    return tx_check_sfnt(d, size, 0);
+}
+
 static neox_result font_load(nx_text_context *t, const void *data, size_t size,
                              int ttc_index, nx_font **out)
 {
@@ -598,6 +822,11 @@ static neox_result font_load(nx_text_context *t, const void *data, size_t size,
         TX_ERR(t, "invalid font header or TTC index", NEOX_ERROR_INVALID_ARGUMENT);
     if (size > INT32_MAX)
         TX_ERR(t, "font exceeds parser offset range", NEOX_ERROR_UNSUPPORTED);
+    /* Reject malformed headers and covered table structures before stb parsing.
+     * This partial validation does not make arbitrary untrusted fonts safe. */
+    if (!tx_font_header_ok((const uint8_t *)data, size, ttc_index))
+        TX_ERR(t, "malformed TrueType/OpenType header, table directory or TTC index",
+               NEOX_ERROR_INVALID_ARGUMENT);
     neox_result result = font_alloc(t, &f);
     if (result != NEOX_OK) return result;
     f->data = (uint8_t *)tx_alloc(t, size, 16);
@@ -721,11 +950,35 @@ float nx_font_line_gap(nx_font *f,float size) {return font_metric(f,f?f->be.line
 
 /* ------------------------------------------------------------------ 排版 */
 
-/* CJK 可断行区间（逐字可断；含全角形式与 CJK 标点） */
+/* Unicode 可断行空白（P2-11，评审 4489969125）：先判空白再判 CJK。
+ * 旧实现把 U+3000（表意空格）归入 CJK 区间，于是它被当成可断行字符、
+ * 按词内字距处理，行首行尾的空白规则也不生效。
+ * ASCII 部分与既有的分词规则一一对应（' '、'\t' 视为空白，'\n' 由调用方
+ * 单独判定）。
+ * U+00A0 / U+202F 是不换行空白：它们**不是**断行点、不参与行首尾丢弃，
+ * 按普通内容字符处理（行内宽度照常计入）。 */
+static int nx_is_space_cp(uint32_t cp)
+{
+    if (cp == 0x20u || cp == 0x09u) return 1;
+    if (cp >= 0x2000u && cp <= 0x200Au) return 1;
+    if (cp == 0x1680u || cp == 0x2028u || cp == 0x2029u || cp == 0x205Fu ||
+        cp == 0x3000u)
+        return 1;
+    return 0;
+}
+
+static int nx_is_nbsp_cp(uint32_t cp)
+{
+    return cp == 0x00A0u || cp == 0x202Fu;
+}
+
+/* CJK 可断行区间（逐字可断；含全角形式与 CJK 标点）。U+3000 空白已由
+ * nx_is_space_cp 先判，不在本函数的语义内。 */
 static int nx_is_cjk(uint32_t cp)
 {
-    return (cp >= 0x2E80 && cp <= 0x9FFF) ||
-           (cp >= 0x3000 && cp <= 0x30FF) ||
+    return (cp >= 0x2E80 && cp <= 0x2FFFu) ||
+           (cp >= 0x3001 && cp <= 0x9FFF) ||
+           (cp >= 0x3040 && cp <= 0x30FF) ||
            (cp >= 0xF900 && cp <= 0xFAFF) ||
            (cp >= 0xFF00 && cp <= 0xFFEF) ||
            (cp >= 0x20000 && cp <= 0x2FA1F);
@@ -734,7 +987,10 @@ static int nx_is_cjk(uint32_t cp)
 /* 行表项（结构体定义在头文件前向声明为不完整类型，此处补全） */
 struct nx_line_info {
     uint32_t start, count;
-    float width;
+    float width;      /* 行内容宽（不含行尾空白，P1-15） */
+    float trail;      /* 行尾空白宽：只参与"是否能放下"的判定，不计入行宽 */
+    uint32_t blank_glyphs; /* 行末可丢弃 ASCII 空白字形数（压缩时删除） */
+    float x0;         /* 对齐后第一个字形的 x（测量包围盒用，P1-16） */
 };
 typedef struct nx_line_info nx_line_info;
 
@@ -742,19 +998,26 @@ void nx_layout_destroy(nx_layout *lo)
 {
     if (!lo) return;
     tx_free(lo->tctx, lo->glyphs, (size_t)lo->glyph_cap * sizeof(nx_laid_glyph), 16);
+    if (lo->blank)
+        tx_free(lo->tctx, lo->blank, (size_t)lo->blank_cap, 16);
     tx_free(lo->tctx, lo->line, (size_t)lo->line_cap * sizeof(nx_line_info), 16);
     tx_free(lo->tctx, lo, sizeof(*lo), 16);
 }
 
 neox_result nx_text_measure(const nx_layout *lo, float out_bbox[4])
 {
-    if (!lo || !out_bbox) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (!out_bbox || !lo) return NEOX_ERROR_INVALID_ARGUMENT;
+    /* 评审 4489969121：失败时保留调用方输出（既有语义）。这里只做指针
+     * 校验；lo == NULL 的判断在写 out_bbox 之前，不会空指针写。 */
     double bottom = (double)(lo->line_count ? lo->line_count-1 : 0) *
                     lo->line_height - lo->descent;
-    if (!isfinite(lo->ascent) || !isfinite(lo->width) || !tx_float_range(bottom))
+    if (!isfinite(lo->ascent) || !isfinite(lo->width) || !tx_float_range(bottom) ||
+        !tx_float_range((double)lo->bbox_x0) || !tx_float_range((double)lo->bbox_x1))
         return NEOX_ERROR_INVALID_ARGUMENT;
-    out_bbox[0] = 0.0f; out_bbox[1] = -lo->ascent;
-    out_bbox[2] = lo->width; out_bbox[3] = (float)bottom;
+    /* 水平范围含对齐偏移（P1-16）：右/居中对齐的行整体右移，包围盒随之
+     * 从 x0 = min(line_off) 到 x1 = max(line_off + width)，而不是恒为 0。 */
+    out_bbox[0] = lo->bbox_x0; out_bbox[1] = -lo->ascent;
+    out_bbox[2] = lo->bbox_x1; out_bbox[3] = (float)bottom;
     return NEOX_OK;
 }
 
@@ -763,12 +1026,15 @@ typedef struct nx_token {
     uint32_t count;
     float width;       /* 含词内字距 */
     int is_space;
+    int is_blank;      /* 码点本身是 ASCII 空白：用于行尾（可见）空白处理 */
     int hard_break;    /* '\n'：强制断行占位（count=0） */
 } nx_token;
 
-static neox_result layout_finish_line(nx_layout *lo, uint32_t g0, double width)
+/* line_trail_glyphs：当前行末尾连续的可丢弃 ASCII 空白字形数。 */
+static neox_result layout_finish_line(nx_layout *lo, uint32_t g0, double width,
+                                      double trail, uint32_t blank_glyphs)
 {
-    if (!tx_float_range(width)) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (!tx_float_range(width) || !tx_float_range(trail)) return NEOX_ERROR_INVALID_ARGUMENT;
     if (lo->line_count == UINT32_MAX) return NEOX_ERROR_OUT_OF_MEMORY;
     nx_line_info *nl = tx_array_grow(lo->tctx, lo->line, sizeof(*nl),
                                     &lo->line_cap, lo->line_count+1);
@@ -777,6 +1043,12 @@ static neox_result layout_finish_line(nx_layout *lo, uint32_t g0, double width)
     lo->line[lo->line_count].start = g0;
     lo->line[lo->line_count].count = lo->glyph_count - g0;
     lo->line[lo->line_count].width = (float)width;
+    lo->line[lo->line_count].trail = (float)trail;
+    (void)blank_glyphs;
+    lo->line[lo->line_count].blank_glyphs = lo->line_trail_glyphs;
+    if (lo->line[lo->line_count].blank_glyphs > lo->glyph_count - g0)
+        lo->line[lo->line_count].blank_glyphs = lo->glyph_count - g0;
+    lo->line[lo->line_count].x0 = 0.0f;
     lo->line_count++;
     return NEOX_OK;
 }
@@ -798,19 +1070,29 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
     const char *p, *end;
     nx_token *tok = NULL;
     uint8_t *cls = NULL;
+    uint8_t *blank = NULL;      /* 逐码点：是否为可丢弃的 ASCII 空白（' '、'\t'） */
     uint32_t ntok = 0, tokcap = 0;
+    double line_trail = 0.0;   /* 当前行行尾空白宽（P1-15） */
+    double line_w = 0.0;       /* 当前行内容宽（不含行尾空白） */
+    int line_has_content = 0;
 
-    if (!t || !font || !utf8 || !out_layout) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (!out_layout) return NEOX_ERROR_INVALID_ARGUMENT;
     *out_layout = NULL;
-    if (font->tctx != t)
-        TX_ERR(t, "font belongs to another text context", NEOX_ERROR_OWNERSHIP_VIOLATION);
+    if (!t || !font || !utf8) return NEOX_ERROR_INVALID_ARGUMENT;
     t->last_error = NULL;
-    if (!isfinite(size_px) || size_px <= 0.0f || !isfinite(max_width) ||
+    if (font->tctx != t)
+        TM_ERR(t, out_layout, "font belongs to another text context",
+               NEOX_ERROR_OWNERSHIP_VIOLATION);
+    /* 评审 4489969115：不再统一拒绝 < 0.25 的字号。layout 不立即光栅化，
+     * 量化到零的防护放在图集量化入口（见 atlas_lookup）。 */
+    if (!isfinite(size_px) || !(size_px > 0.0f) || !isfinite(max_width) ||
         (unsigned)align > NX_ALIGN_RIGHT)
-        TX_ERR(t, "invalid layout size, width or alignment", NEOX_ERROR_INVALID_ARGUMENT);
+        TM_ERR(t, out_layout, "invalid layout size, width or alignment",
+               NEOX_ERROR_INVALID_ARGUMENT);
     size_t text_size = strlen(utf8);
     if (text_size >= UINT32_MAX || text_size > PTRDIFF_MAX)
-        TX_ERR(t, "text exceeds layout count range", NEOX_ERROR_INVALID_ARGUMENT);
+        TM_ERR(t, out_layout, "text exceeds layout count range",
+               NEOX_ERROR_INVALID_ARGUMENT);
 
     lo = (nx_layout *)tx_alloc(t, sizeof(*lo), 16);
     if (!lo) TX_ERR(t, "layout allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
@@ -855,18 +1137,20 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
     {
         /* 码点类别数组（1=空白 2=CJK 3=词字符 4=换行） */
         cls = (uint8_t *)tx_alloc(t, n ? n : 1, 16);
+        blank = (uint8_t *)tx_alloc(t, n ? n : 1, 16);
         double pen;
         uint32_t line_g0 = 0;
-        double line_w = 0.0;
         uint32_t tok_i;
 
-        if (!cls) goto oom;
+        if (!cls || !blank) goto oom;
         p = utf8;
         {
             uint32_t k = 0;
             while (k < n && nx_utf8_next(&p, end, &i)) {
+                blank[k] = (uint8_t)(i == 0x20u || i == 0x09u);
                 if (i == '\n') cls[k] = 4;
-                else if (i == ' ' || i == '\t') cls[k] = 1;
+                else if (nx_is_nbsp_cp(i)) cls[k] = 3;    /* 不换行空白：内容字符 */
+                else if (nx_is_space_cp(i)) cls[k] = 1;   /* 空白优先于 CJK */
                 else if (nx_is_cjk(i)) cls[k] = 2;
                 else cls[k] = 3;
                 k++;
@@ -883,8 +1167,19 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
                 tk.hard_break = 1;
                 tk.count = 1;
                 i += 1;
-            } else if (cls[i] == 1) {    /* 空白 */
+            } else if (cls[i] == 1 && !blank[i]) {
+                /* Unicode 空白（如 U+3000）：可断行，但作为内容字符处理（保留
+                 * 字形、参与行宽与行尾），不进入下面的行尾丢弃规则。 */
+                tk.count = 1;
+                tk.width = gadv[i];
+                i += 1;
+            } else if (cls[i] == 1) {    /* 可丢弃的 ASCII 空白 */
                 tk.is_space = 1;
+                /* 只有 ASCII 空格/制表属于"行尾可丢弃的可见空白"；其余
+                 * Unicode 空白（U+3000 等）保留字形，不参与删尾（评审
+                 * 4489969056：不从 glyph index 反推码点，用码点分类）。
+                 * 这里按输入码点复核一次：gidx[i] 是字形索引，不能当码点。 */
+                tk.is_blank = (blank && blank[i]);
                 tk.count = 1;
                 tk.width = gadv[i];
                 i += 1;
@@ -918,55 +1213,107 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
             }
         }
         tx_free(t, cls, n ? n : 1, 16); cls = NULL;
+        tx_free(t, blank, n ? n : 1, 16); blank = NULL;
 
         /* 3) 贪心断行 + 放置 */
         pen = 0.0f;
         line_g0 = 0;
         line_w = 0.0f;
+        line_trail = 0.0;
+        line_has_content = 0;
         for (tok_i = 0; tok_i < ntok; tok_i++) {
             nx_token *tk = &tok[tok_i];
             if (tk->hard_break) {
-                r = layout_finish_line(lo, line_g0, line_w);
+                r = layout_finish_line(lo, line_g0, line_w, line_trail,
+                                       lo->line_trail_glyphs);
                 if (r != NEOX_OK) goto fail;
                 pen = 0.0f;
                 line_w = 0.0f;
+                line_trail = 0.0;
+                line_has_content = 0;
                 line_g0 = lo->glyph_count;
                 continue;
             }
             /* 行首空白丢弃 */
-            if (tk->is_space && lo->glyph_count == line_g0)
+            if (tk->is_space && lo->glyph_count == line_g0) {
                 continue;
-            /* 贪心换行：本行已有内容且放不下 */
-            if (max_width > 0.0f && lo->glyph_count > line_g0 &&
+            }
+            /* 贪心换行：本行已有内容且"内容 + 已累积的行尾空白 + 本词"放不
+             * 下（行尾空白仍然参与是否换行的判定，只是不计入行宽，P1-15）。 */
+            if (max_width > 0.0f && line_has_content &&
                 pen + tk->width > max_width) {
-                r = layout_finish_line(lo, line_g0, line_w);
+                r = layout_finish_line(lo, line_g0, line_w, line_trail,
+                                       lo->line_trail_glyphs);
                 if (r != NEOX_OK) goto fail;
                 pen = 0.0f;
                 line_w = 0.0f;
+                line_trail = 0.0;
+                line_has_content = 0;
                 line_g0 = lo->glyph_count;
-                if (tk->is_space)
-                    continue;   /* 换行后行首空白同样丢弃 */
+                if (tk->is_space) {
+                    /* 这些位于上一行行尾、本该被丢弃的空格已经计入 lo->glyphs
+                     * 且没有被任何行引用（换行后行首空白丢弃）；截掉它们，
+                     * 避免留下没人引用的字形（评审：空白不应占位）。 */
+                    lo->glyph_count = line_g0;
+                    continue;
+                }
             }
             /* 放置词内字形 */
             {
                 uint32_t k;
+                /* A trailing space may become an interior space when the next
+                 * word arrives. Keep all advances until line finalization. */
                 double adv = pen;
                 for (k = 0; k < tk->count; k++) {
                     uint32_t gi = tk->glyph0 + k;
                     nx_laid_glyph lg;
                     if (lo->glyph_count == UINT32_MAX) goto oom;
                     if (lo->glyph_count == lo->glyph_cap) {
-                        nx_laid_glyph *ngl = (nx_laid_glyph *)tx_array_grow(
-                            t, lo->glyphs, sizeof(nx_laid_glyph),
-                            &lo->glyph_cap, lo->glyph_count + 1);
-                        if (!ngl) goto oom;
-                        lo->glyphs = ngl;
+                        /* 两个数组各自扩容；glyph 先扩容成功、blank 追加的内存
+                         * 失败时保留已发布的 glyph 数组，下一次重新尝试，避免
+                         * 丢失旧数组（内存泄漏/悬空）。 */
+                        uint32_t need = lo->glyph_count + 1;
+                        if (need > lo->glyph_cap) {
+                            uint32_t ncap = lo->glyph_cap ? lo->glyph_cap : 16;
+                            nx_laid_glyph *ngl;
+                            uint8_t *nb;
+                            while (ncap < need) {
+                                if (ncap > UINT32_MAX / 2) { ncap = need; break; }
+                                ncap *= 2;
+                            }
+                            /* 容量按 2 倍增长并在 UINT32_MAX 处截断；两个数组
+                             * 各自 tx_alloc 都会做 size 溢出检查。 */
+                            ngl = (nx_laid_glyph *)tx_alloc(t, (size_t)ncap *
+                                    sizeof(nx_laid_glyph), 16);
+                            if (!ngl) goto oom;
+                            if (lo->glyphs)
+                                memcpy(ngl, lo->glyphs, (size_t)lo->glyph_cap *
+                                       sizeof(nx_laid_glyph));
+                            nb = (uint8_t *)tx_alloc(t, ncap, 16);
+                            if (!nb) {
+                                tx_free(t, ngl, (size_t)ncap * sizeof(nx_laid_glyph), 16);
+                                goto oom;
+                            }
+                            if (lo->blank)
+                                memcpy(nb, lo->blank, lo->blank_cap);
+                            if (lo->glyphs)
+                                tx_free(t, lo->glyphs, (size_t)lo->glyph_cap *
+                                        sizeof(nx_laid_glyph), 16);
+                            if (lo->blank)
+                                tx_free(t, lo->blank, (size_t)lo->blank_cap, 16);
+                            lo->glyphs = ngl;
+                            lo->blank = nb;
+                            lo->glyph_cap = ncap;
+                            lo->blank_cap = ncap;
+                        }
                     }
                     lg.glyph_index = gidx[gi];
                     if (!tx_float_range(adv)) goto invalid;
                     lg.x = (float)adv;
                     lg.y = 0.0f;   /* y 在行定稿后统一设置 */
-                    lo->glyphs[lo->glyph_count++] = lg;
+                    lo->glyphs[lo->glyph_count] = lg;
+                    lo->blank[lo->glyph_count] = (uint8_t)(tk->is_space && tk->is_blank);
+                    lo->glyph_count++;
                     adv += gadv[gi];
                     if (k + 1 < tk->count) {
                         float kern = font_kerning(font,gidx[gi],gidx[gi+1],size_px);
@@ -976,16 +1323,66 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
                 }
                 if (!tx_float_range(adv)) goto invalid;
                 pen = adv;
-                line_w += tk->width;
+                {
+                    /* 标记本行末尾仍是"行尾空白"（删尾时用）：长度 = 本行
+                     * 字形数 − 行尾连续 ASCII 空白字形数。 */
+                    uint32_t j = lo->glyph_count;
+                    while (j > line_g0 && lo->blank && lo->blank[j - 1]) j--;
+                    lo->line_trail_glyphs = lo->glyph_count - j;
+                }
+                if (tk->is_space && line_has_content) {
+                    /* 行尾（可见）空白：暂不计入内容宽，只保留"是否放得下"
+                     * 所需的宽度。 */
+                    line_trail += tk->width;
+                } else {
+                    line_w += line_trail;
+                    /* 后续内容出现：先前累积的词间空白现在是**行内**空白，
+                     * 必须计回内容宽，否则 aa bb 的行宽少一个空格（评审
+                     * 4489969067：右/居中对齐会把实际末端推过 max_width）。 */
+                    line_trail = 0.0;
+                    line_w += tk->width;
+                    line_has_content = 1;
+                }
             }
         }
         /* 收尾行 */
-        r = layout_finish_line(lo, line_g0, line_w);
+        r = layout_finish_line(lo, line_g0, line_w, line_trail,
+                               lo->line_trail_glyphs);
         if (r != NEOX_OK) goto fail;
+
+        /* 行尾 ASCII 空白（P1-15 / 评审 4489969061）：行尾只影响对齐与行宽，
+     * 不产生可见像素。这里按行的原始起点 g0 检索每个字形自己的空白标记
+     * （构建期随字形一起记录，绝不从 glyph index 反推码点），再把整个字形
+     * 数组压缩到 keep 处。上一行压缩后 keep 与新行 g0 不同，用 keep 检索会
+     * 读到上一行的内容。 */
+        if (lo->line_count > 0) {
+            uint32_t keep = 0;
+            for (i = 0; i < lo->line_count; i++) {
+                uint32_t g0 = lo->line[i].start, cnt = lo->line[i].count;
+                /* 行表的 count 是"本行占用的字形数"（含行尾空白），压缩时
+                 * 必须用 kept（= 释放数量）得到保留数量；不能把 count 本身
+                 * 当剩余量再减一次。 */
+                uint32_t kept = cnt - lo->line[i].blank_glyphs;
+                cnt = kept;
+                if (g0 != keep && cnt > 0)
+                    memmove(&lo->glyphs[keep], &lo->glyphs[g0], (size_t)cnt *
+                            sizeof(nx_laid_glyph));
+                lo->line[i].start = keep;
+                lo->line[i].count = cnt;
+                keep += cnt;
+            }
+            lo->glyph_count = keep;
+            if (lo->blank)
+                tx_free(t, lo->blank, (size_t)lo->blank_cap, 16);
+            lo->blank = NULL;
+            lo->blank_cap = 0;
+        }
 
         /* 4) 对齐 + 基线 y + 包围盒 */
         {
-            float box_w = 0.0f;
+            float x0 = 0.0f, x1 = 0.0f;
+            int have_box = 0;
+            /* 行宽在放置阶段已排除行尾空白（line_w），对齐直接用它。 */
             for (i = 0; i < lo->line_count; i++) {
                 uint32_t g0 = lo->line[i].start;
                 uint32_t cnt = lo->line[i].count;
@@ -1003,9 +1400,34 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
                     lo->glyphs[g0+k].x = (float)x;
                     lo->glyphs[g0+k].y = (float)ybase;
                 }
-                if (lo->line[i].width > box_w) box_w = lo->line[i].width;
+                /* 对齐后这一行的实际范围 = [off, off + 已放置字形的右端]
+                 * （P1-16：包围盒含对齐偏移）。行宽取已放置字形决定的内容宽
+                 * （行尾空白被丢弃后，它小于含空白的排版宽度）。 */
+                lo->line[i].x0 = (float)off;
+                if (cnt > 0) {
+                    float lx1;
+                    /* 行尾空白已不计入行宽：只在"行尾空白恰好是行的全部内容"
+                     * （一行只有空白）时把它按空白宽记下，其余情况行宽就是
+                     * 放置阶段累计的内容宽。 */
+                    if (lo->line[i].width == 0.0f && lo->line[i].trail > 0.0f)
+                        lo->line[i].width = lo->line[i].trail;
+                    if (!tx_float_range(off + (double)lo->line[i].width)) goto invalid;
+                    lx1 = (float)(off + (double)lo->line[i].width);
+                    if (!have_box) {
+                        x0 = (float)off;
+                        x1 = lx1;
+                        have_box = 1;
+                    } else {
+                        if ((float)off < x0) x0 = (float)off;
+                        if (lx1 > x1) x1 = lx1;
+                    }
+                }
             }
-            lo->width = box_w;
+            /* 宽度取整行区间宽度（对齐后的 x1 − x0）；lo->width 保留最大行宽
+             * 以便左对齐时二者相同。 */
+            lo->bbox_x0 = have_box ? x0 : 0.0f;
+            lo->bbox_x1 = have_box ? x1 : 0.0f;
+            lo->width = have_box ? (x1 - x0) : 0.0f;
             double bottom = (double)(lo->line_count ? lo->line_count-1 : 0) *
                             lo->line_height - lo->descent;
             double height = bottom + lo->ascent;
@@ -1026,6 +1448,7 @@ oom:
     r = NEOX_ERROR_OUT_OF_MEMORY;
 fail:
     if (cls) tx_free(t, cls, n ? n : 1, 16);
+    if (blank) tx_free(t, blank, n ? n : 1, 16);
     if (tok) tx_free(t, tok, (size_t)tokcap * sizeof(nx_token), 16);
     if (gidx) tx_free(t, gidx, (size_t)cap_idx * 4, 16);
     if (gadv) tx_free(t, gadv, (size_t)cap_adv * 4, 16);
@@ -1109,10 +1532,11 @@ neox_result nx_atlas_create_ex(nx_text_context *t, neox_device *dev,
     nx_atlas *a;
     neox_texture_desc td;
 
-    if (!t || !dev || !out || width == 0 || height == 0 ||
+    if (!out) return NEOX_ERROR_INVALID_ARGUMENT;
+    *out = NULL; /* P2-9：确认 out 非空后立即清空 */
+    if (!t || !dev || width == 0 || height == 0 ||
         (unsigned)mode > NEOX_ATLAS_MSDF || width > 16384 || height > 16384)
         return NEOX_ERROR_INVALID_ARGUMENT;
-    *out = NULL;
     if (nx_device_context(dev) != t->core)
         TX_ERR(t, "atlas device belongs to another core context", NEOX_ERROR_OWNERSHIP_VIOLATION);
     if (!isfinite(dist_range_px) || dist_range_px < 0.0f || dist_range_px > 16384.0f)
@@ -1304,13 +1728,27 @@ static neox_result atlas_lookup(nx_atlas *a, nx_font *font, uint32_t glyph,
                                 float size_px, nx_atlas_rect *out_rect,
                                 float *out_bx, float *out_by)
 {
-    if (!a || !font || !out_rect || !isfinite(size_px) || size_px <= 0 || size_px > 16384.0f)
+    if (!a || !font || !out_rect || !isfinite(size_px) ||
+        !(size_px > 0.0f) || size_px > 16384.0f)
         return NEOX_ERROR_INVALID_ARGUMENT;
     if (font->tctx != a->tctx)
         TX_ERR(a->tctx, "font belongs to another text context", NEOX_ERROR_OWNERSHIP_VIOLATION);
     if (!font->is_custom && glyph >= (uint32_t)font->stb.numGlyphs)
         TX_ERR(a->tctx, "glyph index exceeds font glyph count", NEOX_ERROR_INVALID_ARGUMENT);
-    uint32_t size_q = (uint32_t)(size_px * 4.0f + 0.5f);
+    /* 字号按 1/4 像素量化（size*4+0.5 四舍五入到整数）。量化结果为 0 的
+     * 极端小字号（< 0.125px）在这里钳到 1，光栅回调永远收不到尺寸 0；其余
+     * 大小完全按既有的 [0, 16384] 范围工作（评审 4489969115）。 */
+    uint32_t size_q;
+    {
+        float q = size_px * 4.0f + 0.5f;
+        if (!(q >= 1.0f)) {
+            q = 1.0f;
+            a->tctx->last_error =
+                "font size quantized below one 1/4-pixel step; clamped to 0.25px";
+        }
+        if (q > (float)UINT32_MAX) q = (float)UINT32_MAX;
+        size_q = (uint32_t)q;
+    }
     uint32_t slot = atlas_hash(font->id, glyph, size_q);
     uint32_t probe;
     nx_atlas_entry *e;
@@ -1416,7 +1854,9 @@ neox_result nx_atlas_glyph(nx_atlas *a, nx_font *font, uint32_t glyph_index,
                            float size_px, nx_atlas_rect *out_rect)
 {
     float bx, by;
-    if (!a || !font || !out_rect || !(size_px > 0.0f))
+    if (!out_rect) return NEOX_ERROR_INVALID_ARGUMENT;
+    /* 失败时保留调用方的 out_rect（既有语义，评审 4489969121）。 */
+    if (!a || !font || !isfinite(size_px) || !(size_px > 0.0f))
         return NEOX_ERROR_INVALID_ARGUMENT;
     return atlas_lookup(a, font, glyph_index, size_px, out_rect, &bx, &by);
 }

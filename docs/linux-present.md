@@ -70,6 +70,17 @@ callback（最多约 100ms）。Xvfb 上交换间隔失败不算错误，帧照�
 窗口的逻辑尺寸由 `neox_window_resize` 立即改掉；Wayland 上同时把
 xdg min/max 设成这个尺寸，避免合成器把它拉成输出大小。
 
+X11 另有一条**额外窗口策略**（不是正确性必需）：映射和缩放前用
+`WM_NORMAL_HINTS` 把 min/max/base 锁成同一像素尺寸。它只是让拖拽改尺寸
+通常不发生，与下面“等窗口可见再读写”的修复没有依赖关系；不需要锁尺寸的
+应用仍可用窗口管理器改变大小（ConfigureNotify 会被接受）。
+
+窗口管理器收到 `XMapWindow` 之后才真正映射，`XSync` 返回时窗口经常还不可见。
+这时 `XGetImage` 按协议是 BadMatch；个别服务器会交回一张空白图，读回就变成
+全黑。Soft 呈现和读回会先等到窗口 `IsViewable` 且尺寸与请求一致（最多约 2
+秒）。超时返回明确的后端错误，不把空白图当成这一帧。没有窗口管理器的
+Xvfb 在 `XMapWindow` 之后立刻可见，等待在第一次查询就结束。
+
 `neox_window_acquire_target` 给出的目标是像素尺寸。应用若要按 point 绘制，
 自己压入 `{scale, 0, 0, scale, 0, 0}`，并在 `neox_frame_end` 前弹出。
 `neox_window_destroy` 会释放 `neox_window_create_device` 得到的设备
@@ -127,7 +138,7 @@ Clang 18，`-Wall -Wextra -Werror`。Mesa 25.2.8，llvmpipe（LLVM 20.1.2）。
 
 - 只实现了 Linux，而且 X11 事件布局只接受 LP64。
 - 不处理输入法、剪贴板、装饰以外的窗口状态，也不把指针锁定或滚轮轴做成独立事件。
-- Wayland 客户端把窗口 min/max 设成请求的逻辑尺寸，合成器拖拽改大小通常不会发生；程序自己调用 `neox_window_resize`。
+- Wayland 客户端把窗口 min/max 设成请求的逻辑尺寸；X11 用 `WM_NORMAL_HINTS` 做同样的锁定（额外窗口策略，见上）。窗口管理器拖拽改大小通常不会发生；程序自己调用 `neox_window_resize`。
 - Wayland GL 读的是交换前的窗口帧缓冲，不是合成器合成之后的屏幕。
 - 不支持 fractional-scale-v1。分数缩放只在 X11（`Xft.dpi`）上保留。
 - `eglSwapInterval` 在 Xvfb 上常常失败，垂直同步是尽力而为。

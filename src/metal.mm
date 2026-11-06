@@ -317,6 +317,7 @@ typedef struct nx_mtl_rt {          /* 渲染目标池项（层 / 掩码纹理�
     uint32_t w, h;
     int in_use;
     int is_layer;                   /* 1 = RGBA32Float 层；0 = R32Float 掩码 */
+    uint64_t fence_seq;             /* 最近预留该层（作为本帧基底）的提交序号（P1-12） */
     id<MTLRenderCommandEncoder> enc;/* 保留字段：活动通道由执行器的局部
                                        nx_mtl_channel 管理，enc_fail 统一结束 */
 } nx_mtl_rt;
@@ -342,6 +343,8 @@ typedef struct nx_mtl_inflight {
     nx_mtl_rt **held;               /* 执行期占用的纹理（poll 完成后归还池） */
     uint32_t nheld, capheld;
     int completed;                  /* 完成回调置位（lock 保护） */
+    uint64_t seq;                   /* 该提交的序号（P1-12 跨帧顺序） */
+    nx_mtl_rt *fence_target;        /* 写入的基底层（=base，保持占用） */
 } nx_mtl_inflight;
 
 #define NX_MTL_NMODE 13
@@ -376,6 +379,7 @@ typedef struct nx_mtl_dev {
     uint32_t premul_w, premul_h;
     /* 异步完成（回调线程只触碰 lock/done/vbo 释放） */
     pthread_mutex_t lock;
+    uint64_t submit_seq;            /* 单调递增的提交序号（P1-12） */
     uint32_t *done;                 /* 已完成 sub 槽索引（回调线程写入） */
     uint32_t done_count, done_cap;
     nx_mtl_inflight *inflight;
@@ -595,6 +599,7 @@ typedef struct nx_mtl_enc {
     nx_mtl_rt **held;
     uint32_t nheld, capheld;
     id<MTLTexture> snap_tex;   /* 本次提交的基底快照纹理（held 持有） */
+    uint64_t seq;              /* 本次提交的序号（P1-12） */
 } nx_mtl_enc;
 
 static neox_result mtl_hold(neox_context *ctx, nx_mtl_enc *e, nx_mtl_rt *rt)
@@ -1444,6 +1449,32 @@ static int mtl_needs_layer(float opacity, neox_blend blend)
 
 static uint32_t mtl_poll(neox_device *dev);
 
+/* P1-12：同一表面（基底层）连续帧的顺序。每层记录"最近一次写入它的提交
+ * 序号"；新提交在写入或读取某层之前，等待所有序号更早、仍在本层写队列里
+ * 的提交完成。等待使用 command buffer 的 waitUntilCompleted（完成回调只
+ * 登记事件），等待后调用 mtl_poll 推进状态，保证两帧不会交错执行。
+ * 查找在锁内完成并 retain，释放锁后再等待（回调也要拿这把锁）。 */
+static void mtl_wait_rt(nx_mtl_dev *g, const nx_mtl_rt *rt)
+{
+    uint32_t k, n;
+    id<MTLCommandBuffer> *cbs;
+    if (!g || !rt) return;
+    cbs = (id<MTLCommandBuffer> *)calloc(g->capinflight ? g->capinflight : 1,
+                                        sizeof(*cbs));
+    if (!cbs) return; /* 无法等待：保守地继续，不阻塞渲染 */
+    n = 0;
+    pthread_mutex_lock(&g->lock);
+    for (k = 0; k < g->ninflight; k++) {
+        if (g->inflight[k].completed) continue;
+        if (g->inflight[k].fence_target != rt) continue;
+        cbs[n++] = [g->inflight[k].cb retain];
+    }
+    pthread_mutex_unlock(&g->lock);
+    for (k = 0; k < n; k++) { [cbs[k] waitUntilCompleted]; [cbs[k] release]; }
+    free(cbs);
+    if (n) mtl_poll(g->dev);
+}
+
 static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
 {
     neox_context *ctx = dev->ctx;
@@ -1482,20 +1513,16 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
         return NEOX_ERROR_BACKEND;
     }
     sidx = (uint32_t)(sub - (nx_sub_slot *)dev->subs.slots);
-    /* P1-12：同一表面的连续帧必须在 GPU 上按提交顺序完成。Metal 队列按
-     * 入队顺序执行，但"在途只有一条"才是可推理的完成序：这里先等上一条
-     * 提交结束（完成回调置 completed），并就地收割其状态。CPU 侧此前已经
-     * 用 waitUntilCompleted 等待过一个提交（MTL surface 的 read_pixels 会
-     * 同步），因此这一步在实际使用中不会引入额外阻塞。 */
-    if (g->ninflight > 0) {
-        uint32_t k, n;
-        id<MTLCommandBuffer> cbs[8];
-        n = g->ninflight < 8 ? g->ninflight : 8;
+    /* P1-12：同一表面的连续帧必须在 GPU 上按提交顺序完成。Metal 队列本身
+     * 按入队顺序执行，但跨帧的资源复用（基底层会回池）要求显式顺序：新提交
+     * 在写入基底前，先等同表面更早的提交完成（见 mtl_wait_rt 与 poll 里推
+     * 进 fence）。 */
+    {
+        uint64_t seq;
         pthread_mutex_lock(&g->lock);
-        for (k = 0; k < n; k++) cbs[k] = [g->inflight[k].cb retain];
+        seq = ++g->submit_seq;
         pthread_mutex_unlock(&g->lock);
-        for (k = 0; k < n; k++) { [cbs[k] waitUntilCompleted]; [cbs[k] release]; }
-        mtl_poll(dev);
+        e.seq = seq;
     }
     /* 顶点缓冲预检按真实顶点数累计（P2-8）：每个三角形 3 个 8 字节顶点，
      * 每个字形四边形 6 个顶点。旧实现在此按每个绘制命令额外加 1024 字节
@@ -1538,7 +1565,14 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
             nx_mtl_rt *base2, *snap_rt = NULL;
             r = mtl_rt_acquire(ctx, g, SSW, SSH, 1, &base2);
             if (r != NEOX_OK) goto enc_fail;
+            /* 该层可能刚被上一帧写回池：等它的写者完成后再写。 */
+            mtl_wait_rt(g, base2);
             base = base2;
+            {
+                pthread_mutex_lock(&g->lock);
+                base2->fence_seq = e.seq;
+                pthread_mutex_unlock(&g->lock);
+            }
             r = mtl_rt_acquire(ctx, g, W, H, 1, &snap_rt);
             if (r != NEOX_OK) goto enc_fail;
             mtl_upload(snap_rt->tex, W, H, sub->accum, W * 16u);
@@ -1814,6 +1848,8 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
             g->inflight[g->ninflight].nheld = e.nheld;
             g->inflight[g->ninflight].capheld = e.capheld;
             g->inflight[g->ninflight].completed = 0;
+            g->inflight[g->ninflight].seq = e.seq;
+            g->inflight[g->ninflight].fence_target = base;
             g->ninflight++;
             pthread_mutex_unlock(&g->lock);
         }

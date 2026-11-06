@@ -29,8 +29,8 @@
  *     ADR 0005 同款）。PLUS 的 clamp 非线性始终走 ping-pong（fill/glyph
  *     读 dst 算插值式写临时层再拷回；tex 覆盖二值，折源 + 整层 clamp）。
  *     组合成（§7）走 gl_blend_plain 真实 Porter-Duff。
- *   - 组不透明度：PUSH owns_layer → 渲染到离屏层纹理（RGBA32F SS），POP 时
- *     以 opacity × 裁剪掩码整体合成回父层（§7 隔离合成）。
+ *   - 组隔离：组有自己的层（owns_layer 或 opacity<1，P1-8），POP 时以
+ *     opacity × 裁剪掩码 × 组混合整体合成回父层（§7）。
  *   - 裁剪：掩码在 push 期经 geom.c 急切光栅化（与 Soft 同一 CPU 覆盖率），
  *     执行期上传 R32F 纹理；绘制采样当前掩码（组合成时调制）。
  *   - draw_texture / draw_glyphs：纹理四边形 / 字形四边形；NEAREST/LINEAR 与
@@ -2402,6 +2402,9 @@ void neox_gl_surface_destroy(neox_device *dev, neox_gl_surface *surface)
     }
     g = (nx_gl_dev *)dev->bstate;
     if (!g) return;
+    /* P2-6：GL 对象只能在 make-current 成功时释放；但 CPU 侧与平台侧资源
+     * 的释放不能再受这个条件约束——上下文丢失后仍必须拆掉 EGLSurface、
+     * 归还快照与表面外壳，否则表面泄漏且从注册表消失。 */
     if (gl_make_current(g))
         gl_surface_release_color(surface);
     if (g->ctx && surface->win_egl)

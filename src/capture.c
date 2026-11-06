@@ -495,7 +495,8 @@ neox_result neox_capture_replay(neox_frame *frame, const uint8_t *data, size_t s
             READ(clip == NX_CAP_NO_RES || handle);
             m = nx_affine_mul(frame->ctm_stack[frame->ctm_count-1],m);
             CALL(nx_emit_push(&staged,m,opacity,(neox_blend)blend,flags,
-                          handle ? (int32_t)nx_handle_index(handle) : -1,handle));
+                          handle ? (int32_t)nx_handle_index(handle) : -1,handle,
+                          owns ? 1 : 0));
             depth++;
             break;
         }

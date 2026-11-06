@@ -684,7 +684,8 @@ neox_result nx_validate_glyphs(neox_device *dev, uint32_t idx,
         const neox_glyph_style *style);
 neox_result nx_emit_push(neox_frame *fr, neox_affine ctm, float opacity,
                              neox_blend blend, uint32_t flags,
-                             int32_t clip_idx, uint64_t clip_id);
+                             int32_t clip_idx, uint64_t clip_id,
+                             int force_isolate);
 void nx_commands_free(neox_context *ctx, nx_cmd *cmds, uint32_t n);
 neox_result nx_cmd_ref(neox_device *dev, const nx_cmd *c, int acquire);
 void nx_frame_destroy(neox_device *dev, neox_frame *fr);

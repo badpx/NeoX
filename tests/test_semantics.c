@@ -312,6 +312,46 @@ static void test_group_opacity(void)
     neox_device_pump(g_dev);
 }
 
+/* ------------------------------------------------------------------ ③b 组混合隔离（§7，P1-8）
+ * 场景组始终隔离：底层不透明蓝 + opacity=1 的 DST_IN 组内画不透明红 → 保留蓝。
+ * 立即模式 push_state 的 blend 仍是子绘制混合（不因非 SRC_OVER 自动建组层）。 */
+static void test_group_blend_isolation(void)
+{
+    uint8_t buf[8 * 8 * 4];
+    neox_path full = make_rect(0, 0, 8, 8, NEOX_FILL_NONZERO);
+    neox_paint pr;
+    neox_frame *fr;
+    neox_scene sc;
+    neox_node_desc nd;
+    neox_node group, child;
+    pr.color = RED;
+
+    sc = neox_scene_create(g_dev);
+    CHECK(sc.id != 0);
+    memset(&nd, 0, sizeof(nd));
+    nd.kind = NEOX_NODE_GROUP;
+    nd.transform = (neox_affine){ 1, 0, 0, 1, 0, 0 };
+    nd.opacity = 1.0f;
+    nd.visible = 1;
+    nd.blend = NEOX_BLEND_DST_IN;
+    CHECK_RES(neox_node_create(g_dev, sc, &nd, &group), NEOX_OK);
+    nd.kind = NEOX_NODE_PATH;
+    nd.blend = NEOX_BLEND_SRC_OVER;
+    nd.path.path = full;
+    nd.path.paint = pr;
+    CHECK_RES(neox_node_create(g_dev, sc, &nd, &child), NEOX_OK);
+    CHECK_RES(neox_node_append_child(g_dev, group, child), NEOX_OK);
+    CHECK_RES(begin_frame(&fr, buf, 8, 8, &BLUE), NEOX_OK);
+    CHECK_RES(neox_scene_render(fr, sc, (neox_node){ 0 }), NEOX_OK);
+    end_and_pump(fr);
+    CHECK_PX(buf, 8, 3, 3, 0, 0, 255, 255);
+    CHECK_PX(buf, 8, 7, 7, 0, 0, 255, 255);
+    neox_scene_destroy(g_dev, sc);
+
+    neox_path_release(g_dev, full);
+    neox_device_pump(g_dev);
+}
+
 /* ------------------------------------------------------------------ ④ 嵌套裁剪交集（§7） */
 static void test_nested_clip(void)
 {
@@ -1060,6 +1100,7 @@ int main(void)
     test_fill_rules();
     test_porter_duff();
     test_group_opacity();
+    test_group_blend_isolation();
     test_nested_clip();
     test_texture_sampling();
     test_glyphs();

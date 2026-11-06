@@ -560,7 +560,8 @@ static neox_result scene_emit(neox_frame *fr, uint32_t idx, neox_affine parent_c
             clip_idx = (int32_t)p;
             clip_id = n->u.group.clip_id;
         }
-        r = nx_emit_push(fr, ctm, n->opacity, n->blend, 0, clip_idx, clip_id);
+        /* 场景组始终隔离（P1-8）：组 blend 只在 POP 生效。 */
+        r = nx_emit_push(fr, ctm, n->opacity, n->blend, 0, clip_idx, clip_id, 1);
         if (r != NEOX_OK) return r;
         for (i = 0; i < n->child_count; i++) {
             r = scene_emit(fr, n->children[i], ctm, depth + 1);
@@ -569,7 +570,7 @@ static neox_result scene_emit(neox_frame *fr, uint32_t idx, neox_affine parent_c
         return nx_emit_pop(fr);
     }
     /* 叶子：push（transform/opacity/blend）→ 绘制 → pop */
-    r = nx_emit_push(fr, ctm, n->opacity, n->blend, 0, -1, 0);
+    r = nx_emit_push(fr, ctm, n->opacity, n->blend, 0, -1, 0, 0);
     if (r != NEOX_OK) return r;
     switch (n->kind) {
     case NEOX_NODE_PATH: {

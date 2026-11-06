@@ -1441,12 +1441,6 @@ static neox_result mtl_resolve(neox_context *ctx, nx_mtl_dev *g, nx_mtl_rt *base
  * 只编码 + 提交：submission 保持 PENDING，完成事件由 completedHandler 登记
  * （回调只触碰 lock/completed 标志与 vbo 释放），poll 收割时做 resolve 与
  * 状态推进。编码期错误置 FAILED 并返回（pump 按失败收割）。 */
-/* §7：PUSH 是否构成隔离边界（组的 blend 或 opacity 需要自己的层）。 */
-static int mtl_needs_layer(float opacity, neox_blend blend)
-{
-    return opacity < 1.0f || blend != NEOX_BLEND_SRC_OVER;
-}
-
 static uint32_t mtl_poll(neox_device *dev);
 
 /* P1-12：同一表面（基底层）连续帧的顺序。每层记录"最近一次写入它的提交
@@ -1630,10 +1624,12 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
             case NXC_PUSH: {
                 mtl_ex_state *nst;
                 int32_t layer_idx = top->layer;
-                /* §7 隔离边界：组（blend != SRC_OVER 或 opacity < 1）必须有
-                 * 自己的层；组的 blend/opacity 只在 POP 组合成时作用于源，
-                 * 组内子绘制一律 SRC_OVER（nx_exec_isolated_blend）。 */
-                int group_layer = mtl_needs_layer(c->opacity, c->blend);
+                /* §7 隔离边界：与 Soft/GL 共用录制期的判定（recording.c
+                 * push_needs_layer）：blend != SRC_OVER、opacity < 1 或带
+                 * 裁剪的组都拥有自己的层；组的 blend/opacity 只在 POP
+                 * 组合成时作用于源，组内子绘制一律 SRC_OVER
+                 * （nx_exec_isolated_blend）。 */
+                int group_layer = c->owns_layer;
                 if (group_layer) {
                     nx_mtl_rt *lb;
                     nx_mtl_rt **nl;

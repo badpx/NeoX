@@ -29,7 +29,8 @@
  *     ADR 0005 同款）。PLUS 的 clamp 非线性始终走 ping-pong（fill/glyph
  *     读 dst 算插值式写临时层再拷回；tex 覆盖二值，折源 + 整层 clamp）。
  *     组合成（§7）走 gl_blend_plain 真实 Porter-Duff。
- *   - 组隔离：组有自己的层（owns_layer 或 opacity<1，P1-8），POP 时以
+ *   - 组隔离：非默认 blend、半透明或有裁剪的组有自己的层（owns_layer，
+ *     P1-8）；层内子绘制一律 SRC_OVER（nx_exec_isolated_blend），POP 时以
  *     opacity × 裁剪掩码 × 组混合整体合成回父层（§7）。
  *   - 裁剪：掩码在 push 期经 geom.c 急切光栅化（与 Soft 同一 CPU 覆盖率），
  *     执行期上传 R32F 纹理；绘制采样当前掩码（组合成时调制）。
@@ -256,16 +257,23 @@ static const char *NX_GLSL_FS_CLAMP =
 
 /* 窗口呈现：resolve 纹理的第 0 行是设备顶行，但按 GL 纹素原点放在底边。
  * 真实窗口的底边是视觉底边，所以这里按高度翻转，让设备顶行出现在窗口顶边。
- * u_ss 复用为像素高度。离屏 read_pixels 不走这个 shader。 */
+ * u_ss 复用为像素高度。离屏 read_pixels 不走这个 shader。
+ *
+ * 不透明窗口策略（P1-5）：与 Soft（X11/Wayland/Cocoa 的 RGB *= a、丢弃
+ * alpha）和 Metal（present 着色器 RGB *= a、a = 1）统一——呈现像素 = 预乘
+ * 后的 RGB（sRGB 编码）+ 不透明 alpha 1。窗口缓冲的 alpha 因此恒为 255
+ * （评审要求显示/读回一致，不再保留 128 → Soft=128,0,0,255 = GL 现在）。 */
 static const char *NX_GLSL_FS_PRESENT =
     "#version 410 core\n"
     "uniform sampler2D u_tex;\n"
     "uniform float u_ss;\n"
     "out vec4 o_color;\n"
+    "float enc(float v) { return v<=0.0031308 ? v*12.92 : 1.055*pow(v,1.0/2.4)-0.055; }\n"
     "void main(void)\n"
     "{\n"
     "    int y = int(u_ss) - 1 - int(gl_FragCoord.y);\n"
-    "    o_color = texelFetch(u_tex, ivec2(int(gl_FragCoord.x), y), 0);\n"
+    "    vec4 p = texelFetch(u_tex, ivec2(int(gl_FragCoord.x), y), 0);\n"
+    "    o_color = vec4(enc(clamp(p.rgb, 0.0, 1.0)), 1.0);\n"
     "}\n";
 
 /* PLUS（§6.1）：clamp 非线性 + 覆盖率插值无法由固定功能因子表达。
@@ -1416,6 +1424,7 @@ typedef struct gl_ex_state {
     neox_blend  blend;
     const float *clip;      /* 裁剪掩码（命令拥有，借用）；NULL = 无 */
     int32_t     layer;      /* 层池槽索引 */
+    int         owns_layer; /* 本作用域有隔离层：blend 只在 POP 组合成时生效 */
 } gl_ex_state;
 
 /* PLUS 混合后把层内容 clamp 到 [0,1]（§6：PLUS 逐通道 clamp；GL float
@@ -2149,6 +2158,7 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
         stk[0].blend = NEOX_BLEND_SRC_OVER;
         stk[0].clip = NULL;
         stk[0].layer = 0;
+        stk[0].owns_layer = 0;
         nstk = 1;
     }
     /* 基底：清屏色或快照内容 → 基底层 */
@@ -2217,6 +2227,7 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
             r = nx_execution_clip_push(dev, &execution_clips, c, sub->width, sub->height, &stk[nstk].clip);
             if (r != NEOX_OK) goto cleanup;
             stk[nstk].layer = layer_idx;
+            stk[nstk].owns_layer = c->owns_layer;
             nstk++;
             break;
         }
@@ -2277,7 +2288,8 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
         case NXC_PATH: {
             const nx_path_slot *ps =
                 &((nx_path_slot *)dev->paths.slots)[c->res_idx];
-            r = gl_fill_path(dev, g, ps, top->ctm, &c->color, top->blend,
+            r = gl_fill_path(dev, g, ps, top->ctm, &c->color,
+                             nx_exec_isolated_blend(top->blend, top->owns_layer),
                              layers[top->layer], W, H);
             if (r != NEOX_OK) goto cleanup;
             GL_CHECK("GL error during path fill");
@@ -2286,7 +2298,8 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
         case NXC_TEX: {
             const nx_tex_slot *tx =
                 &((nx_tex_slot *)dev->textures.slots)[c->res_idx];
-            r = gl_draw_tex(dev, g, tx, c, top->ctm, top->blend,
+            r = gl_draw_tex(dev, g, tx, c, top->ctm,
+                            nx_exec_isolated_blend(top->blend, top->owns_layer),
                             layers[top->layer], W, H);
             if (r != NEOX_OK) goto cleanup;
             GL_CHECK("GL error during texture draw");
@@ -2295,7 +2308,8 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
         case NXC_GLYPHS: {
             const nx_tex_slot *at =
                 &((nx_tex_slot *)dev->textures.slots)[c->res_idx];
-            r = gl_draw_glyphs(dev, g, at, c, top->ctm, top->blend,
+            r = gl_draw_glyphs(dev, g, at, c, top->ctm,
+                               nx_exec_isolated_blend(top->blend, top->owns_layer),
                                layers[top->layer], W, H);
             if (r != NEOX_OK) goto cleanup;
             GL_CHECK("GL error during glyph draw");
@@ -2646,8 +2660,8 @@ neox_result neox_gl_surface_present(neox_gl_surface *surface)
         glPixelStorei(GL_PACK_ALIGNMENT,4);
         g->stats.pixel_readback_bytes+=(uint64_t)w*h*4;g->stats.readback_calls++;
         glReadPixels(0,0,(GLsizei)w,(GLsizei)h,GL_RGBA,GL_UNSIGNED_BYTE,surface->presented);
-        /* 窗口缓冲是预乘 RGBA8 且保留 alpha：它就是屏幕显示的像素（P1-5；
-         * 不透明窗口的 RGB *= a 语义与 Soft/Wayland/X11 一致）。 */
+        /* 窗口缓冲即屏幕像素（P1-5 不透明窗口）：present 着色器已做 RGB *= a
+         * 并写入 alpha = 1，与环境是否提供 alpha 位面无关，读回同样如此。 */
         /* In-place row reversal needs no second full-window allocation. */
         for (uint32_t y=0;y<h/2;y++) {
             uint8_t *top=surface->presented+(size_t)y*w*4;

@@ -458,10 +458,6 @@ static int nx_wl_register_enter(nx_wl *p, void *surface)
     return 1;
 }
 
-#ifdef NX_WL_TEST_HOOK
-int nx_wl_test_skip_open;
-int nx_wl_test_surf_enter_ready;
-#endif
 
 static int memfd_new(size_t size)
 {
@@ -1293,14 +1289,6 @@ static neox_result wl_open(neox_window *w)
         wl_close(w);
         return NEOX_ERROR_BACKEND;
     }
-#ifdef NX_WL_TEST_HOOK
-    /* 单测：跳过真正的 wl_surface 创建（没有合成器），把"注册 listener"的
-     * 决策与调用暴露出来。生产代码不走这里。 */
-    if (nx_wl_test_skip_open) {
-        nx_wl_test_surf_enter_ready = nx_wl_surface_enter_ready(p->comp_ver);
-        return NEOX_OK;
-    }
-#endif
     /* wl_surface 版本决定能否用整数倍缓冲（P2-1）：v<3 没有
      * set_buffer_scale，强制 1 倍——像素尺寸等于逻辑尺寸，缓冲不会被
      * 合成器再放大一次。 */

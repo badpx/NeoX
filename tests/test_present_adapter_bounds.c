@@ -1,6 +1,5 @@
 /* Execute the actual adapter boundary code with no compositor or display.
  * Invalid geometry must return before dispatching to any native API. */
-#define NX_WL_TEST_HOOK 1
 #include "../src/present_wl.c"
 #include "../src/present_x11.c"
 #include <float.h>

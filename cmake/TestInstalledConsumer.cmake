@@ -19,6 +19,8 @@ set(toolchain_hint)
 if(NEOX_CONSUMER_GENERATOR)
   list(APPEND toolchain_hint "-G" "${NEOX_CONSUMER_GENERATOR}")
 endif()
+# make 程序只在 Makefile 生成器下由外层给定；Ninja 等生成器由 CMake 自行
+# 定位可执行文件，本测试不宣称覆盖“外部指定 Ninja 路径”的场景。
 if(NEOX_CONSUMER_MAKE_PROGRAM AND NEOX_CONSUMER_GENERATOR MATCHES "Makefiles")
   list(APPEND toolchain_hint "-DCMAKE_MAKE_PROGRAM=${NEOX_CONSUMER_MAKE_PROGRAM}")
 endif()

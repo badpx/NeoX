@@ -207,13 +207,16 @@ static void run_backend(neox_context *ctx, neox_backend_kind kind, const char *t
     expect(draw_bars(win, dev), "draw/present");
     check_orientation(win, tag);
     if (kind==NEOX_BACKEND_GPU) {
-        /* A regular present must not silently capture or expose an old snapshot. */
+        /* P1-14：普通 present 之后，读回得到的是刚才上屏的那一帧（快照随
+         * 每次 present 发布），而不是"没有最新帧"的 UNSUPPORTED。 */
         expect(neox_window_present(win)==NEOX_OK,"ordinary present");
         uint8_t *pixels=malloc((size_t)px_w*px_h*4);
         expect(pixels!=NULL,"snapshot check allocation");
         if(pixels) {
-            expect(neox_window_read_pixels(win,pixels)==NEOX_ERROR_UNSUPPORTED,
-                   "ordinary present invalidates explicit snapshot");
+            expect(neox_window_read_pixels(win,pixels)==NEOX_OK,
+                   "read_pixels after ordinary present returns the presented frame");
+            expect(pix_near(pixels + ((size_t)px_w*2u + px_w/2u)*4u, 255, 0, 0),
+                   "readback after ordinary present shows the red bar");
             free(pixels);
         }
     }

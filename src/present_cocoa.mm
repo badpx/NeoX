@@ -194,6 +194,9 @@ static neox_result cocoa_soft(neox_window *w)
         CGColorSpaceRelease(color);CGDataProviderRelease(provider);
         if(!image)return NEOX_ERROR_OUT_OF_MEMORY;
         if(p->image)CGImageRelease(p->image);p->image=image;p->image_w=w->px_w;p->image_h=w->px_h;
+        /* 不透明窗口（P1-5）：图层没有 alpha 通道，按预乘 RGB 绘制；图像
+         * 用 NoneSkipLast 解释，与 Soft/Wayland/X11/GL 同一规则。 */
+        p->view.layer.opaque=YES;
         p->view.layer.contents=(id)image;p->view.layer.contentsGravity=kCAGravityResize;
         [CATransaction flush];return NEOX_OK;
     }
@@ -207,10 +210,9 @@ static int cocoa_read(neox_window *w,uint8_t *out)
     {
         const uint8_t *src=(const uint8_t *)CFDataGetBytePtr(data);
         size_t n=(size_t)w->px_w*w->px_h;
-        /* 与 Soft/GL/Metal 的读回一致：不透明窗口读回 alpha = 255，RGB 为
-         * 预乘后（RGB *= a）的值。图像本身不含 alpha 通道。 */
+        /* Soft 帧缓冲本身已是预乘 RGBA（P1-5：不透明窗口按 RGB *= a 显示），
+         * 读回原样返回即可，与离屏/GL 读回同一语义。 */
         memcpy(out,src,n*4);
-        for(size_t i=0;i<n;i++)out[i*4+3]=255;
     }
     CFRelease(data);return 0;
 }

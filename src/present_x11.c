@@ -145,6 +145,7 @@ extern int nx_test_x11_dlclose(void *handle);
  * 请求序号，呈现/读回路径在 XSync 之后比较并返回 NEOX_ERROR_BACKEND。 */
 static uint32_t g_x_errors;
 static uint32_t g_x_last_error;
+static uint32_t g_x_last_code;
 
 static int on_xerr(void *dpy, void *ev)
 {
@@ -154,7 +155,10 @@ static int on_xerr(void *dpy, void *ev)
     (void)dpy;
     g_x_errors++;
     g_x_last_error = req;
-    fprintf(stderr, "X error code=%u request=%u\n", code, req);
+    g_x_last_code = code;
+    /* 错误详情经 x11_take_error 进入窗口错误串（nx_win_set_error），不再
+     * 无条件写 stderr：多窗口/并行测试下会刷屏，也无法被调用方处理。 */
+    (void)code;
     return 0;
 }
 
@@ -167,8 +171,9 @@ static int x11_take_error(uint32_t mark, const char *what)
     if (g_x_errors == mark) return 0;
     {
         char buf[128];
-        snprintf(buf, sizeof buf, "X11: %s failed (X protocol error, request %u)",
-                 what, (unsigned)g_x_last_error);
+        snprintf(buf, sizeof buf,
+                 "X11: %s failed (X protocol error %u, request %u)",
+                 what, (unsigned)g_x_last_code, (unsigned)g_x_last_error);
         nx_win_set_error(buf);
     }
     return 1;

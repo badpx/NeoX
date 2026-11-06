@@ -679,7 +679,8 @@ void nx_gl_ctx_destroy(nx_gl_ctx *ctx)
     native = ctx->native;
     if (dpy != EGL_NO_DISPLAY)
         drop_ctx(dpy, ctx->ctx, ctx->surface);
-    nx_gl_ctx_free_host(ctx);
+    /* 外壳由宿主分配、宿主释放（nx_gl_ctx_free_host）；这里不能读 ctx 的
+     * 任何字段，也不 free 外壳。 */
     if (native) {
         native_release(dpy);
         return;

@@ -63,6 +63,8 @@ int main(void)
         /* 设备销毁会级联释放场景（另一条深链释放路径）。 */
     }
 
+    neox_context_destroy(ctx);
+    ctx = NULL;
     OK(neox_context_create(NULL, &ctx));
     OK(neox_device_create(ctx, NULL, &dev));
 

@@ -105,7 +105,43 @@ int main(void)
     expect_bad(t, buf, 8, 0, "shorter than sfnt header");
     expect_bad(t, buf, 64, -1, "negative TTC index");
 
-    /* 9. 结构合法但内容不可解析的最小 sfnt：校验通过后由 stb 拒绝。 */
+    /* 9. 评审 4489969086 的反例：108 字节 sfnt，六个完整目录项
+     * cmap/loca/head/glyf/hhea/hmtx 全部 offset=108、length=0。旧校验只比较
+     * off+len==size 会放行，stb 随后读 cmap+2 越界；现在必须拒绝。 */
+    {
+        static const char *tags[6] = { "cmap", "loca", "head", "glyf", "hhea", "hmtx" };
+        int i;
+        memset(buf, 0, sizeof buf);
+        put32(buf, 0x00010000u);
+        put16(buf + 4, 6);
+        for (i = 0; i < 6; i++) {
+            memcpy(buf + 12 + i * 16, tags[i], 4);
+            put32(buf + 12 + i * 16 + 8, 108);
+            put32(buf + 12 + i * 16 + 12, 0);
+        }
+        expect_bad(t, buf, 108, 0, "review: zero-length required tables");
+        /* 同一反例但把 cmap 长度改成 2（仍不足以容纳 cmap 头部）。 */
+        put32(buf + 12 + 12, 2);
+        expect_bad(t, buf, 110, 0, "review: cmap shorter than its header");
+        /* 只补齐必需表的长度，内部引用仍不合法（numGlyphs=0）。 */
+        for (i = 0; i < 6; i++) {
+            uint32_t len = 0;
+            if (!strcmp(tags[i], "head")) len = 54;
+            else if (!strcmp(tags[i], "hhea")) len = 36;
+            else if (!strcmp(tags[i], "maxp")) len = 6;
+            else if (!strcmp(tags[i], "cmap")) len = 64;
+            else if (!strcmp(tags[i], "hmtx")) len = 4;
+            put32(buf + 12 + i * 16 + 12, len);
+        }
+        /* maxp 不存在：必需表缺失。 */
+        put32(buf + 28, 0x68656164u); /* 'head' */
+        put32(buf + 44, 0x68686561u); /* 'hhea' */
+        put32(buf + 60, 0x636D6170u); /* 'cmap' */
+        put32(buf + 76, 0x686D7478u); /* 'hmtx' */
+        expect_bad(t, buf, 108, 0, "missing maxp");
+    }
+
+    /* 10. 只有 head 一个表：结构上缺少必需表，必须在校验层拒绝。 */
     {
         nx_font *f = NULL;
         neox_result r;

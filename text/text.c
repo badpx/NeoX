@@ -616,11 +616,125 @@ static int tx_sfnt_tag_ok(uint32_t tag)
            tag == 0x74727565u /* 'true' */ || tag == 0x74797031u /* 'typ1' */;
 }
 
+typedef struct tx_sfnt_table {
+    uint32_t tag;
+    uint32_t off;      /* 相对文件开头 */
+    uint32_t len;
+} tx_sfnt_table;
+
+/* 读 16 位元素的偏移（相对表起点）：base + idx*2 + 2 <= size 才合法。 */
+static int tx_in(const uint8_t *d, size_t size, uint64_t base, uint64_t rel, uint64_t n)
+{
+    (void)d;
+    return base <= size && rel <= size - base && n <= size - base - rel;
+}
+
+/* 必需表的最小长度：
+ *   head  : 54 字节（indexToLocFormat 在 +50）
+ *   hhea  : 36 字节（numberOfHMetrics 在 +34）
+ *   maxp  : 6 字节（numGlyphs 在 +4）
+ *   hmtx  : 4 × numberOfHMetrics + 2 × (numGlyphs − numberOfHMetrics)
+ *   loca  : 2/4 × (numGlyphs + 1)
+ *   glyf  : 0（可为空，但 loca 的偏移都必须落在表内）
+ *   cmap  : 64 字节（头部 + 至少一个编码记录 + 一张子表头部）
+ * CFF 字体（'OTTO'）以 'CFF '/'CFF2' 代替 glyf/loca。 */
+static int tx_check_required_tables(const uint8_t *d, size_t size,
+                                    const tx_sfnt_table *tbl, uint32_t n)
+{
+    const tx_sfnt_table *head = NULL, *hhea = NULL, *maxp = NULL, *hmtx = NULL;
+    const tx_sfnt_table *cmap = NULL, *glyf = NULL, *loca = NULL, *cff = NULL;
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        switch (tbl[i].tag) {
+        case 0x68656164u: head = &tbl[i]; break; /* 'head' */
+        case 0x68686561u: hhea = &tbl[i]; break; /* 'hhea' */
+        case 0x6D617870u: maxp = &tbl[i]; break; /* 'maxp' */
+        case 0x686D7478u: hmtx = &tbl[i]; break; /* 'hmtx' */
+        case 0x636D6170u: cmap = &tbl[i]; break; /* 'cmap' */
+        case 0x676C7966u: glyf = &tbl[i]; break; /* 'glyf' */
+        case 0x6C6F6361u: loca = &tbl[i]; break; /* 'loca' */
+        case 0x43464620u: /* 'CFF ' */
+        case 0x43464632u: cff = &tbl[i]; break; /* 'CFF2' */
+        default: break;
+        }
+    }
+    if (!head || !hhea || !maxp || !hmtx || !cmap) return 0;
+    if (head->len < 54 || hhea->len < 36 || maxp->len < 6 || cmap->len < 64)
+        return 0;
+    {
+        uint32_t num_glyphs = tx_rd_u16(d + maxp->off + 4);
+        uint32_t nhm = tx_rd_u16(d + hhea->off + 34);
+        int16_t loc_format = (int16_t)tx_rd_u16(d + head->off + 50);
+        uint64_t hmtx_need;
+        if (num_glyphs == 0) return 0;
+        if (nhm == 0 || nhm > num_glyphs) return 0;
+        hmtx_need = (uint64_t)nhm * 4u + (uint64_t)(num_glyphs - nhm) * 2u;
+        if ((uint64_t)hmtx->len < hmtx_need) return 0;
+        if (loc_format != 0 && loc_format != 1) return 0;
+        if (!glyf && !cff) return 0;
+        if (glyf || loca) {
+            uint64_t loca_need, last;
+            uint32_t k;
+            if (!glyf || !loca) return 0;
+            loca_need = (loc_format == 0 ? 2u : 4u) * ((uint64_t)num_glyphs + 1u);
+            if ((uint64_t)loca->len < loca_need) return 0;
+            /* glyf 内的偏移必须单调且落在 glyf 表内（loca 的最后一项可以不
+             * 指向表尾，但任何一项都不能越过表尾）。 */
+            last = 0;
+            for (k = 0; k <= num_glyphs; k++) {
+                uint64_t v = loc_format == 0
+                    ? (uint64_t)tx_rd_u16(d + loca->off + k * 2u) * 2u
+                    : (uint64_t)tx_rd_u32(d + loca->off + k * 4u);
+                if (v > (uint64_t)glyf->len) return 0;
+                if (k > 0 && v < last) return 0;
+                last = v;
+            }
+        }
+        /* cmap：numTables 与每张子表（format / length）都必须落在表内。 */
+        {
+            uint32_t nt = tx_rd_u16(d + cmap->off + 2);
+            uint32_t k;
+            if (nt == 0) return 0;
+            if (!tx_in(d, size, cmap->off, 4u, (uint64_t)nt * 8u)) return 0;
+            for (k = 0; k < nt; k++) {
+                uint32_t sub = tx_rd_u32(d + cmap->off + 4u + k * 8u + 4u);
+                uint32_t fmt, len;
+                if ((uint64_t)sub + 4u > cmap->len) return 0;
+                if (!tx_in(d, size, cmap->off, sub, 4u)) return 0;
+                fmt = tx_rd_u16(d + cmap->off + sub);
+                switch (fmt) {
+                case 0: case 4: case 6: case 10:
+                    if (!tx_in(d, size, cmap->off, sub, 6u)) return 0;
+                    len = tx_rd_u16(d + cmap->off + sub + 2);
+                    break;
+                case 12: case 13:
+                    if (!tx_in(d, size, cmap->off, sub, 16u)) return 0;
+                    len = tx_rd_u32(d + cmap->off + sub + 4);
+                    break;
+                case 14:
+                    if (!tx_in(d, size, cmap->off, sub, 10u)) return 0;
+                    len = tx_rd_u32(d + cmap->off + sub + 2);
+                    break;
+                default:
+                    /* 未知/不支持格式：至少它的头部必须在表内。 */
+                    if (!tx_in(d, size, cmap->off, sub, 4u)) return 0;
+                    len = tx_rd_u16(d + cmap->off + sub + 2);
+                    break;
+                }
+                if (len < 4u || (uint64_t)sub + len > cmap->len) return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 /* 校验 offset 处的 SFNT 头与表目录；返回 1 = 合法。 */
 static int tx_check_sfnt(const uint8_t *d, size_t size, size_t offset)
 {
     uint32_t num_tables, i;
-    size_t dir_start, dir_bytes;
+    size_t dir_start;
+    tx_sfnt_table tbl[NX_SFNT_MAX_TABLES]; /* 512 × 12B = 6 KiB 栈上临时表 */
+    int ok;
     if (offset > size || size - offset < 12) return 0;
     if (!tx_sfnt_tag_ok(tx_rd_u32(d + offset))) return 0;
     num_tables = tx_rd_u16(d + offset + 4);
@@ -628,16 +742,22 @@ static int tx_check_sfnt(const uint8_t *d, size_t size, size_t offset)
     dir_start = offset + 12;
     /* numTables × 16 字节目录；用除法形式避免 32 位乘法溢出。 */
     if ((size - dir_start) / 16u < num_tables) return 0;
-    dir_bytes = (size_t)num_tables * 16u;
-    (void)dir_bytes;
+    ok = 1;
     for (i = 0; i < num_tables; i++) {
         const uint8_t *rec = d + dir_start + (size_t)i * 16u;
         uint32_t off = tx_rd_u32(rec + 8);
         uint32_t len = tx_rd_u32(rec + 12);
-        if ((uint64_t)off + (uint64_t)len > (uint64_t)size) return 0;
-        if (off < offset) return 0; /* 表不能落在文件头之前 */
+        /* 目录项本身、表偏移与长度都必须在缓冲内且不溢出；
+         * 表不能落在 SFNT 头之前（评审 4489969086 的 108 字节反例正是
+         * offset == size、length == 0，表体为空）。 */
+        if ((uint64_t)off + (uint64_t)len > (uint64_t)size) { ok = 0; break; }
+        if (off < offset) { ok = 0; break; }
+        tbl[i].tag = tx_rd_u32(rec);
+        tbl[i].off = off;
+        tbl[i].len = len;
     }
-    return 1;
+    if (ok) ok = tx_check_required_tables(d, size, tbl, num_tables);
+    return ok;
 }
 
 /* 校验整份字体（TTC 目录 + 指定 index 的 SFNT 头）；返回 1 = 合法。 */
@@ -1136,7 +1256,8 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
                                 if (ncap > UINT32_MAX / 2) { ncap = need; break; }
                                 ncap *= 2;
                             }
-                            if ((size_t)ncap > SIZE_MAX / sizeof(nx_laid_glyph)) goto oom;
+                            /* 容量按 2 倍增长并在 UINT32_MAX 处截断；两个数组
+                             * 各自 tx_alloc 都会做 size 溢出检查。 */
                             ngl = (nx_laid_glyph *)tx_alloc(t, (size_t)ncap *
                                     sizeof(nx_laid_glyph), 16);
                             if (!ngl) goto oom;

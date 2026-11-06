@@ -52,7 +52,13 @@ typedef struct nx_font nx_font;
 /* [own] 从文件加载（整个文件读入模块缓冲，随字体存活） */
 neox_result nx_font_load_file(nx_text_context *tctx, const char *path,
                               int ttc_index, nx_font **out_font);
-/* [own] 从内存加载（data 在 [borrow]；模块内部拷贝，调用方可立即释放） */
+/* [own] 从内存加载（data 在 [borrow]；模块内部拷贝，调用方可立即释放）
+ * 不可信输入的部分加固（不是完整的字体安全边界）：进入 stb_truetype 之前
+ * 做长度感知的结构校验——sfnt/TTC 头与表目录全部在缓冲内；必需表
+ * cmap/head/hhea/maxp/hmtx 齐全且达到最小长度；glyf+loca 或 CFF 存在；
+ * loca 覆盖 numGlyphs 且偏移单调、落在 glyf 内；cmap 子表头部与声明长度
+ * 在表内；hmtx 长度与 hhea/maxp 一致。任何一项失败返回 INVALID_ARGUMENT。
+ * 仍未逐项校验 stb 内部访问的每个可选表（如 kern、GSUB）。 */
 neox_result nx_font_load_memory(nx_text_context *tctx, const void *data,
                                 size_t size, int ttc_index, nx_font **out_font);
 /* [own] 显式销毁（亦可随文本上下文级联销毁）。先销毁借用此字体的 layout。

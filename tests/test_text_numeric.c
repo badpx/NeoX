@@ -79,12 +79,14 @@ static void layout_numeric(nx_text_context *t)
     }
     nx_layout fake={0};fake.line_count=3;fake.line_height=FLT_MAX;
     float box[4]={1,2,3,4},before[4];memcpy(before,box,sizeof(box));
-    /* P2-9：失败时输出被清空（而不是保留调用方的旧值）。 */
+    /* 评审 4489969121：measure 失败保留调用方输出（既有语义），且 lo==NULL
+     * 时不会写 out_bbox。 */
     CHECK(nx_text_measure(&fake,box)==NEOX_ERROR_INVALID_ARGUMENT &&
-          box[0]==0 && box[1]==0 && box[2]==0 && box[3]==0);
-    (void)before;
+          memcmp(box,before,sizeof(box))==0);
+    CHECK(nx_text_measure(NULL,box)==NEOX_ERROR_INVALID_ARGUMENT &&
+          memcmp(box,before,sizeof(box))==0);
     fake.tctx=t;fake.line_count=UINT32_MAX;
-    CHECK(layout_finish_line(&fake,0,0,0)==NEOX_ERROR_OUT_OF_MEMORY && !fake.line);
+    CHECK(layout_finish_line(&fake,0,0,0,0)==NEOX_ERROR_OUT_OF_MEMORY && !fake.line);
     nx_font_backend bad=f->be;bad.ascent=NAN;nx_font *rejected=(nx_font*)(uintptr_t)1;
     CHECK(nx_font_create_custom(t,&bad,&rejected)==NEOX_ERROR_INVALID_ARGUMENT && !rejected);
     unsigned char header[12]={0};nx_font *invalid=NULL;size_t used=t->core->used;
@@ -122,7 +124,8 @@ static void atlas_numeric(nx_text_context *t,neox_device *d)
         m.result=i==3?NEOX_ERROR_BACKEND:NEOX_OK;
         CHECK(nx_atlas_glyph(a,f,7,12,&rc)==(i==3?NEOX_ERROR_BACKEND:NEOX_ERROR_INVALID_ARGUMENT));
         CHECK(m.freed==i+1 && !a->nshelves && !a->dirty && !a->hits && !a->misses);
-        CHECK(rc.x==0 && t->core->used==used); /* P2-9：失败清空 out_rect */
+        /* 评审 4489969121：失败保留调用方的 out_rect（不再清空）。 */
+        CHECK(rc.x==9 && rc.w==9 && t->core->used==used);
     }
     m.bx=FLT_MAX;m.by=0;m.w=1;m.result=NEOX_OK;
     OK(nx_atlas_glyph(a,f,7,12,&rc));CHECK(a->misses==1);
@@ -160,9 +163,9 @@ static int real_font(nx_text_context *t,neox_device *d,tracker *tr)
         metrics[0]=0;metrics[1]=1;metrics[2]=metrics[3]=0;
         CHECK(nx_atlas_glyph(a,f,glyph,16384,&rect)==NEOX_ERROR_OUT_OF_MEMORY);
         memcpy(metrics,saved,4);
-        /* P2-9：失败路径清空 out_rect（不再保留调用方的旧矩形）。 */
+        /* 评审 4489969121：nx_atlas_glyph 失败保留调用方的 out_rect。 */
         CHECK(tr->calls==0 && t->core->used==used && !a->nshelves && !a->dirty &&
-              !a->misses && rect.x==0 && rect.w==0);
+              !a->misses && rect.w>0);
         OK(nx_atlas_glyph(a,f,glyph,24,&rect));CHECK(rect.w>0 && rect.h>0);nx_atlas_destroy(a);
     }
     nx_atlas *a;nx_atlas_rect rect;

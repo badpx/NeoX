@@ -124,6 +124,9 @@ typedef struct nx_layout {
     uint32_t line_count;
     float size_px;
     float bbox_x0, bbox_x1;          /* 含对齐偏移的水平范围（nx_text_measure） */
+    uint8_t *blank;                  /* 逐字形空白标记（构建期使用；nx_layout 拥有） */
+    uint32_t blank_cap;
+    uint32_t line_trail_glyphs;      /* 构建期：当前行末尾空白字形数 */
     nx_font *font;                   /* [borrow] 字体必须比此布局存活更久 */
     /* —— 内部字段（实现使用，调用方勿依赖，v0 后为不透明化预留） —— */
     uint32_t glyph_cap;
@@ -134,8 +137,10 @@ typedef struct nx_layout {
 
 /* [own] 简化排版：UTF-8 解码（非法序列替换为 U+FFFD）→ cmap → 字距 →
  * LTR 贪心断行（CJK 逐字可断、拉丁按词；'\n' 强制断行）→ 对齐。
- * size_px/max_width 须有限，size_px >= 0.25（字号按 1/4 像素量化，更小
- * 的字号无法光栅化，返回 INVALID_ARGUMENT）；max_width <= 0 表示不换行。
+ * size_px/max_width 须有限且 size_px > 0；字号按 1/4 像素量化，量化到 0 的
+ * 极端小字号（< 0.125px）在图集里钳到 0.25px 并给出 last_error。
+ * max_width <= 0 表示不换行。行尾的 ASCII 空格/制表不计入行宽（对齐按
+ * 内容宽），行内空白照常计入。
  * 度量/字距或累计坐标无法表示为有限 float 时返回 INVALID_ARGUMENT，
  * 分配失败返回 OUT_OF_MEMORY；失败不返回部分 layout。
  * font 必须属于 tctx；布局须先于字体和 tctx 销毁。 */
@@ -144,7 +149,8 @@ neox_result nx_text_layout(nx_text_context *tctx, nx_font *font, float size_px,
                            nx_text_align align, nx_layout **out_layout);
 void nx_layout_destroy(nx_layout *layout);
 
-/* 排版结果包围盒 [x0, y0, x1, y1]（布局坐标系，y 向下） */
+/* 排版结果包围盒 [x0, y0, x1, y1]（布局坐标系，y 向下）。
+ * 失败（layout 为 NULL、度量非有限）时不写 out_bbox，调用方原值保留。 */
 neox_result nx_text_measure(const nx_layout *layout, float out_bbox[4]);
 
 /* ------------------------------------------------------------------ 动态图集

@@ -104,6 +104,65 @@ int main(void)
     NEAR(box[0], 82.0f);                  /* 两行都是 18 宽 */
     nx_layout_destroy(l);
 
+    /* P2-9：早期参数失败清空输出（不留下旧布局指针 / 旧包围盒）。 */
+    {
+        nx_layout *stale = l;
+        float bb[4] = { 1, 2, 3, 4 };
+        l = (nx_layout *)t;
+        CHECK(nx_text_layout(t, f, 0.1f, "aa", 0, NX_ALIGN_LEFT, &l) ==
+              NEOX_ERROR_INVALID_ARGUMENT && l == NULL);
+        l = (nx_layout *)t;
+        CHECK(nx_text_layout(t, f, 10, "aa", 0, (nx_text_align)99, &l) ==
+              NEOX_ERROR_INVALID_ARGUMENT && l == NULL);
+        CHECK(nx_text_measure(NULL, bb) == NEOX_ERROR_INVALID_ARGUMENT &&
+              bb[0] == 0 && bb[1] == 0 && bb[2] == 0 && bb[3] == 0);
+        (void)stale;
+    }
+
+    /* P2-10：字号按 1/4 像素量化，小于 0.25px 的字号被拒绝。 */
+    {
+        nx_layout *small = NULL;
+        CHECK(nx_text_layout(t, f, 0.249f, "aa", 0, NX_ALIGN_LEFT, &small) ==
+              NEOX_ERROR_INVALID_ARGUMENT && small == NULL);
+        OK(nx_text_layout(t, f, 0.25f, "aa", 0, NX_ALIGN_LEFT, &small));
+        nx_layout_destroy(small);
+        {
+            /* 图集入口同样拒绝，绝不把 size_q == 0 传给光栅回调。 */
+            neox_device *dev = NULL;
+            nx_atlas *at = NULL;
+            nx_atlas_rect rc;
+            OK(neox_device_create(ctx, NULL, &dev));
+            OK(nx_atlas_create(t, dev, 16, 16, &at));
+            CHECK(nx_atlas_glyph(at, f, 'a', 0.1f, &rc) == NEOX_ERROR_INVALID_ARGUMENT);
+            OK(nx_atlas_glyph(at, f, 'a', 0.25f, &rc));
+            nx_atlas_destroy(at);
+            neox_device_destroy(dev);
+        }
+    }
+
+    /* P2-11：U+3000（表意空格）是空白，不是 CJK 可断行字符：行首被丢弃、
+     * 行尾不计入行宽，与 ASCII 空格一致。 */
+    {
+        nx_layout *lj = NULL;
+        OK(nx_text_layout(t, f, 10, "\xE3\x80\x80" "aa", 0, NX_ALIGN_LEFT, &lj));
+        CHECK(lj->glyph_count == 2);              /* 行首 U+3000 被丢弃 */
+        NEAR(lj->glyphs[0].x, 0.0f);
+        NEAR(lj->width, 18.0f);
+        nx_layout_destroy(lj);
+        OK(nx_text_layout(t, f, 10, "aa" "\xE3\x80\x80", 100, NX_ALIGN_RIGHT, &lj));
+        NEAR(lj->width, 18.0f);
+        NEAR(lj->glyphs[0].x, 82.0f);             /* 右对齐不含行尾 U+3000 */
+        CHECK(lj->glyph_count == 2);              /* 行尾 U+3000 不进入字形数组 */
+        nx_layout_destroy(lj);
+        /* 行内 U+3000 仍然占位（它不是行尾空白）。 */
+        OK(nx_text_layout(t, f, 10, "aa" "\xE3\x80\x80" "bb", 0, NX_ALIGN_LEFT, &lj));
+        CHECK(lj->glyph_count == 5);
+        NEAR(lj->glyphs[2].x, 18.0f);             /* aa 之后是 U+3000 */
+        NEAR(lj->glyphs[3].x, 27.0f);             /* bb 从 18 + 9 开始 */
+        NEAR(lj->width, 36.0f);
+        nx_layout_destroy(lj);
+    }
+
     nx_font_destroy(f);
     nx_text_context_destroy(t);
     neox_context_destroy(ctx);

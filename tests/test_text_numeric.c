@@ -79,7 +79,10 @@ static void layout_numeric(nx_text_context *t)
     }
     nx_layout fake={0};fake.line_count=3;fake.line_height=FLT_MAX;
     float box[4]={1,2,3,4},before[4];memcpy(before,box,sizeof(box));
-    CHECK(nx_text_measure(&fake,box)==NEOX_ERROR_INVALID_ARGUMENT && !memcmp(box,before,sizeof(box)));
+    /* P2-9：失败时输出被清空（而不是保留调用方的旧值）。 */
+    CHECK(nx_text_measure(&fake,box)==NEOX_ERROR_INVALID_ARGUMENT &&
+          box[0]==0 && box[1]==0 && box[2]==0 && box[3]==0);
+    (void)before;
     fake.tctx=t;fake.line_count=UINT32_MAX;
     CHECK(layout_finish_line(&fake,0,0,0)==NEOX_ERROR_OUT_OF_MEMORY && !fake.line);
     nx_font_backend bad=f->be;bad.ascent=NAN;nx_font *rejected=(nx_font*)(uintptr_t)1;
@@ -119,7 +122,7 @@ static void atlas_numeric(nx_text_context *t,neox_device *d)
         m.result=i==3?NEOX_ERROR_BACKEND:NEOX_OK;
         CHECK(nx_atlas_glyph(a,f,7,12,&rc)==(i==3?NEOX_ERROR_BACKEND:NEOX_ERROR_INVALID_ARGUMENT));
         CHECK(m.freed==i+1 && !a->nshelves && !a->dirty && !a->hits && !a->misses);
-        CHECK(rc.x==9 && t->core->used==used);
+        CHECK(rc.x==0 && t->core->used==used); /* P2-9：失败清空 out_rect */
     }
     m.bx=FLT_MAX;m.by=0;m.w=1;m.result=NEOX_OK;
     OK(nx_atlas_glyph(a,f,7,12,&rc));CHECK(a->misses==1);
@@ -157,7 +160,9 @@ static int real_font(nx_text_context *t,neox_device *d,tracker *tr)
         metrics[0]=0;metrics[1]=1;metrics[2]=metrics[3]=0;
         CHECK(nx_atlas_glyph(a,f,glyph,16384,&rect)==NEOX_ERROR_OUT_OF_MEMORY);
         memcpy(metrics,saved,4);
-        CHECK(tr->calls==0 && t->core->used==used && !a->nshelves && !a->dirty && !a->misses && rect.x==9);
+        /* P2-9：失败路径清空 out_rect（不再保留调用方的旧矩形）。 */
+        CHECK(tr->calls==0 && t->core->used==used && !a->nshelves && !a->dirty &&
+              !a->misses && rect.x==0 && rect.w==0);
         OK(nx_atlas_glyph(a,f,glyph,24,&rect));CHECK(rect.w>0 && rect.h>0);nx_atlas_destroy(a);
     }
     nx_atlas *a;nx_atlas_rect rect;

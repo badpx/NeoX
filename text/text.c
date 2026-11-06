@@ -66,6 +66,10 @@ static void *tx_array_grow(nx_text_context *t, void *arr, size_t elem,
 }
 
 #define TX_ERR(t, msg, code) do { (t)->last_error = (msg); return (code); } while (0)
+/* API 边界（P2-9）：确认 out 非空后立刻清空输出指针，之后任何早期失败都
+ * 不会把上一份/垃圾布局指针留给调用方。 */
+#define TM_ERR(t, out, msg, code) \
+    do { *(out) = NULL; TX_ERR(t, msg, code); } while (0)
 
 static int tx_float_range(double x)
 {
@@ -221,6 +225,10 @@ static int nx_utf8_next(const char **pp, const char *end, uint32_t *out_cp)
     *pp = p + 1;
     return 1;
 }
+
+/* 图集字号下限（P2-10）：size_px 量化为 1/4 像素后不得为 0。比 0.25px
+ * 还小的字号无法产生任何像素，光栅回调也不应收到尺寸 0。 */
+#define NX_TEXT_MIN_SIZE_PX 0.25f
 
 /* ------------------------------------------------------------------ 字体 */
 
@@ -796,11 +804,29 @@ float nx_font_line_gap(nx_font *f,float size) {return font_metric(f,f?f->be.line
 
 /* ------------------------------------------------------------------ 排版 */
 
-/* CJK 可断行区间（逐字可断；含全角形式与 CJK 标点） */
+/* Unicode 空白（P2-11）：先判空白再判 CJK。旧实现把 U+3000（表意空格）
+ * 归入 CJK 区间，于是它被当成可断行字符、按词内字距处理，行首行尾的空白
+ * 规则也不生效。ASCII 部分与既有的分词规则一一对应（' '、'\t' 视为空白，
+ * '\n' 由调用方单独判定）。 */
+static int nx_is_space_cp(uint32_t cp)
+{
+    if (cp == 0x20u || cp == 0x09u) return 1;
+    /* Unicode Zs：U+00A0 及 U+2000–U+200A、U+202F、U+205F、U+3000 */
+    if (cp == 0x00A0u) return 1;
+    if (cp >= 0x2000u && cp <= 0x200Au) return 1;
+    if (cp == 0x1680u || cp == 0x2028u || cp == 0x2029u || cp == 0x202Fu ||
+        cp == 0x205Fu || cp == 0x3000u)
+        return 1;
+    return 0;
+}
+
+/* CJK 可断行区间（逐字可断；含全角形式与 CJK 标点）。U+3000 空白已由
+ * nx_is_space_cp 先判，不在本函数的语义内。 */
 static int nx_is_cjk(uint32_t cp)
 {
-    return (cp >= 0x2E80 && cp <= 0x9FFF) ||
-           (cp >= 0x3000 && cp <= 0x30FF) ||
+    return (cp >= 0x2E80 && cp <= 0x2FFFu) ||
+           (cp >= 0x3001 && cp <= 0x9FFF) ||
+           (cp >= 0x3040 && cp <= 0x30FF) ||
            (cp >= 0xF900 && cp <= 0xFAFF) ||
            (cp >= 0xFF00 && cp <= 0xFFEF) ||
            (cp >= 0x20000 && cp <= 0x2FA1F);
@@ -825,7 +851,10 @@ void nx_layout_destroy(nx_layout *lo)
 
 neox_result nx_text_measure(const nx_layout *lo, float out_bbox[4])
 {
-    if (!lo || !out_bbox) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (!out_bbox) return NEOX_ERROR_INVALID_ARGUMENT;
+    /* P2-9：先清空输出，早期失败不留下旧包围盒。 */
+    out_bbox[0] = out_bbox[1] = out_bbox[2] = out_bbox[3] = 0.0f;
+    if (!lo) return NEOX_ERROR_INVALID_ARGUMENT;
     double bottom = (double)(lo->line_count ? lo->line_count-1 : 0) *
                     lo->line_height - lo->descent;
     if (!isfinite(lo->ascent) || !isfinite(lo->width) || !tx_float_range(bottom) ||
@@ -854,7 +883,10 @@ typedef struct nx_token {
 static int nx_layout_is_blank(nx_font *font, uint32_t g)
 {
     if (g == (uint32_t)' ' || g == (uint32_t)'\t') return 1;
-    if (font && !font->is_custom) return g == 0x3000u || g == 0x00A0u;
+    /* 自定义后端：多字节空白字形在 gidx 里是码点本身，按 Unicode 空白判定。
+     * 内置 stb 后端给的是字形索引，无法可靠反推码点，只按 ASCII 空白截尾
+     * （渲染上不可见，保留它们在数组里也不画像素）。 */
+    if (font && font->is_custom) return nx_is_space_cp(g);
     return 0;
 }
 
@@ -898,17 +930,22 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
     double line_w = 0.0;       /* 当前行内容宽（不含行尾空白） */
     int line_has_content = 0;
 
-    if (!t || !font || !utf8 || !out_layout) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (!out_layout) return NEOX_ERROR_INVALID_ARGUMENT;
     *out_layout = NULL;
-    if (font->tctx != t)
-        TX_ERR(t, "font belongs to another text context", NEOX_ERROR_OWNERSHIP_VIOLATION);
+    if (!t || !font || !utf8) return NEOX_ERROR_INVALID_ARGUMENT;
     t->last_error = NULL;
-    if (!isfinite(size_px) || size_px <= 0.0f || !isfinite(max_width) ||
+    if (font->tctx != t)
+        TM_ERR(t, out_layout, "font belongs to another text context",
+               NEOX_ERROR_OWNERSHIP_VIOLATION);
+    /* P2-10：字号量化到 1/4 像素后必须 ≥ 1；更小的字号无法光栅化。 */
+    if (!isfinite(size_px) || size_px < NX_TEXT_MIN_SIZE_PX || !isfinite(max_width) ||
         (unsigned)align > NX_ALIGN_RIGHT)
-        TX_ERR(t, "invalid layout size, width or alignment", NEOX_ERROR_INVALID_ARGUMENT);
+        TM_ERR(t, out_layout, "invalid layout size, width or alignment",
+               NEOX_ERROR_INVALID_ARGUMENT);
     size_t text_size = strlen(utf8);
     if (text_size >= UINT32_MAX || text_size > PTRDIFF_MAX)
-        TX_ERR(t, "text exceeds layout count range", NEOX_ERROR_INVALID_ARGUMENT);
+        TM_ERR(t, out_layout, "text exceeds layout count range",
+               NEOX_ERROR_INVALID_ARGUMENT);
 
     lo = (nx_layout *)tx_alloc(t, sizeof(*lo), 16);
     if (!lo) TX_ERR(t, "layout allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
@@ -963,7 +1000,7 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
             uint32_t k = 0;
             while (k < n && nx_utf8_next(&p, end, &i)) {
                 if (i == '\n') cls[k] = 4;
-                else if (i == ' ' || i == '\t') cls[k] = 1;
+                else if (nx_is_space_cp(i)) cls[k] = 1;   /* 空白优先于 CJK */
                 else if (nx_is_cjk(i)) cls[k] = 2;
                 else cls[k] = 3;
                 k++;
@@ -1276,10 +1313,11 @@ neox_result nx_atlas_create_ex(nx_text_context *t, neox_device *dev,
     nx_atlas *a;
     neox_texture_desc td;
 
-    if (!t || !dev || !out || width == 0 || height == 0 ||
+    if (!out) return NEOX_ERROR_INVALID_ARGUMENT;
+    *out = NULL; /* P2-9：确认 out 非空后立即清空 */
+    if (!t || !dev || width == 0 || height == 0 ||
         (unsigned)mode > NEOX_ATLAS_MSDF || width > 16384 || height > 16384)
         return NEOX_ERROR_INVALID_ARGUMENT;
-    *out = NULL;
     if (nx_device_context(dev) != t->core)
         TX_ERR(t, "atlas device belongs to another core context", NEOX_ERROR_OWNERSHIP_VIOLATION);
     if (!isfinite(dist_range_px) || dist_range_px < 0.0f || dist_range_px > 16384.0f)
@@ -1471,13 +1509,20 @@ static neox_result atlas_lookup(nx_atlas *a, nx_font *font, uint32_t glyph,
                                 float size_px, nx_atlas_rect *out_rect,
                                 float *out_bx, float *out_by)
 {
-    if (!a || !font || !out_rect || !isfinite(size_px) || size_px <= 0 || size_px > 16384.0f)
+    if (!a || !font || !out_rect || !isfinite(size_px) ||
+        size_px < NX_TEXT_MIN_SIZE_PX || size_px > 16384.0f)
         return NEOX_ERROR_INVALID_ARGUMENT;
     if (font->tctx != a->tctx)
         TX_ERR(a->tctx, "font belongs to another text context", NEOX_ERROR_OWNERSHIP_VIOLATION);
     if (!font->is_custom && glyph >= (uint32_t)font->stb.numGlyphs)
         TX_ERR(a->tctx, "glyph index exceeds font glyph count", NEOX_ERROR_INVALID_ARGUMENT);
-    uint32_t size_q = (uint32_t)(size_px * 4.0f + 0.5f);
+    /* P2-10：size_px ≥ 0.25，量化结果至少 1；再钳一次防止极端浮点取值。 */
+    uint32_t size_q;
+    {
+        float q = size_px * 4.0f + 0.5f;
+        if (!(q >= 1.0f)) q = 1.0f;
+        size_q = (uint32_t)q;
+    }
     uint32_t slot = atlas_hash(font->id, glyph, size_q);
     uint32_t probe;
     nx_atlas_entry *e;
@@ -1583,7 +1628,9 @@ neox_result nx_atlas_glyph(nx_atlas *a, nx_font *font, uint32_t glyph_index,
                            float size_px, nx_atlas_rect *out_rect)
 {
     float bx, by;
-    if (!a || !font || !out_rect || !(size_px > 0.0f))
+    if (!out_rect) return NEOX_ERROR_INVALID_ARGUMENT;
+    memset(out_rect, 0, sizeof(*out_rect)); /* P2-9 */
+    if (!a || !font || !(size_px >= NX_TEXT_MIN_SIZE_PX))
         return NEOX_ERROR_INVALID_ARGUMENT;
     return atlas_lookup(a, font, glyph_index, size_px, out_rect, &bx, &by);
 }

@@ -134,7 +134,8 @@ typedef struct nx_layout {
 
 /* [own] 简化排版：UTF-8 解码（非法序列替换为 U+FFFD）→ cmap → 字距 →
  * LTR 贪心断行（CJK 逐字可断、拉丁按词；'\n' 强制断行）→ 对齐。
- * size_px/max_width 须有限，size_px > 0；max_width <= 0 表示不换行。
+ * size_px/max_width 须有限，size_px >= 0.25（字号按 1/4 像素量化，更小
+ * 的字号无法光栅化，返回 INVALID_ARGUMENT）；max_width <= 0 表示不换行。
  * 度量/字距或累计坐标无法表示为有限 float 时返回 INVALID_ARGUMENT，
  * 分配失败返回 OUT_OF_MEMORY；失败不返回部分 layout。
  * font 必须属于 tctx；布局须先于字体和 tctx 销毁。 */

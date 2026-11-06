@@ -145,5 +145,11 @@ endif()
 
 add_test(NAME installed_consumer COMMAND ${CMAKE_COMMAND}
   -DNEOX_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR} -DNEOX_SOURCE_DIR=${PROJECT_SOURCE_DIR}
-  -DNEOX_PACKAGE_DIR=${NEOX_PACKAGE_DIR} -DNEOX_CONFIG=$<CONFIG> -P ${PROJECT_SOURCE_DIR}/cmake/TestInstalledConsumer.cmake)
+  -DNEOX_PACKAGE_DIR=${NEOX_PACKAGE_DIR} -DNEOX_CONFIG=$<CONFIG>
+  # 消费工程是嵌套的独立 CMake 进程：没有默认生成器/编译器时（部分 CI 镜像
+  # 没有 make，只有 Ninja），把外层选定的生成器与编译器传下去，否则该测试
+  # 只看环境、与本仓库代码无关地失败。
+  -DNEOX_CONSUMER_GENERATOR=${CMAKE_GENERATOR} -DNEOX_CONSUMER_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
+  -DNEOX_CONSUMER_C_COMPILER=${CMAKE_C_COMPILER}
+  -P ${PROJECT_SOURCE_DIR}/cmake/TestInstalledConsumer.cmake)
 set_tests_properties(installed_consumer PROPERTIES TIMEOUT 120)

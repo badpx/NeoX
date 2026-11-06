@@ -41,8 +41,23 @@ static EGLSurface create_window(EGLDisplay d, EGLConfig c, void *w, const EGLint
 static EGLBoolean destroy_surface(EGLDisplay d, EGLSurface s)
 { (void)d; (void)s; cleanup_calls++; error_code = 0; return EGL_TRUE; }
 
+static unsigned shell_allocs, shell_frees;
+static void *shell_alloc(void *user, size_t bytes)
+{ CHECK(user == &shell_allocs); ++shell_allocs; return malloc(bytes); }
+static void shell_free(void *user, void *p)
+{ CHECK(user == &shell_allocs); ++shell_frees; free(p); }
+
 int main(void)
 {
+    nx_gl_ctx *shell = nx_gl_ctx_alloc_host(NULL, NULL, NULL);
+    CHECK(shell && !shell->dealloc);
+    nx_gl_ctx_free_host(shell);
+    CHECK(!nx_gl_ctx_alloc_host(shell_alloc, NULL, &shell_allocs));
+    shell = nx_gl_ctx_alloc_host(shell_alloc, shell_free, &shell_allocs);
+    CHECK(shell && shell_allocs == 1);
+    nx_gl_ctx_free_host(shell);
+    CHECK(shell_frees == 1);
+
     /* libEGL 加载器：失败 → dlclose + 清表 → 补齐后重新加载成功。 */
     {
         int first, second;

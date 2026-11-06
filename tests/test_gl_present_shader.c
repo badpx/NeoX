@@ -9,8 +9,8 @@
  *      显式不透明 alpha，行翻转仍保留；
  *   2. 设备可用时（EGL surfaceless / X11）：创建离屏 GL 设备，逐段编译全部
  *      fragment program（含 NX_DUAL=0/1 两种前缀），任何一段失败即 FAIL；
- *   3. 端到端半透明呈现：有 DISPLAY 时在 X11 窗口上画线性 (0,0.5,0,0.5)，
- *      读回必须是 (0,128,0,255)——RGB 预乘、sRGB 只编码一次，alpha 恒 255。
+ *   3. 端到端半透明呈现：有 DISPLAY 时在 X11 窗口上画非预乘 sRGB (0,0.5,0,0.5)，
+ *      读回必须是 (0,64,0,255)——RGB 预乘、sRGB 只编码一次，alpha 恒 255。
  *
  * 设备创建失败不得当作通过：只有环境确实没有 GL 时才返回 77（not_run），
  * 并且第 1 步仍必须已经通过。
@@ -163,7 +163,7 @@ static int draw_half_red(neox_device *dev, neox_gl_surface *surf, const neox_col
 /* 端到端半透明呈现：窗口 GL 表面（需 DISPLAY，GL 窗口表面只支持本地 display）。 */
 static int translucent_present(neox_context *ctx)
 {
-#if NEOX_ENABLE_PRESENT
+#if NEOX_ENABLE_PRESENT && defined(__linux__)
     neox_present_desc wd;
     neox_window *w = NULL;
     neox_device *dev = NULL;
@@ -196,7 +196,7 @@ static int translucent_present(neox_context *ctx)
     /* 不透明的靛蓝底 + alpha=0.5 的绿：绘制必须做 SRC_OVER，结果等于
      * sRGB 0.5 的绿；若后端忽略 alpha（如直接覆盖），读回会是别的值。 */
     /* 透明快照基底 + alpha=0.5 的绿：绘制按 SRC_OVER 合成，窗口呈现时
-     * RGB 已预乘、sRGB 只编码一次，读回必须是 (0,128,0,255)；若 present
+     * RGB 已预乘、sRGB 只编码一次，读回必须是 (0,64,0,255)；若 present
      * 再编码一次会读到约 (0,188,0,255) 或其他值。 */
     if (!draw_half_red(dev, (neox_gl_surface *)td.surface, NULL)) {
         neox_window_destroy(w);
@@ -207,12 +207,12 @@ static int translucent_present(neox_context *ctx)
     CHECK(neox_window_read_pixels(w, px) == NEOX_OK);
     for (i = 0; i < 4; i++) {
         /* 不透明窗口：RGB = 预乘后的 sRGB 分量（与 Soft 相同口径）+ alpha 255。 */
-        static const int want[4] = { 0, 128, 0, 255 };
+        static const int want[4] = { 0, 64, 0, 255 };
         if (px[(((size_t)pxh / 2) * pxw + pxw / 2) * 4 + (size_t)i] != want[i]) break;
     }
     if (i != 4) {
         const uint8_t *p = px + (((size_t)pxh / 2) * pxw + pxw / 2) * 4;
-        fprintf(stderr, "FAIL translucent present: got %u,%u,%u,%u want 0,128,0,255\n",
+        fprintf(stderr, "FAIL translucent present: got %u,%u,%u,%u want 0,64,0,255\n",
                 p[0], p[1], p[2], p[3]);
         neox_window_destroy(w);
         return -1;
@@ -225,6 +225,35 @@ static int translucent_present(neox_context *ctx)
 #endif
 }
 
+/* Exercise the real presentation shader offscreen as well: CGL has no native
+ * GL window surface, but must obey the same alpha and color-space contract. */
+static void present_pixels(neox_device *dev, neox_gl_surface *source)
+{
+    nx_gl_dev *g = (nx_gl_dev *)dev->bstate;
+    neox_gl_surface *output = NULL;
+    uint8_t pixels[32 * 32 * 4];
+    float v[6] = {0, 0, 64, 0, 0, 64};
+    CHECK(neox_gl_surface_create(dev, 32, 32, &output) == NEOX_OK);
+    glBindFramebuffer(GL_FRAMEBUFFER, output->fbo);
+    glViewport(0, 0, 32, 32);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, source->tex);
+    gl_use(&g->p_present, 2.0f / 32, 2.0f / 32);
+    glUniform1i(g->p_present.u_tex, 0);
+    glUniform1f(g->p_present.u_ss, 32);
+    gl_draw(g, v, 3);
+    glReadPixels(0, 0, 32, 32, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    CHECK(gl_error(g) == GL_NO_ERROR);
+    for (size_t i = 0; i < 32 * 32; ++i) {
+        CHECK(pixels[i * 4] == 0 && pixels[i * 4 + 1] == 64);
+        CHECK(pixels[i * 4 + 2] == 0 && pixels[i * 4 + 3] == 255);
+    }
+    neox_gl_surface_destroy(dev, output);
+}
+
 static int offscreen(neox_context *ctx, neox_device *dev)
 {
     neox_gl_surface *surf = NULL;
@@ -233,7 +262,6 @@ static int offscreen(neox_context *ctx, neox_device *dev)
     /* 离屏表面：alpha=0.5，读回应保留 alpha=128（非预乘）。 */
     if (neox_gl_surface_create(dev, 32, 32, &surf) != NEOX_OK) {
         fprintf(stderr, "offscreen surface failed: %s\n", neox_get_error_detail(ctx));
-        neox_device_destroy(dev);
         return 0;
     }
     CHECK(draw_half_red(dev, surf, NULL));
@@ -245,6 +273,7 @@ static int offscreen(neox_context *ctx, neox_device *dev)
         CHECK(px[(16 * 32 + 16) * 4 + 1] == 128);
         CHECK(px[(16 * 32 + 16) * 4 + 3] == 128);
     }
+    present_pixels(dev, surf);
     neox_gl_surface_destroy(dev, surf);
     return 1;
 }
@@ -271,6 +300,7 @@ int main(void)
         dd.platform_size = (uint32_t)sizeof gld;
         if (neox_device_create(ctx, &dd, &dev) != NEOX_OK) {
             printf("GL device creation unavailable: %s\n", neox_get_error_detail(ctx));
+            CHECK(!getenv("NEOX_REQUIRE_GL") || !*getenv("NEOX_REQUIRE_GL"));
             runtime = 0;
         } else {
             runtime = offscreen(ctx, dev);
@@ -294,8 +324,8 @@ int main(void)
         return 77;
     }
     printf("present shader: all GLSL programs compile%s\n",
-           window ? "; translucent present 0,128,0,255 ok"
-                  : "; translucent window present not_run (no DISPLAY)");
+           window ? "; translucent present 0,64,0,255 ok"
+                  : "; native GL window not_run (offscreen shader pixels verified)");
     return 0;
 #else
     puts("SKIP: GL backend not built");

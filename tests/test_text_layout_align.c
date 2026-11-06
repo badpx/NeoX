@@ -69,6 +69,32 @@ int main(void)
     NEAR(l->glyphs[l->glyph_count - 1].x, 100.0f - 9.0f);
     nx_layout_destroy(l);
 
+    /* Consecutive spaces keep their individual advances until line finalization.
+     * Check actual glyph positions as well as the independently measured box. */
+    for (i = NX_ALIGN_LEFT; i <= NX_ALIGN_RIGHT; i++) {
+        float offset = i == NX_ALIGN_LEFT ? 0.0f :
+                       i == NX_ALIGN_CENTER ? 22.0f : 44.0f;
+        OK(nx_text_layout(t, f, 10, "aa  bb   ", 100, (nx_text_align)i, &l));
+        CHECK(l->line_count == 1 && l->glyph_count == 6);
+        NEAR(l->width, 56.0f);
+        NEAR(l->glyphs[2].x, offset + 18.0f);
+        NEAR(l->glyphs[3].x, offset + 28.0f);
+        NEAR(l->glyphs[4].x, offset + 38.0f);
+        NEAR(l->glyphs[5].x + 9.0f, offset + 56.0f);
+        OK(nx_text_measure(l, box));
+        NEAR(box[0], offset);
+        NEAR(box[2], offset + 56.0f);
+        nx_layout_destroy(l);
+    }
+    OK(nx_text_layout(t, f, 10, "aa  bb", 55, NX_ALIGN_RIGHT, &l));
+    CHECK(l->line_count == 2 && l->glyph_count == 4);
+    NEAR(l->glyphs[0].x, 37.0f);
+    NEAR(l->glyphs[2].x, 37.0f);
+    OK(nx_text_measure(l, box));
+    NEAR(box[0], 37.0f);
+    NEAR(box[2], 55.0f);
+    nx_layout_destroy(l);
+
     /* 3. 换行判定仍然把行尾空白算进去：'aa ' 能放进 21，'aa bbbb' 放不下。 */
     OK(nx_text_layout(t, f, 10, "aa bbbb", 21, NX_ALIGN_LEFT, &l));
     CHECK(l->line_count == 2);

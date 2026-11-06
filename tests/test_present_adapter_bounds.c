@@ -34,6 +34,7 @@ static void *capture_marshal(void *proxy, uint32_t op,
 struct fake_listen_rec {
     void *proxy;
     void *data;
+    void *listener;
 };
 static struct fake_listen_rec *g_listens;
 static int capture_listen(void *proxy, void *lis, void *data)
@@ -41,8 +42,8 @@ static int capture_listen(void *proxy, void *lis, void *data)
     if (g_listens) {
         g_listens->proxy = proxy;
         g_listens->data = data;
+        g_listens->listener = lis;
     }
-    (void)lis;
     return 0;
 }
 static int stub_getattr_unmapped(void *dpy, unsigned long win, void *attr)
@@ -143,9 +144,7 @@ int main(void)
             w.qn = 0; w.qh = w.qt = 0;
         }
     }
-    /* 评审 4489969071：wl_compositor 必须按服务端实际版本（上限 5）绑定，
-     * wl_surface 的 enter/leave（v5 事件）才可能注册。旧实现 clamp 到 4，
-     * surf_ver >= 5 永远为假，多输出跟踪接不上。 */
+    /* Bound versions must not exceed either server support or our v5 cap. */
     {
         struct fake_marshal_rec rec;
         PFN_marshal saved_marshal = g_wl.marshal;
@@ -160,7 +159,7 @@ int main(void)
         g_marshals = NULL;
         CHECK(rec.iface == g_wl.compositor && rec.ver == 5);
         CHECK(wl2.comp_ver == 5);
-        /* v4 服务端：绑定 4，enter/leave 不可用。 */
+        /* v4 服务端：绑定 4，仍支持 enter/leave。 */
         memset(&wl2, 0, sizeof wl2);
         g_wl.marshal = capture_marshal;
         g_marshals = &rec;
@@ -186,30 +185,43 @@ int main(void)
             CHECK(wv.scale == 2.0f && wv.px_w == 16 && wv.px_h == 16);
         }
     }
-    /* 版本判定本身：只有 >= 5 才注册 enter/leave。 */
+    /* Exercise the actual registration path and dispatch through the listener
+     * for every supported version, including v1-v4 compositors. */
     {
-        CHECK(!nx_wl_surface_enter_ready(4));
-        CHECK(nx_wl_surface_enter_ready(5));
-        CHECK(nx_wl_surface_enter_ready(6));
-        /* 注册入口真正调用 wl_listener 的接线：v4 不注册，v5 注册一次。 */
-        {
-            struct fake_listen_rec lrec;
-            PFN_listen saved_listen = g_wl.listen;
-            nx_wl wl3;
-            memset(&lrec, 0, sizeof lrec);
-            memset(&wl3, 0, sizeof wl3);
+        uint32_t version;
+        PFN_listen saved_listen = g_wl.listen;
+        struct surface_listener {
+            void (*enter)(void *, void *, void *);
+            void (*leave)(void *, void *, void *);
+        };
+        CHECK(!nx_wl_surface_enter_ready(0));
+        for (version = 1; version <= 5; version++) {
+            struct fake_listen_rec lrec = {0};
+            nx_wl wl3 = {0};
+            neox_window ww = {0};
+            const struct surface_listener *listener;
+            void *surface = (void *)(uintptr_t)0x11;
+            void *output = (void *)(uintptr_t)0x22;
             g_wl.listen = capture_listen;
             g_listens = &lrec;
-            wl3.surf_ver = 4;
-            CHECK(!nx_wl_register_enter(&wl3, (void *)(uintptr_t)0x11));
-            CHECK(lrec.proxy == NULL && !wl3.surf_enter_ready);
-            wl3.surf_ver = 5;
-            CHECK(nx_wl_register_enter(&wl3, (void *)(uintptr_t)0x11));
-            CHECK(lrec.proxy == (void *)(uintptr_t)0x11 && lrec.data == &wl3);
-            CHECK(wl3.surf_enter_ready);
-            g_wl.listen = saved_listen;
-            g_listens = NULL;
+            wl3.surf_ver = version;
+            wl3.win = &ww;
+            wl3.opened = 1;
+            wl3.outputs[0] = output;
+            wl3.output_scales[0] = 2;
+            wl3.noutputs = 1;
+            OK(nx_win_set_geometry(&ww, 8, 8, 1));
+            CHECK(nx_wl_register_enter(&wl3, surface));
+            CHECK(lrec.proxy == surface && lrec.data == &wl3 && wl3.surf_enter_ready);
+            listener = (const struct surface_listener *)lrec.listener;
+            listener->enter(lrec.data, surface, output);
+            CHECK(wl3.enter_output == output);
+            CHECK(ww.scale == (version >= 3 ? 2.0f : 1.0f));
+            listener->leave(lrec.data, surface, output);
+            CHECK(wl3.enter_output == NULL);
         }
+        g_wl.listen = saved_listen;
+        g_listens = NULL;
     }
 
     /* 评审 4489969158：两个槽都在合成器手里时，present 必须返回可重试的

@@ -342,13 +342,68 @@ static void test_group_blend_isolation(void)
     CHECK_RES(neox_node_create(g_dev, sc, &nd, &child), NEOX_OK);
     CHECK_RES(neox_node_append_child(g_dev, group, child), NEOX_OK);
     CHECK_RES(begin_frame(&fr, buf, 8, 8, &BLUE), NEOX_OK);
-    CHECK_RES(neox_scene_render(fr, sc, (neox_node){ 0 }), NEOX_OK);
+    CHECK_RES(neox_scene_render(fr, sc, group), NEOX_OK);
     end_and_pump(fr);
     CHECK_PX(buf, 8, 3, 3, 0, 0, 255, 255);
     CHECK_PX(buf, 8, 7, 7, 0, 0, 255, 255);
     neox_scene_destroy(g_dev, sc);
 
     neox_path_release(g_dev, full);
+    neox_device_pump(g_dev);
+}
+
+/* Compare the same partial drawing through an immediate scope and a retained
+ * group: SRC_OVER is equivalent, but DST_IN differs outside the primitive. */
+static void test_group_blend_scope_comparison(void)
+{
+    const neox_blend modes[] = { NEOX_BLEND_SRC_OVER, NEOX_BLEND_DST_IN };
+    uint8_t immediate[8 * 8 * 4], retained[8 * 8 * 4];
+    neox_path half = make_rect(0, 0, 4, 8, NEOX_FILL_NONZERO);
+    neox_paint paint = { RED };
+    unsigned i;
+    for (i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        neox_frame *fr;
+        neox_state state = {0};
+        neox_scene scene = neox_scene_create(g_dev);
+        neox_node_desc desc = {0};
+        neox_node group, child;
+        CHECK(scene.id != 0);
+        state.transform = (neox_affine){ 1, 0, 0, 1, 0, 0 };
+        state.opacity = 1.0f;
+        state.blend = modes[i];
+        CHECK_RES(begin_frame(&fr, immediate, 8, 8, &BLUE), NEOX_OK);
+        CHECK_RES(neox_push_state(fr, &state), NEOX_OK);
+        CHECK_RES(neox_draw_path(fr, half, &paint), NEOX_OK);
+        CHECK_RES(neox_pop_state(fr), NEOX_OK);
+        end_and_pump(fr);
+
+        desc.kind = NEOX_NODE_GROUP;
+        desc.transform = state.transform;
+        desc.opacity = 1.0f;
+        desc.visible = 1;
+        desc.blend = modes[i];
+        CHECK_RES(neox_node_create(g_dev, scene, &desc, &group), NEOX_OK);
+        desc.kind = NEOX_NODE_PATH;
+        desc.blend = NEOX_BLEND_SRC_OVER;
+        desc.path.path = half;
+        desc.path.paint = paint;
+        CHECK_RES(neox_node_create(g_dev, scene, &desc, &child), NEOX_OK);
+        CHECK_RES(neox_node_append_child(g_dev, group, child), NEOX_OK);
+        CHECK_RES(begin_frame(&fr, retained, 8, 8, &BLUE), NEOX_OK);
+        CHECK_RES(neox_scene_render(fr, scene, group), NEOX_OK);
+        end_and_pump(fr);
+        CHECK_PX(immediate, 8, 6, 3, 0, 0, 255, 255);
+        if (modes[i] == NEOX_BLEND_SRC_OVER) {
+            CHECK_PX(immediate, 8, 1, 3, 255, 0, 0, 255);
+            CHECK(memcmp(immediate, retained, sizeof(immediate)) == 0);
+        } else {
+            CHECK_PX(immediate, 8, 1, 3, 0, 0, 255, 255);
+            CHECK_PX(retained, 8, 1, 3, 0, 0, 255, 255);
+            CHECK_PX(retained, 8, 6, 3, 0, 0, 0, 0);
+        }
+        neox_scene_destroy(g_dev, scene);
+    }
+    neox_path_release(g_dev, half);
     neox_device_pump(g_dev);
 }
 
@@ -1101,6 +1156,7 @@ int main(void)
     test_porter_duff();
     test_group_opacity();
     test_group_blend_isolation();
+    test_group_blend_scope_comparison();
     test_nested_clip();
     test_texture_sampling();
     test_glyphs();

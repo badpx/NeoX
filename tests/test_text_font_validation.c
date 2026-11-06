@@ -1,4 +1,5 @@
-/* P0-3：不可信字体输入必须在进入 stb_truetype 之前被拒绝。
+/* Structural font validation rejects the malformed inputs covered here before
+ * stb_truetype; this is not a complete security boundary for untrusted fonts.
  * 旧实现在 12 字节的伪造 sfnt 头上让 stbtt_InitFont 越界读（ASan
  * heap-buffer-overflow）。这里逐类构造畸形/截断输入，要求统一返回
  * INVALID_ARGUMENT 且 *out 保持 NULL；最后用一个结构合法的最小字体确认
@@ -30,6 +31,43 @@ static void expect_bad(nx_text_context *t, const uint8_t *d, size_t n, int ttc,
                 what, (int)r, (void *)f);
         exit(1);
     }
+}
+
+/* Two empty glyphs and a single format 12 mapping: U+0041 -> glyph 1.
+ * The complete cmap is only 40 bytes (4 + 8 + 16 + 12). */
+static size_t small_cmap_font(uint8_t *d)
+{
+    static const char *tags[] = { "head", "hhea", "maxp", "hmtx", "loca", "cmap", "glyf" };
+    static const unsigned offsets[] = { 124, 180, 216, 248, 256, 264, 304 };
+    static const unsigned lengths[] = { 54, 36, 32, 8, 6, 40, 0 };
+    unsigned i;
+    memset(d, 0, 304);
+    put32(d, 0x00010000u);
+    put16(d + 4, 7);
+    for (i = 0; i < 7; i++) {
+        memcpy(d + 12 + i * 16, tags[i], 4);
+        put32(d + 20 + i * 16, offsets[i]);
+        put32(d + 24 + i * 16, lengths[i]);
+    }
+    put16(d + 124 + 18, 1000); /* unitsPerEm */
+    put16(d + 180 + 4, 800);  /* ascender */
+    put16(d + 180 + 6, (unsigned)(uint16_t)-200); /* descender */
+    put16(d + 180 + 34, 2);   /* numberOfHMetrics */
+    put32(d + 216, 0x00010000u);
+    put16(d + 216 + 4, 2);    /* numGlyphs */
+    put16(d + 248, 500);
+    put16(d + 252, 500);
+    put16(d + 264 + 2, 1);    /* one encoding record */
+    put16(d + 264 + 4, 3);    /* Microsoft Unicode full repertoire */
+    put16(d + 264 + 6, 10);
+    put32(d + 264 + 8, 12);
+    put16(d + 276, 12);       /* format 12 */
+    put32(d + 276 + 4, 28);
+    put32(d + 276 + 12, 1);   /* nGroups */
+    put32(d + 276 + 16, 'A');
+    put32(d + 276 + 20, 'A');
+    put32(d + 276 + 24, 1);
+    return 304;
 }
 
 int main(void)
@@ -153,6 +191,28 @@ int main(void)
         put32(buf + 24, 54);
         r = nx_font_load_memory(t, buf, 256, 0, &f);
         CHECK(r == NEOX_ERROR_INVALID_ARGUMENT && f == NULL);
+    }
+
+    /* A valid small cmap must load and actually map its character through stb. */
+    {
+        nx_font *f = NULL;
+        nx_layout *layout = NULL;
+        size_t size = small_cmap_font(buf);
+        CHECK(nx_font_load_memory(t, buf, size, 0, &f) == NEOX_OK);
+        CHECK(nx_text_layout(t, f, 10, "A", 0, NX_ALIGN_LEFT, &layout) == NEOX_OK);
+        CHECK(layout->glyph_count == 1 && layout->glyphs[0].glyph_index == 1);
+        CHECK(layout->width > 4.999f && layout->width < 5.001f);
+        nx_layout_destroy(layout);
+        nx_font_destroy(f);
+
+        put32(buf + 276 + 12, 2); /* two groups do not fit in 28 bytes */
+        expect_bad(t, buf, size, 0, "format 12 group array truncated");
+        small_cmap_font(buf);
+        put32(buf + 276 + 4, 15); /* shorter than the format-specific header */
+        expect_bad(t, buf, size, 0, "format 12 header truncated");
+        small_cmap_font(buf);
+        put16(buf + 264 + 2, 5); /* encoding records spill outside cmap */
+        expect_bad(t, buf, sizeof buf, 0, "cmap records exceed table, not file");
     }
 
     nx_text_context_destroy(t);

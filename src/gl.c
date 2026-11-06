@@ -261,7 +261,7 @@ static const char *NX_GLSL_FS_CLAMP =
  *
  * 颜色链（P1-5 + shader 类型修正）：surface 纹理在 gl_resolve / encode pass
  * 已经做过**一次** sRGB 量化（NX_GLSL_FS_ENCODE；GL_FRAMEBUFFER_SRGB 恒关，
- * 见 gl_device_init），是预乘 sRGB8。present 只负责翻转行序与输出，不能再做
+ * 见 gl_device_init），是非预乘 sRGB8。present 在编码域乘 alpha 后输出，不能再做
  * 一次 sRGB 编码（会二次编码、把 128 变成约 188）。
  *
  * 不透明窗口策略：与 Soft（X11/Wayland/Cocoa 的 RGB *= a、丢弃 alpha）和
@@ -280,7 +280,7 @@ static const char *NX_GLSL_FS_PRESENT =
     "{\n"
     "    int y = int(u_ss) - 1 - int(gl_FragCoord.y);\n"
     "    vec4 p = texelFetch(u_tex, ivec2(int(gl_FragCoord.x), y), 0);\n"
-    "    o_color = vec4(clamp(p.rgb, 0.0, 1.0), 1.0);\n"
+    "    o_color = vec4(clamp(p.rgb, 0.0, 1.0) * clamp(p.a, 0.0, 1.0), 1.0);\n"
     "}\n";
 
 /* PLUS（§6.1）：clamp 非线性 + 覆盖率插值无法由固定功能因子表达。
@@ -2687,13 +2687,12 @@ neox_result neox_gl_surface_present(neox_gl_surface *surface)
      * 普通 present 之后读回返回 UNSUPPORTED（既有契约，评审 4489969103）。 */
     surface->presented_valid = 0;
     /* 普通呈现不分配、不做 CPU 读回；只有请求过 readback 的那一次才保存
-     * 窗口缓冲。快照存储复用，直到 resize/销毁才归还。捕获失败不阻断
-     * 呈现本身。 */
+     * 窗口缓冲。快照存储复用，直到 resize/销毁才归还。分配失败必须
+     * 返回 OOM，并保留请求供调用方重试，不能把未完成的捕获报告为成功。 */
     if (capture && !surface->presented) {
         surface->presented = nx_alloc(ctx,(size_t)w*h*4,16);
         if (!surface->presented) {
-            capture = 0;
-            ctx->last_error = "snapshot allocation failed";
+            NX_ERR(ctx, "snapshot allocation failed", NEOX_ERROR_OUT_OF_MEMORY);
         }
     }
     if (!nx_gl_ctx_window_make_current(g->ctx, surface->win_egl))

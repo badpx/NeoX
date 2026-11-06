@@ -636,7 +636,7 @@ static int tx_in(const uint8_t *d, size_t size, uint64_t base, uint64_t rel, uin
  *   hmtx  : 4 × numberOfHMetrics + 2 × (numGlyphs − numberOfHMetrics)
  *   loca  : 2/4 × (numGlyphs + 1)
  *   glyf  : 0（可为空，但 loca 的偏移都必须落在表内）
- *   cmap  : 64 字节（头部 + 至少一个编码记录 + 一张子表头部）
+ *   cmap  : 4 字节头部，编码记录及子表按各自格式检查
  * CFF 字体（'OTTO'）以 'CFF '/'CFF2' 代替 glyf/loca。 */
 static int tx_check_required_tables(const uint8_t *d, size_t size,
                                     const tx_sfnt_table *tbl, uint32_t n)
@@ -659,7 +659,7 @@ static int tx_check_required_tables(const uint8_t *d, size_t size,
         }
     }
     if (!head || !hhea || !maxp || !hmtx || !cmap) return 0;
-    if (head->len < 54 || hhea->len < 36 || maxp->len < 6 || cmap->len < 64)
+    if (head->len < 54 || hhea->len < 36 || maxp->len < 6 || cmap->len < 4)
         return 0;
     {
         uint32_t num_glyphs = tx_rd_u16(d + maxp->off + 4);
@@ -695,33 +695,62 @@ static int tx_check_required_tables(const uint8_t *d, size_t size,
             uint32_t nt = tx_rd_u16(d + cmap->off + 2);
             uint32_t k;
             if (nt == 0) return 0;
+            if (nt > (cmap->len - 4u) / 8u) return 0;
             if (!tx_in(d, size, cmap->off, 4u, (uint64_t)nt * 8u)) return 0;
             for (k = 0; k < nt; k++) {
                 uint32_t sub = tx_rd_u32(d + cmap->off + 4u + k * 8u + 4u);
-                uint32_t fmt, len;
+                uint32_t fmt, len, header;
+                const uint8_t *p;
                 if ((uint64_t)sub + 4u > cmap->len) return 0;
                 if (!tx_in(d, size, cmap->off, sub, 4u)) return 0;
                 fmt = tx_rd_u16(d + cmap->off + sub);
+                p = d + cmap->off + sub;
                 switch (fmt) {
-                case 0: case 4: case 6: case 10:
-                    if (!tx_in(d, size, cmap->off, sub, 6u)) return 0;
-                    len = tx_rd_u16(d + cmap->off + sub + 2);
-                    break;
-                case 12: case 13:
-                    if (!tx_in(d, size, cmap->off, sub, 16u)) return 0;
-                    len = tx_rd_u32(d + cmap->off + sub + 4);
+                case 10: header = 20; break;
+                case 12: case 13: header = 16; break;
+                case 14: header = 10; break;
+                case 0: header = 262; break;
+                case 4: header = 16; break;
+                case 6: header = 10; break;
+                default: header = 4; break;
+                }
+                if (header > cmap->len - sub) return 0;
+                switch (fmt) {
+                case 10: case 12: case 13:
+                    len = tx_rd_u32(p + 4);
                     break;
                 case 14:
-                    if (!tx_in(d, size, cmap->off, sub, 10u)) return 0;
-                    len = tx_rd_u32(d + cmap->off + sub + 2);
+                    len = tx_rd_u32(p + 2);
                     break;
                 default:
-                    /* 未知/不支持格式：至少它的头部必须在表内。 */
-                    if (!tx_in(d, size, cmap->off, sub, 4u)) return 0;
-                    len = tx_rd_u16(d + cmap->off + sub + 2);
+                    len = tx_rd_u16(p + 2);
                     break;
                 }
-                if (len < 4u || (uint64_t)sub + len > cmap->len) return 0;
+                if (len < header || len > cmap->len - sub) return 0;
+                /* Counted arrays must fit in their own subtable, not merely the
+                 * font buffer. This is structural hardening, not a validator
+                 * for every nested reference used by the font parser. */
+                switch (fmt) {
+                case 4: {
+                    uint32_t seg2 = tx_rd_u16(p + 6);
+                    if (!seg2 || (seg2 & 1u) || seg2 / 2u > (len - 16u) / 8u)
+                        return 0;
+                    break;
+                }
+                case 6:
+                    if (tx_rd_u16(p + 8) > (len - 10u) / 2u) return 0;
+                    break;
+                case 10:
+                    if (tx_rd_u32(p + 16) > (len - 20u) / 2u) return 0;
+                    break;
+                case 12: case 13:
+                    if (tx_rd_u32(p + 12) > (len - 16u) / 12u) return 0;
+                    break;
+                case 14:
+                    if (tx_rd_u32(p + 6) > (len - 10u) / 11u) return 0;
+                    break;
+                default: break;
+                }
             }
         }
     }
@@ -793,7 +822,8 @@ static neox_result font_load(nx_text_context *t, const void *data, size_t size,
         TX_ERR(t, "invalid font header or TTC index", NEOX_ERROR_INVALID_ARGUMENT);
     if (size > INT32_MAX)
         TX_ERR(t, "font exceeds parser offset range", NEOX_ERROR_UNSUPPORTED);
-    /* P0-3：先把不可信的字体结构校验干净，再让 stb 解析。 */
+    /* Reject malformed headers and covered table structures before stb parsing.
+     * This partial validation does not make arbitrary untrusted fonts safe. */
     if (!tx_font_header_ok((const uint8_t *)data, size, ttc_index))
         TX_ERR(t, "malformed TrueType/OpenType header, table directory or TTC index",
                NEOX_ERROR_INVALID_ARGUMENT);
@@ -1231,14 +1261,9 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
             /* 放置词内字形 */
             {
                 uint32_t k;
-                double adv;
-                /* 放置位置就是被丢弃的行尾空白之前的位置：间隔由前导空白
-                 * 的宽度占住，但它的字形不进入字形数组（P1-15）。 */
-                if (tk->is_space && line_has_content && line_trail > 0.0 &&
-                    pen - line_trail >= 0.0)
-                    adv = pen - line_trail;
-                else
-                    adv = pen;
+                /* A trailing space may become an interior space when the next
+                 * word arrives. Keep all advances until line finalization. */
+                double adv = pen;
                 for (k = 0; k < tk->count; k++) {
                     uint32_t gi = tk->glyph0 + k;
                     nx_laid_glyph lg;

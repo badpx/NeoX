@@ -359,12 +359,12 @@ typedef struct nx_wl {
     void *toplevel;
     void *egl_window;
     uint32_t comp_ver, wm_ver, seat_ver, surf_ver;
-    int surf_enter_ready;      /* 已按 v5 注册 enter/leave（评审 4489969071） */
+    int surf_enter_ready;      /* 已注册 enter/leave */
     int output_scale;          /* 当前 output 的整数 scale；0 = 未知（P1-6） */
     void *outputs[NX_WL_OUTPUTS]; /* 绑定的全部 wl_output（P1-6） */
     int output_scales[NX_WL_OUTPUTS];
     int noutputs;
-    const void *enter_output;  /* wl_surface.enter 的当前 output（v5+） */
+    const void *enter_output;  /* wl_surface.enter 的当前 output（v1+） */
     int pointer_on;            /* 指针已进入本 surface */
     float pointer_x, pointer_y;/* 最近一次 enter/motion 的逻辑坐标（P1-2） */
     int configured;
@@ -439,13 +439,13 @@ static uint32_t clamp_ver(uint32_t server, uint32_t cap)
     return server < cap ? server : cap;
 }
 
-/* wl_surface 绑定版本 >= 5 才有 enter/leave 事件（wayland.xml）。 */
+/* enter/leave are available since wl_surface v1; v5 adds the offset request. */
 static int nx_wl_surface_enter_ready(uint32_t surf_ver)
 {
-    return surf_ver >= 5;
+    return surf_ver >= 1;
 }
 
-/* 注册 enter/leave listener；返回 1 = 已注册（绑定版本支持 v5 事件）。 */
+/* 注册 enter/leave listener；返回 1 = 已注册。 */
 static int nx_wl_register_enter(nx_wl *p, void *surface)
 {
     static const struct {
@@ -453,7 +453,7 @@ static int nx_wl_register_enter(nx_wl *p, void *surface)
         void (*leave)(void *, void *, void *);
     } surf_lis = { on_surf_enter, on_surf_leave };
     if (!p || !surface || !nx_wl_surface_enter_ready(p->surf_ver)) return 0;
-    g_wl.listen(surface, (void *)&surf_lis, p);
+    if (g_wl.listen(surface, (void *)&surf_lis, p) != 0) return 0;
     p->surf_enter_ready = 1;
     return 1;
 }
@@ -717,7 +717,7 @@ static int output_scale_of(const nx_wl *p, const void *out)
 }
 
 /* wl_output.scale（v2 事件）：记到该 output 的槽位。只有"当前 output"
- * 的 scale 能改变窗口（P1-6）。当前 output 优先取 wl_surface.enter（v5+），
+ * 的 scale 能改变窗口（P1-6）。当前 output 优先取 wl_surface.enter（v1+），
  * 否则取指针 enter。收到第一份 scale 之前以首个报告值作为窗口初值。 */
 static void on_out_scale(void *data, void *out, int32_t factor)
 {
@@ -761,7 +761,7 @@ static void output_destroy(nx_wl *p, int i)
     p->noutputs--;
 }
 
-/* wl_surface 版本 ≥5 的 enter/leave：合成器告知窗口所在 output，
+/* wl_surface 版本 ≥1 的 enter/leave：合成器告知窗口所在 output，
  * 比指针 enter 更直接（P1-6）。 */
 static void on_surf_enter(void *data, void *surface, void *output)
 {
@@ -990,10 +990,8 @@ static void on_global(void *data, void *registry, uint32_t name,
 {
     nx_wl *p = (nx_wl *)data;
     if (!p->compositor && strcmp(interface, "wl_compositor") == 0) {
-        /* wl_surface v5 才有 enter/leave 事件。旧实现把 compositor 绑成
-         * clamp(version, 4)，而 surf_ver 又取 comp_ver，导致 surf_ver >= 5
-         * 永远不成立、listener 永不注册（评审 4489969071）。这里按服务端
-         * 实际支持的版本（上限 5）绑定。 */
+        /* Bind at most v5: the surface listener implements enter/leave,
+         * but not the preferred-buffer events introduced in v6. */
         p->comp_ver = clamp_ver(version, 5);
         p->compositor = g_wl.marshal(registry, 0, g_wl.compositor, p->comp_ver, 0,
                                      name, interface, p->comp_ver, NULL);
@@ -1305,8 +1303,7 @@ static neox_result wl_open(neox_window *w)
     }
 
     p->surface = g_wl.marshal(p->compositor, 0, g_wl.surface, p->surf_ver, 0, NULL);
-    /* wl_surface.enter/leave 是 v5 事件：只有绑定的 surface 版本 >= 5 才
-     * 注册（注册即表示客户端愿意接收该版本的事件）。 */
+    /* All bound surface versions support enter/leave. */
     (void)nx_wl_register_enter(p, p->surface);
     p->xdg_surface = g_wl.marshal(p->wm, 2, &xdg_surface_interface, p->wm_ver, 0,
                                   NULL, p->surface);

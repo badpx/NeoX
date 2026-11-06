@@ -178,8 +178,9 @@ nx_gl_ctx *nx_gl_ctx_alloc_host(void *(*alloc)(void *, size_t),
                                 void (*dealloc)(void *, void *), void *user)
 {
     nx_gl_ctx *ctx;
-    if (!alloc || !dealloc) return NULL;
-    ctx = (nx_gl_ctx *)alloc(user, sizeof(*ctx));
+    if (!!alloc != !!dealloc) return NULL;
+    ctx = alloc ? (nx_gl_ctx *)alloc(user, sizeof(*ctx))
+                : (nx_gl_ctx *)malloc(sizeof(*ctx));
     if (!ctx) return NULL;
     memset(ctx, 0, sizeof(*ctx));
     ctx->dealloc = dealloc;
@@ -191,6 +192,7 @@ void nx_gl_ctx_free_host(nx_gl_ctx *ctx)
 {
     if (!ctx) return;
     if (ctx->dealloc) ctx->dealloc(ctx->alloc_user, ctx);
+    else free(ctx);
 }
 
 static void set_err_egl(const char *prefix)
@@ -510,26 +512,15 @@ static int make_current_or_pbuffer(EGLDisplay dpy, EGLContext *glctx,
     return 1;
 }
 
-static nx_gl_host_alloc g_host_alloc;
-static nx_gl_host_free g_host_free;
-static void *g_host_user;
+
+nx_gl_ctx *nx_gl_ctx_create(const neox_gl_device_desc *desc)
+{
+    return nx_gl_ctx_create_hosted(desc, NULL, NULL, NULL);
+}
 
 nx_gl_ctx *nx_gl_ctx_create_hosted(const neox_gl_device_desc *desc,
                                    nx_gl_host_alloc alloc,
                                    nx_gl_host_free dealloc, void *user)
-{
-    nx_gl_ctx *ctx;
-    g_host_alloc = alloc;
-    g_host_free = dealloc;
-    g_host_user = user;
-    ctx = nx_gl_ctx_create(desc);
-    g_host_alloc = NULL;
-    g_host_free = NULL;
-    g_host_user = NULL;
-    return ctx;
-}
-
-nx_gl_ctx *nx_gl_ctx_create(const neox_gl_device_desc *desc)
 {
     EGLConfig cfg = NULL;
     EGLContext share;
@@ -566,7 +557,7 @@ nx_gl_ctx *nx_gl_ctx_create(const neox_gl_device_desc *desc)
             return NULL;
     }
 
-    out = nx_gl_ctx_alloc_host(g_host_alloc, g_host_free, g_host_user);
+    out = nx_gl_ctx_alloc_host(alloc, dealloc, user);
     if (!out) {
         drop_ctx(dpy, glctx, surf);
         if (native) native_release(dpy);

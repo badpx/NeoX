@@ -566,8 +566,8 @@ static neox_result scene_emit(neox_frame *fr, uint32_t idx, neox_affine parent_c
             clip_idx = (int32_t)p;
             clip_id = n->u.group.clip_id;
         }
-        /* 组节点与立即模式 push_state 同语义（§7.1）：blend 只在 POP 生效，
-         * 组内子绘制 SRC_OVER。force_isolate=1 只记录来源。 */
+        /* 组节点始终隔离（§7.1）：force_isolate=1 保证建立组层，
+         * 组的 blend 在 POP 时作用于整层；立即 PUSH 可不建立隔离层。 */
         r = nx_emit_push(fr, ctm, n->opacity, n->blend, 0, clip_idx, clip_id, 1);
         if (r != NEOX_OK) return r;
         for (i = 0; i < n->child_count; i++) {

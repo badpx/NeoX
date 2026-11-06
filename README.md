@@ -34,8 +34,9 @@ NeoX 是一个以**图形语义契约**为中心的跨平台 2D 图形库：矢�
 测试包含语义、三后端一致性、生命周期、立即/保留/CAP 组合、裁剪性质与文字模块。
 特定参考场景三后端逐位一致，距离场场景按规范 §8.2 容差验收；这不代表任意内容的质量或性能已被证明。
 独立距离场质量与离线资产约定见 [docs/distance-field-quality.md](docs/distance-field-quality.md)。
-架构审阅后的实施进度和验证范围见 [docs/implementation-review.md](docs/implementation-review.md)。第三方依赖：仅模块级 vendored
-stb_truetype（见 [docs/dependencies.md](docs/dependencies.md)），核心零依赖。
+架构审阅后的实施进度和验证范围见 [docs/implementation-review.md](docs/implementation-review.md)。
+依赖口径（与 [docs/dependencies.md](docs/dependencies.md) 一致）：**核心零第三方依赖**；
+只有 Text 模块内置 vendored 的 stb_truetype，可用 `-DNEOX_WITH_TEXT=OFF` 整个裁掉。
 
 ## 构建与测试
 
@@ -45,7 +46,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-- 依赖：C11 编译器 + CMake；无第三方库。Linux GL 后端运行期 `dlopen("libEGL.so.1")`，另需 Mesa 的软件光栅驱动（无显示器也可跑，不需要 X11/Wayland）。Ubuntu 24.04：
+- 依赖：C11 编译器 + CMake。核心与 Soft/GL/Metal 后端没有第三方库；Text 模块内置
+  vendored stb_truetype（不引入外部包，`-DNEOX_WITH_TEXT=OFF` 即可去掉）。Linux GL 后端运行期 `dlopen("libEGL.so.1")`，另需 Mesa 的软件光栅驱动（无显示器也可跑，不需要 X11/Wayland）。Ubuntu 24.04：
 
 ```sh
 sudo apt-get install -y build-essential cmake libgl1-mesa-dri fonts-dejavu-core

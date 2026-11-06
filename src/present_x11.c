@@ -116,6 +116,24 @@ static struct {
 
 static int g_handlers;
 
+/* 加载状态：未尝试 / 成功 / 失败。校验失败时 dlclose 并清空整张函数表，
+ * 绝不让第二次调用把第一次的失败当成成功。 */
+enum { NX_X_LOAD_UNTRIED = 0, NX_X_LOAD_OK = 1, NX_X_LOAD_FAILED = 2 };
+static int g_x_state = NX_X_LOAD_UNTRIED;
+
+#ifndef NX_TEST_HOOK_DLOPEN
+#define NX_TEST_HOOK_DLOPEN 0
+#endif
+#if NX_TEST_HOOK_DLOPEN
+extern void *nx_test_x11_dlopen(const char *name, int flags);
+extern void *nx_test_x11_dlsym(void *handle, const char *symbol);
+#define nx_x_dlopen(n, f) nx_test_x11_dlopen((n), (f))
+#define nx_x_dlsym(h, s) nx_test_x11_dlsym((h), (s))
+#else
+#define nx_x_dlopen(n, f) dlopen((n), (f))
+#define nx_x_dlsym(h, s) dlsym((h), (s))
+#endif
+
 static int on_xerr(void *dpy, void *ev)
 {
     const unsigned char *e = (const unsigned char *)ev;
@@ -132,11 +150,19 @@ static int on_xio(void *dpy)
     return 0;
 }
 
+static void unload_x11(void)
+{
+    if (g_x.lib) dlclose(g_x.lib);
+    memset(&g_x, 0, sizeof g_x);
+    g_x_state = NX_X_LOAD_FAILED;
+}
+
 static int load_x11(void)
 {
-    if (g_x.lib) return 1;
-    g_x.lib = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
-    if (!g_x.lib) g_x.lib = dlopen("libX11.so", RTLD_NOW | RTLD_LOCAL);
+    if (g_x_state == NX_X_LOAD_OK && g_x.lib) return 1;
+    g_x_state = NX_X_LOAD_FAILED;
+    g_x.lib = nx_x_dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+    if (!g_x.lib) g_x.lib = nx_x_dlopen("libX11.so", RTLD_NOW | RTLD_LOCAL);
     if (!g_x.lib) {
         const char *de = dlerror();
         char buf[256];
@@ -147,7 +173,7 @@ static int load_x11(void)
     }
 #define NX_DLSYM(field, type, sym) do { \
         union { void *vp; type fp; } u_; \
-        u_.vp = dlsym(g_x.lib, sym); \
+        u_.vp = nx_x_dlsym(g_x.lib, sym); \
         g_x.field = u_.fp; \
     } while (0)
     NX_DLSYM(open, PFN_open, "XOpenDisplay");
@@ -195,6 +221,7 @@ static int load_x11(void)
         !g_x.keysym || !g_x.visual || !g_x.depth || !g_x.black || !g_x.destroy ||
         !g_x.cwin || !g_x.cmap || !g_x.vinfo || !g_x.xfree ||
         !g_x.getattr || !g_x.hints) {
+        unload_x11();
         nx_win_set_error("X11: libX11 is missing a required entry point");
         return 0;
     }
@@ -203,6 +230,7 @@ static int load_x11(void)
         g_x.setio(on_xio);
         g_handlers = 1;
     }
+    g_x_state = NX_X_LOAD_OK;
     return 1;
 }
 

@@ -90,6 +90,19 @@ static PFN_ewin g_ewin_create;
 static PFN_eresize g_ewin_resize;
 static PFN_edestroy g_ewin_destroy;
 
+#ifndef NX_TEST_HOOK_DLOPEN
+#define NX_TEST_HOOK_DLOPEN 0
+#endif
+#if NX_TEST_HOOK_DLOPEN
+extern void *nx_test_dlopen(const char *name, int flags);
+extern void *nx_test_dlsym(void *handle, const char *symbol);
+#define nx_dlopen(n, f) nx_test_dlopen((n), (f))
+#define nx_dlsym(h, s) nx_test_dlsym((h), (s))
+#else
+#define nx_dlopen(n, f) dlopen((n), (f))
+#define nx_dlsym(h, s) dlsym((h), (s))
+#endif
+
 static const struct wl_interface *xdg_types[26];
 
 static const struct wl_message xdg_wm_base_requests[] = {
@@ -179,7 +192,7 @@ static int xdg_filled;
 
 static const struct wl_interface *iface_sym(const char *name)
 {
-    return (const struct wl_interface *)dlsym(g_wl.lib, name);
+    return (const struct wl_interface *)nx_dlsym(g_wl.lib, name);
 }
 
 static int fill_xdg(void)
@@ -207,11 +220,39 @@ static int fill_xdg(void)
     return 1;
 }
 
+/* 加载状态：未尝试 / 成功 / 失败。失败后不缓存半初始化的函数表：
+ * 任何一个符号校验失败都 dlclose 并把全部字段清零，下次调用重新尝试
+ * （或再次干净地失败），绝不把第一次的失败当成第二次的成功。 */
+enum { NX_LOAD_UNTRIED = 0, NX_LOAD_OK = 1, NX_LOAD_FAILED = 2 };
+
+static int g_wl_state = NX_LOAD_UNTRIED;
+static int g_egl_state = NX_LOAD_UNTRIED;
+
+static void unload_wl(void)
+{
+    if (g_wl.lib) dlclose(g_wl.lib);
+    memset(&g_wl, 0, sizeof g_wl);
+    g_wl_state = NX_LOAD_FAILED;
+}
+
+static void unload_egl(void)
+{
+    if (g_egl_lib) dlclose(g_egl_lib);
+    g_egl_lib = NULL;
+    g_ewin_create = NULL;
+    g_ewin_resize = NULL;
+    g_ewin_destroy = NULL;
+    g_egl_state = NX_LOAD_FAILED;
+}
+
 static int load_wl(void)
 {
-    if (g_wl.lib) return 1;
-    g_wl.lib = dlopen("libwayland-client.so.0", RTLD_NOW | RTLD_LOCAL);
-    if (!g_wl.lib) g_wl.lib = dlopen("libwayland-client.so", RTLD_NOW | RTLD_LOCAL);
+    if (g_wl_state == NX_LOAD_OK && g_wl.lib) return 1;
+    /* 走到这里是未尝试或上次失败：两者都重新尝试加载。调用方保证不会
+     * 并发进入（呈现接口要求外部串行化）。 */
+    g_wl_state = NX_LOAD_FAILED;
+    g_wl.lib = nx_dlopen("libwayland-client.so.0", RTLD_NOW | RTLD_LOCAL);
+    if (!g_wl.lib) g_wl.lib = nx_dlopen("libwayland-client.so", RTLD_NOW | RTLD_LOCAL);
     if (!g_wl.lib) {
         const char *de = dlerror();
         char buf[256];
@@ -222,7 +263,7 @@ static int load_wl(void)
     }
 #define NX_DLSYM(field, type, sym) do { \
         union { void *vp; type fp; } u_; \
-        u_.vp = dlsym(g_wl.lib, sym); \
+        u_.vp = nx_dlsym(g_wl.lib, sym); \
         g_wl.field = u_.fp; \
     } while (0)
     NX_DLSYM(connect, PFN_connect, "wl_display_connect");
@@ -248,30 +289,36 @@ static int load_wl(void)
     g_wl.pointer = iface_sym("wl_pointer_interface");
     g_wl.keyboard = iface_sym("wl_keyboard_interface");
     g_wl.callback = iface_sym("wl_callback_interface");
+    /* fill_xdg 会经 iface_sym(g_wl.lib) 取 surface/seat/output 三个接口，
+     * 因此要在清除 lib 之前完成。 */
+    xdg_filled = 0;
     if (!g_wl.connect || !g_wl.disconnect || !g_wl.roundtrip || !g_wl.pending ||
         !g_wl.flush || !g_wl.get_fd || !g_wl.prepare || !g_wl.read_events ||
         !g_wl.cancel || !g_wl.marshal || !g_wl.listen || !g_wl.version ||
         !g_wl.destroy || !g_wl.registry || !g_wl.compositor || !g_wl.shm ||
         !g_wl.pool || !g_wl.buffer || !g_wl.pointer || !g_wl.keyboard ||
         !g_wl.callback || !fill_xdg()) {
+        unload_wl();
         nx_win_set_error("Wayland: libwayland-client is missing a required entry");
         return 0;
     }
+    g_wl_state = NX_LOAD_OK;
     return 1;
 }
 
 static int load_egl(void)
 {
-    if (g_egl_lib) return 1;
-    g_egl_lib = dlopen("libwayland-egl.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (!g_egl_lib) g_egl_lib = dlopen("libwayland-egl.so", RTLD_NOW | RTLD_LOCAL);
+    if (g_egl_state == NX_LOAD_OK && g_egl_lib) return 1;
+    g_egl_state = NX_LOAD_FAILED;
+    g_egl_lib = nx_dlopen("libwayland-egl.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!g_egl_lib) g_egl_lib = nx_dlopen("libwayland-egl.so", RTLD_NOW | RTLD_LOCAL);
     if (!g_egl_lib) {
         nx_win_set_error("Wayland: dlopen libwayland-egl.so.1 failed");
         return 0;
     }
 #define NX_DLSYM(dst, type, sym) do { \
         union { void *vp; type fp; } u_; \
-        u_.vp = dlsym(g_egl_lib, sym); \
+        u_.vp = nx_dlsym(g_egl_lib, sym); \
         dst = u_.fp; \
     } while (0)
     NX_DLSYM(g_ewin_create, PFN_ewin, "wl_egl_window_create");
@@ -279,9 +326,11 @@ static int load_egl(void)
     NX_DLSYM(g_ewin_destroy, PFN_edestroy, "wl_egl_window_destroy");
 #undef NX_DLSYM
     if (!g_ewin_create || !g_ewin_resize || !g_ewin_destroy) {
+        unload_egl();
         nx_win_set_error("Wayland: libwayland-egl is missing an entry point");
         return 0;
     }
+    g_egl_state = NX_LOAD_OK;
     return 1;
 }
 

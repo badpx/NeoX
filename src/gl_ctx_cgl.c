@@ -15,6 +15,7 @@
 
 #include <dlfcn.h>
 #include <stdlib.h>
+#include <string.h>
 
 extern CGLError CGLChoosePixelFormat(const CGLPixelFormatAttribute *attribs,
                                      CGLPixelFormatObj *pix, GLint *npix);
@@ -25,9 +26,51 @@ extern void CGLReleaseContext(CGLContextObj ctx);
 
 struct nx_gl_ctx {
     CGLContextObj cgl;
+    void (*dealloc)(void *, void *); /* 宿主注入的释放器；NULL = 自建外壳 */
+    void *alloc_user;
 };
 
 static const char *g_err;
+
+size_t nx_gl_ctx_struct_size(void) { return sizeof(struct nx_gl_ctx); }
+
+static nx_gl_host_alloc g_host_alloc;
+static nx_gl_host_free g_host_free;
+static void *g_host_user;
+
+nx_gl_ctx *nx_gl_ctx_alloc_host(nx_gl_host_alloc alloc, nx_gl_host_free dealloc,
+                                void *user)
+{
+    nx_gl_ctx *ctx;
+    if (!alloc || !dealloc) return NULL;
+    ctx = (nx_gl_ctx *)alloc(user, sizeof(*ctx));
+    if (!ctx) return NULL;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->dealloc = dealloc;
+    ctx->alloc_user = user;
+    return ctx;
+}
+
+void nx_gl_ctx_free_host(nx_gl_ctx *ctx)
+{
+    if (!ctx) return;
+    if (ctx->dealloc) ctx->dealloc(ctx->alloc_user, ctx);
+}
+
+nx_gl_ctx *nx_gl_ctx_create_hosted(const neox_gl_device_desc *desc,
+                                   nx_gl_host_alloc alloc,
+                                   nx_gl_host_free dealloc, void *user)
+{
+    nx_gl_ctx *ctx;
+    g_host_alloc = alloc;
+    g_host_free = dealloc;
+    g_host_user = user;
+    ctx = nx_gl_ctx_create(desc);
+    g_host_alloc = NULL;
+    g_host_free = NULL;
+    g_host_user = NULL;
+    return ctx;
+}
 
 const char *nx_gl_ctx_last_error(void) { return g_err; }
 int nx_gl_ctx_is_lost(const nx_gl_ctx *ctx) { (void)ctx; return 0; }
@@ -107,7 +150,7 @@ nx_gl_ctx *nx_gl_ctx_create(const neox_gl_device_desc *desc)
         g_err = "CGL: context creation failed";
         return NULL;
     }
-    out = (nx_gl_ctx *)calloc(1, sizeof(*out));
+    out = nx_gl_ctx_alloc_host(g_host_alloc, g_host_free, g_host_user);
     if (!out) {
         CGLReleaseContext(cgl);
         g_err = "CGL: out of memory";
@@ -136,5 +179,5 @@ void nx_gl_ctx_destroy(nx_gl_ctx *ctx)
         CGLSetCurrentContext(NULL);
         CGLReleaseContext(ctx->cgl);
     }
-    free(ctx);
+    nx_gl_ctx_free_host(ctx);
 }

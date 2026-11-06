@@ -545,6 +545,8 @@ struct neox_gl_surface {
     int capture_next, presented_valid;
 };
 
+#define NX_HOST_CTX_SLOTS 8 /* 上下文外壳记账槽；单进程设备数远小于此 */
+
 typedef struct nx_gl_dev {
     neox_device *dev;
     nx_gl_ctx *ctx;             /* 平台上下文；shared_context 只加入共享组 */
@@ -982,10 +984,59 @@ static neox_result gl_tex_ensure(neox_context *ctx, nx_gl_dev *g,
 
 /* ------------------------------------------------------------------ 设备初始化 / 销毁 */
 
+/* 平台上下文外壳：宿主（本文件）经注入分配器分配，平台层只填字段。
+ * 平台层通过 nx_gl_ctx_struct_size() 告知外壳大小。平台层内部再向对齐
+ * 分配器申请 size+16；本文件把地址与这次记账尺寸一起记住（每个设备最多
+ * 一个上下文外壳），释放时按同一尺寸归还。 */
+#define NX_HOST_CTX_PAD 16u
+typedef struct nx_host_ctx_block {
+    void *p;
+    size_t bytes;
+    int used;
+} nx_host_ctx_block;
+static nx_host_ctx_block g_host_ctx[NX_HOST_CTX_SLOTS];
+
+static void *gl_ctx_host_alloc(void *user, size_t bytes)
+{
+    neox_context *ctx = (neox_context *)user;
+    size_t i;
+    uint8_t *raw;
+    if (bytes == 0 || bytes > SIZE_MAX - NX_HOST_CTX_PAD) return NULL;
+    raw = (uint8_t *)nx_alloc(ctx, bytes + NX_HOST_CTX_PAD, 16);
+    if (!raw) return NULL;
+    for (i = 0; i < NX_HOST_CTX_SLOTS; i++) {
+        if (g_host_ctx[i].used) continue;
+        g_host_ctx[i].used = 1;
+        g_host_ctx[i].p = raw;
+        g_host_ctx[i].bytes = bytes + NX_HOST_CTX_PAD;
+        return raw; /* 对齐分配器已保证 16 字节对齐 */
+    }
+    nx_free(ctx, raw, bytes + NX_HOST_CTX_PAD, 16);
+    return NULL;
+}
+
+static void gl_ctx_host_free(void *user, void *p)
+{
+    size_t i;
+    if (!p) return;
+    for (i = 0; i < NX_HOST_CTX_SLOTS; i++) {
+        if (!g_host_ctx[i].used || g_host_ctx[i].p != p) continue;
+        nx_free((neox_context *)user, p, g_host_ctx[i].bytes, 16);
+        g_host_ctx[i].used = 0;
+        g_host_ctx[i].p = NULL;
+        return;
+    }
+}
+
 static void gl_state_destroy(neox_context *ctx, nx_gl_dev *g)
 {
     uint32_t i;
-    if (g->ctx && g->gl_ready && gl_make_current(g)) {
+    int current = 0;
+    if (!g) return;
+    /* GL 对象只在 make-current 成功时才能释放；失败不能让随后的 CPU/平台
+     * 资源释放（表面外壳、EGL 上下文/display、分配器记账）被跳过。 */
+    if (g->ctx && g->gl_ready && gl_make_current(g)) current = 1;
+    if (current) {
         gl_prog_free(&g->p_fill);
         gl_prog_free(&g->p_clamp);
         gl_prog_free(&g->p_plusfill);
@@ -1006,18 +1057,20 @@ static void gl_state_destroy(neox_context *ctx, nx_gl_dev *g)
         for (i = 0; i < g->nrts; i++) gl_rt_destroy(&g->rts[i]);
         for (i = 0; i < g->ntexs; i++)
             if (g->texs[i].id) glDeleteTextures(1, &g->texs[i].id);
-        /* 表面注册表中仍存活的表面。窗口的 EGLSurface 不随 GL 上下文一起没，
-         * 必须先拆掉。颜色附件随后随上下文销毁。 */
-        for (i = 0; i < g->nsurfs; i++) {
-            neox_gl_surface *s = g->surfs[i];
-            if (s->win_egl) nx_gl_ctx_window_destroy(g->ctx, s->win_egl);
-            if (s->presented)
-                nx_free(ctx, s->presented, (size_t)s->w * s->h * 4, 16);
-            nx_free(ctx, s, sizeof(neox_gl_surface), 16);
-        }
     }
+    /* 表面注册表中仍存活的表面：颜色附件随上下文/驱动一起没，但 EGLSurface
+     * 与外壳必须显式释放。没有 current 也照样拆平台表面并归还 CPU 内存。 */
+    for (i = 0; i < g->nsurfs; i++) {
+        neox_gl_surface *s = g->surfs[i];
+        if (s->win_egl) nx_gl_ctx_window_destroy(g->ctx, s->win_egl);
+        if (s->presented)
+            nx_free(ctx, s->presented, (size_t)s->w * s->h * 4, 16);
+        nx_free(ctx, s, sizeof(neox_gl_surface), 16);
+    }
+    g->nsurfs = 0;
     if (g->ctx) {
         nx_gl_ctx_destroy(g->ctx);
+        nx_gl_ctx_free_host(g->ctx);
         g->ctx = NULL;
     }
     if (g->mask) nx_free(ctx, g->mask, (size_t)g->mask_w * g->mask_h * 4, 16);
@@ -1144,7 +1197,9 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
         NX_ERR(ctx,"invalid GL output mode",NEOX_ERROR_INVALID_ARGUMENT);
     }
     g->output_mode = gld.output_mode;
-    g->ctx = nx_gl_ctx_create(platform ? &gld : NULL);
+    (void)nx_gl_ctx_struct_size(); /* 外壳大小由平台层在其分配回调内使用 */
+    g->ctx = nx_gl_ctx_create_hosted(platform ? &gld : NULL, gl_ctx_host_alloc,
+                                     gl_ctx_host_free, ctx);
     if (!g->ctx) {
         const char *e = nx_gl_ctx_last_error();
         gl_state_destroy(ctx, g);

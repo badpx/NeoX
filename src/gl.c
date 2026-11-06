@@ -1940,12 +1940,13 @@ static neox_result gl_draw_glyphs(neox_device *dev, nx_gl_dev *g,
     return NEOX_OK;
 }
 
-/* 组/裁剪层整体合成回父层（§7：opacity × 裁剪掩码 × 组混合模式） */
-static void gl_composite(neox_context *ctx, nx_gl_dev *g,
-                         const nx_gl_rt *child,
-                         const nx_gl_rt *parent, float opacity,
-                         neox_blend blend, const nx_gl_rt *clip,
-                         uint32_t w, uint32_t h)
+/* 组/裁剪层整体合成回父层（§7：opacity × 裁剪掩码 × 组混合模式）。
+ * 返回 neox_result：PLUS 的整层 clamp 失败必须向执行器传播（P1-13）。 */
+static neox_result gl_composite(neox_context *ctx, nx_gl_dev *g,
+                                const nx_gl_rt *child,
+                                const nx_gl_rt *parent, float opacity,
+                                neox_blend blend, const nx_gl_rt *clip,
+                                uint32_t w, uint32_t h)
 {
     uint32_t SSW = w * NEOX_GL_SS, SSH = h * NEOX_GL_SS;
     glBindFramebuffer(GL_FRAMEBUFFER, parent->fbo);
@@ -1968,8 +1969,17 @@ static void gl_composite(neox_context *ctx, nx_gl_dev *g,
     gl_draw_full(g, &g->p_comp, (float)SSW, (float)SSH,
                  2.0f / (float)SSW, 2.0f / (float)SSH);
     glActiveTexture(GL_TEXTURE0);
-    if (blend == NEOX_BLEND_PLUS)
-        (void)gl_clamp_layer(ctx, g, parent, w, h); /* ex_composite 对 PLUS 逐步 clamp */
+    if (blend == NEOX_BLEND_PLUS) {
+        /* ex_composite 对 PLUS 逐步 clamp：整层钳制的结果（及其 GL 错误）
+         * 必须回给调用方，不能被丢掉（P1-13）。 */
+        neox_result r = gl_clamp_layer(ctx, g, parent, w, h);
+        if (r != NEOX_OK) return r;
+    }
+    if (gl_error(g) != GL_NO_ERROR) {
+        ctx->last_error = "GL group composite failed";
+        return NEOX_ERROR_BACKEND;
+    }
+    return NEOX_OK;
 }
 
 /* 基底装载：fr->base（W×H 预乘线性）→ 快照纹理 → 放大 blit 进基底层 */
@@ -2235,9 +2245,23 @@ static neox_result gl_execute(neox_device *dev, nx_sub_slot *sub)
                     clips = nc;
                     clips[nclips++] = clip_rt;
                 }
-                gl_composite(ctx, g, layers[top2->layer],
-                             layers[parent->layer],
-                             top2->opacity, top2->blend, clip_rt, W, H);
+                {
+                    neox_result cr = gl_composite(ctx, g, layers[top2->layer],
+                                                  layers[parent->layer],
+                                                  top2->opacity, top2->blend,
+                                                  clip_rt, W, H);
+                    if (cr != NEOX_OK) {
+                        if (clip_rt) {
+                            clips[nclips - 1] = NULL;
+                            nclips--;
+                            gl_rt_release(clip_rt);
+                        }
+                        gl_rt_release(layers[top2->layer]);
+                        nlayers--;
+                        r = cr;
+                        goto cleanup;
+                    }
+                }
                 if (clip_rt) {
                     clips[nclips - 1] = NULL;
                     nclips--;

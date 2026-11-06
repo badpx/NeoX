@@ -334,6 +334,8 @@ static int load_egl(void)
     return 1;
 }
 
+#define NX_WL_OUTPUTS 8 /* 绑定的 wl_output 上限 */
+
 typedef struct nx_wl {
     neox_window *win;
     void *dpy;
@@ -350,7 +352,14 @@ typedef struct nx_wl {
     void *toplevel;
     void *egl_window;
     uint32_t comp_ver, wm_ver, seat_ver, surf_ver;
-    int output_scale;
+    int output_scale;          /* 当前 output 的整数 scale；0 = 未知（P1-6） */
+    void *outputs[NX_WL_OUTPUTS]; /* 绑定的全部 wl_output（P1-6） */
+    int output_scales[NX_WL_OUTPUTS];
+    int noutputs;
+    const void *enter_output;  /* wl_surface.enter 的当前 output（v5+） */
+    int pointer_on;            /* 指针已进入本 surface */
+    float pointer_x, pointer_y;/* 最近一次 enter/motion 的逻辑坐标（P1-2） */
+    int buf_busy_at_present;   /* 上次呈现时两个 slot 都 busy（P2-2） */
     int configured;
     int opened;
     int dead;
@@ -365,6 +374,57 @@ typedef struct nx_wl {
     uint32_t buf_w, buf_h;
     uint32_t egl_w, egl_h;
 } nx_wl;
+
+static uint32_t clamp_ver(uint32_t server, uint32_t cap);
+
+/* Wayland 层内部函数的先行声明：事件回调与呈现路径互相引用。 */
+static void apply_geom(nx_wl *p);
+static void wl_close(neox_window *w);
+static void drop_buffers(nx_wl *p);
+static int wl_pump(nx_wl *p, int timeout_ms);
+static void output_destroy(nx_wl *p, int i);
+static void apply_output_scale(nx_wl *p, int factor);
+static void follow_output(nx_wl *p, const void *out);
+static void on_out_scale(void *data, void *out, int32_t factor);
+static void on_ping(void *data, void *wm, uint32_t serial);
+static void on_xdg_configure(void *data, void *xdg_surface, uint32_t serial);
+static void on_tl_configure(void *data, void *tl, int32_t width, int32_t height,
+                            void *states);
+static void on_tl_close(void *data, void *tl);
+static void on_tl_ignore(void *data, void *tl, int32_t a, int32_t b);
+static void on_tl_caps(void *data, void *tl, void *caps);
+static void on_out_geom(void *data, void *out, int32_t x, int32_t y,
+                        int32_t pw, int32_t ph, int32_t sub,
+                        const char *make, const char *model, int32_t transform);
+static void on_out_mode(void *data, void *out, uint32_t flags, int32_t w,
+                        int32_t h, int32_t refresh);
+static void on_out_done(void *data, void *out);
+static void on_keymap(void *data, void *kbd, uint32_t format, int32_t fd, uint32_t size);
+static void on_kb_enter(void *data, void *kbd, uint32_t serial, void *surface, void *keys);
+static void on_kb_leave(void *data, void *kbd, uint32_t serial, void *surface);
+static void on_key(void *data, void *kbd, uint32_t serial, uint32_t time,
+                   uint32_t key, uint32_t state);
+static void on_mods(void *data, void *kbd, uint32_t serial, uint32_t d,
+                    uint32_t latched, uint32_t locked, uint32_t group);
+static void on_repeat(void *data, void *kbd, int32_t rate, int32_t delay);
+static void on_ptr_enter(void *data, void *ptr, uint32_t serial, void *surface,
+                         int32_t x, int32_t y);
+static void on_ptr_leave(void *data, void *ptr, uint32_t serial, void *surface);
+static void on_motion(void *data, void *ptr, uint32_t time, int32_t x, int32_t y);
+static void on_button(void *data, void *ptr, uint32_t serial, uint32_t time,
+                      uint32_t button, uint32_t state);
+static void on_axis(void *data, void *ptr, uint32_t time, uint32_t axis, int32_t value);
+static void on_frame_ptr(void *data, void *ptr);
+static void on_axis_source(void *data, void *ptr, uint32_t source);
+static void on_axis_stop(void *data, void *ptr, uint32_t time, uint32_t axis);
+static void on_axis_discrete(void *data, void *ptr, uint32_t axis, int32_t discrete);
+static void on_seat_caps(void *data, void *seat, uint32_t caps);
+static void on_seat_name(void *data, void *seat, const char *name);
+static void on_global(void *data, void *registry, uint32_t name,
+                      const char *interface, uint32_t version);
+static void on_global_remove(void *data, void *registry, uint32_t name);
+static void on_surf_enter(void *data, void *surface, void *output);
+static void on_surf_leave(void *data, void *surface, void *output);
 
 static uint32_t clamp_ver(uint32_t server, uint32_t cap)
 {
@@ -469,7 +529,7 @@ static void wl_close(neox_window *w)
         if (p->pointer) g_wl.destroy(p->pointer);
         if (p->keyboard) g_wl.destroy(p->keyboard);
         if (p->seat) g_wl.destroy(p->seat);
-        if (p->output) g_wl.destroy(p->output);
+        while (p->noutputs > 0) output_destroy(p, p->noutputs - 1);
         if (p->shm) g_wl.destroy(p->shm);
         if (p->compositor) g_wl.destroy(p->compositor);
         if (p->registry) g_wl.destroy(p->registry);
@@ -593,14 +653,10 @@ static void on_out_done(void *data, void *out)
     (void)out;
 }
 
-static void on_out_scale(void *data, void *out, int32_t factor)
+static void apply_output_scale(nx_wl *p, int factor)
 {
-    nx_wl *p = (nx_wl *)data;
     neox_window_event ev;
-    (void)out;
-    if (factor < 1) factor = 1;
-    p->output_scale = factor;
-    if (!p->win || p->win->scale_locked || !p->opened) return;
+    if (!p || !p->win || p->win->scale_locked || !p->opened) return;
     if (p->win->scale == (float)factor) return;
     if (nx_win_set_geometry(p->win, p->win->pt_w, p->win->pt_h,
                             (float)factor) != NEOX_OK) return;
@@ -611,6 +667,84 @@ static void on_out_scale(void *data, void *out, int32_t factor)
     ev.height = p->win->pt_h;
     nx_win_push_event(p->win, &ev);
     apply_geom(p);
+}
+
+static int output_slot(const nx_wl *p, const void *out)
+{
+    int i;
+    if (!out) return -1;
+    for (i = 0; i < p->noutputs; i++)
+        if (p->outputs[i] == out) return i;
+    return -1;
+}
+
+static int output_scale_of(const nx_wl *p, const void *out)
+{
+    int i = output_slot(p, out);
+    if (i < 0 || p->output_scales[i] < 1) return 0;
+    return p->output_scales[i];
+}
+
+/* wl_output.scale（v2 事件）：记到该 output 的槽位。只有"当前 output"
+ * 的 scale 能改变窗口（P1-6）。当前 output 优先取 wl_surface.enter（v5+），
+ * 否则取指针 enter。收到第一份 scale 之前以首个报告值作为窗口初值。 */
+static void on_out_scale(void *data, void *out, int32_t factor)
+{
+    nx_wl *p = (nx_wl *)data;
+    int i = output_slot(p, out);
+    if (factor < 1) factor = 1;
+    if (i < 0) return;
+    p->output_scales[i] = factor;
+    if (p->output_scale == 0) {
+        p->output_scale = factor;
+        apply_output_scale(p, factor);
+        return;
+    }
+    if (!p->enter_output) return; /* 无 enter：当前屏未知，不跟随 */
+    if (p->enter_output != out) return;
+    if (p->output_scale == factor) return;
+    p->output_scale = factor;
+    apply_output_scale(p, factor);
+}
+
+/* 窗口落到 out 上（或指针进入 out 所在的 surface）：跟随它。 */
+static void follow_output(nx_wl *p, const void *out)
+{
+    int sc = output_scale_of(p, out);
+    if (sc < 1) return;
+    p->output_scale = sc;
+    apply_output_scale(p, sc);
+}
+
+static void output_destroy(nx_wl *p, int i)
+{
+    void *out;
+    if (!p || i < 0 || i >= p->noutputs) return;
+    out = p->outputs[i];
+    if (out == p->enter_output) p->enter_output = NULL;
+    if (g_wl.destroy && out) g_wl.destroy(out);
+    p->outputs[i] = p->outputs[p->noutputs - 1];
+    p->output_scales[i] = p->output_scales[p->noutputs - 1];
+    p->outputs[p->noutputs - 1] = NULL;
+    p->output_scales[p->noutputs - 1] = 0;
+    p->noutputs--;
+}
+
+/* wl_surface 版本 ≥5 的 enter/leave：合成器告知窗口所在 output，
+ * 比指针 enter 更直接（P1-6）。 */
+static void on_surf_enter(void *data, void *surface, void *output)
+{
+    nx_wl *p = (nx_wl *)data;
+    (void)surface;
+    p->enter_output = output;
+    follow_output(p, output);
+}
+
+static void on_surf_leave(void *data, void *surface, void *output)
+{
+    nx_wl *p = (nx_wl *)data;
+    (void)surface;
+    if (p->enter_output == output) p->enter_output = NULL;
 }
 
 static uint32_t evdev_keysym(uint32_t key)
@@ -672,15 +806,25 @@ static void on_repeat(void *data, void *kbd, int32_t rate, int32_t delay)
     (void)data; (void)kbd; (void)rate; (void)delay;
 }
 
+/* wl_pointer 坐标是 24.8 定点，单位是 surface 的逻辑坐标。 */
+#define NX_WL_COORD(c) ((float)(c) / 256.0f)
+
 static void on_ptr_enter(void *data, void *ptr, uint32_t serial, void *surface,
                          int32_t x, int32_t y)
 {
-    (void)data; (void)ptr; (void)serial; (void)surface; (void)x; (void)y;
+    nx_wl *p = (nx_wl *)data;
+    (void)ptr; (void)serial; (void)surface;
+    if (!p) return;
+    p->pointer_on = 1;
+    p->pointer_x = NX_WL_COORD(x);
+    p->pointer_y = NX_WL_COORD(y);
 }
 
 static void on_ptr_leave(void *data, void *ptr, uint32_t serial, void *surface)
 {
-    (void)data; (void)ptr; (void)serial; (void)surface;
+    nx_wl *p = (nx_wl *)data;
+    (void)ptr; (void)serial; (void)surface;
+    if (p) p->pointer_on = 0;
 }
 
 static void on_motion(void *data, void *ptr, uint32_t time, int32_t x, int32_t y)
@@ -688,12 +832,33 @@ static void on_motion(void *data, void *ptr, uint32_t time, int32_t x, int32_t y
     nx_wl *p = (nx_wl *)data;
     neox_window_event ev;
     (void)ptr; (void)time;
+    if (!p) return;
+    p->pointer_on = 1;
+    p->pointer_x = NX_WL_COORD(x);
+    p->pointer_y = NX_WL_COORD(y);
     memset(&ev, 0, sizeof ev);
     ev.kind = NEOX_WINDOW_POINTER;
     ev.buttons = p->buttons;
-    ev.x = (float)x / 256.0f;
-    ev.y = (float)y / 256.0f;
+    ev.x = p->pointer_x;
+    ev.y = p->pointer_y;
     nx_win_push_event(p->win, &ev);
+}
+
+/* linux/input-event-codes.h：BTN_LEFT=0x110、BTN_RIGHT=0x111、BTN_MIDDLE=
+ * 0x112。neox_window_event.button 约定 1=左、2=中、3=右（与 X11 一致）。
+ * 旧代码把 0x111→2、0x112→3 写反了（P1-1）。 */
+#define NX_BTN_BTN_LEFT   0x110u
+#define NX_BTN_BTN_RIGHT  0x111u
+#define NX_BTN_BTN_MIDDLE 0x112u
+
+static int wl_button_number(uint32_t button)
+{
+    switch (button) {
+    case NX_BTN_BTN_LEFT:   return 1;
+    case NX_BTN_BTN_MIDDLE: return 2;
+    case NX_BTN_BTN_RIGHT:  return 3;
+    default: return 0;
+    }
 }
 
 static void on_button(void *data, void *ptr, uint32_t serial, uint32_t time,
@@ -701,11 +866,10 @@ static void on_button(void *data, void *ptr, uint32_t serial, uint32_t time,
 {
     nx_wl *p = (nx_wl *)data;
     neox_window_event ev;
-    int b = 0;
+    int b;
     (void)ptr; (void)serial; (void)time;
-    if (button == 0x110) b = 1;
-    else if (button == 0x111) b = 2;
-    else if (button == 0x112) b = 3;
+    if (!p) return;
+    b = wl_button_number(button);
     if (b >= 1 && b <= 3) {
         if (state == 1) p->buttons |= 1u << (unsigned)(b - 1);
         else p->buttons &= ~(1u << (unsigned)(b - 1));
@@ -715,6 +879,9 @@ static void on_button(void *data, void *ptr, uint32_t serial, uint32_t time,
     ev.button = b;
     ev.pressed = state == 1;
     ev.buttons = p->buttons;
+    /* 按键事件携带指针位置（P1-2）：取最近一次 enter/motion 的缓存。 */
+    ev.x = p->pointer_x;
+    ev.y = p->pointer_y;
     nx_win_push_event(p->win, &ev);
 }
 
@@ -814,7 +981,9 @@ static void on_global(void *data, void *registry, uint32_t name,
         p->seat = g_wl.marshal(registry, 0, g_wl.seat, p->seat_ver, 0,
                                name, interface, p->seat_ver, NULL);
         if (p->seat) g_wl.listen(p->seat, (void *)&lis, p);
-    } else if (!p->output && strcmp(interface, "wl_output") == 0) {
+    } else if (strcmp(interface, "wl_output") == 0) {
+        /* 绑定全部 wl_output：多屏且 scale 不同时，窗口的整数倍缓冲必须
+         * 跟随窗口/指针所在的那块屏（P1-6）。 */
         static const struct {
             void (*geometry)(void *, void *, int32_t, int32_t, int32_t, int32_t,
                              int32_t, const char *, const char *, int32_t);
@@ -823,9 +992,15 @@ static void on_global(void *data, void *registry, uint32_t name,
             void (*scale)(void *, void *, int32_t);
         } lis = { on_out_geom, on_out_mode, on_out_done, on_out_scale };
         uint32_t ver = clamp_ver(version, 2);
-        p->output = g_wl.marshal(registry, 0, g_wl.output, ver, 0,
-                                 name, interface, ver, NULL);
-        if (p->output) g_wl.listen(p->output, (void *)&lis, p);
+        void *out;
+        if (p->noutputs >= NX_WL_OUTPUTS) return; /* 超出上限：忽略 */
+        out = g_wl.marshal(registry, 0, g_wl.output, ver, 0,
+                           name, interface, ver, NULL);
+        if (!out) return;
+        g_wl.listen(out, (void *)&lis, p);
+        p->outputs[p->noutputs] = out;
+        p->output_scales[p->noutputs] = 0;
+        p->noutputs++;
     }
 }
 
@@ -884,13 +1059,20 @@ static neox_result ensure_pool(nx_wl *p, uint32_t w, uint32_t h)
     return NEOX_OK;
 }
 
+/* 呈现：把 soft_px 拷进一个空闲 shm 槽并 commit。
+ *
+ * 两个槽都在合成器手里时禁止覆盖 slot 0（那正是合成器正在读的缓冲）：
+ * 先 flush，再等 release / 帧回调；仍没有空闲槽时返回可重试的
+ * NEOX_ERROR_BACKEND，且不触碰任何槽（P2-2）。
+ * vsync 等待期间连接死亡不得当作成功（P1-4）。
+ * 像素统一为不透明窗口：RGB *= a、a = 255（P1-5）。 */
 static neox_result wl_present_soft(neox_window *w)
 {
     nx_wl *p = (nx_wl *)w->plat;
     neox_result r;
     size_t stride;
     int slot = -1;
-    int i;
+    int i, k;
     uint32_t x, y;
     void *buf;
     static const struct {
@@ -903,29 +1085,39 @@ static neox_result wl_present_soft(neox_window *w)
         nx_win_set_error("Wayland: no software frame");
         return NEOX_ERROR_INVALID_ARGUMENT;
     }
+    p->buf_busy_at_present = 0;
+    if (p->dead) {
+        nx_win_set_error("Wayland: display connection is gone");
+        return NEOX_ERROR_BACKEND;
+    }
     r = ensure_pool(p, w->px_w, w->px_h);
     if (r != NEOX_OK) return r;
-    for (i = 0; i < 2; i++) {
+    for (i = 0; i < 2; i++)
         if (!p->busy[i]) { slot = i; break; }
+    if (slot < 0 && g_wl.flush(p->dpy) < 0 && errno != EAGAIN) p->dead = 1;
+    for (i = 0; slot < 0 && !p->dead && i < 5; i++) {
+        if (wl_pump(p, 20) != 0) break;
+        for (k = 0; k < 2; k++)
+            if (!p->busy[k]) { slot = k; break; }
     }
     if (slot < 0) {
-        wl_pump(p, 30);
-        for (i = 0; i < 2; i++) {
-            if (!p->busy[i]) { slot = i; break; }
+        p->buf_busy_at_present = 1;
+        if (p->dead) {
+            nx_win_set_error("Wayland: display connection is gone");
+            return NEOX_ERROR_BACKEND;
         }
+        nx_win_set_error("Wayland: both shared buffers are still held by the compositor");
+        return NEOX_ERROR_BACKEND;
     }
-    if (slot < 0) slot = 0;
     stride = (size_t)w->px_w * 4u;
     for (y = 0; y < w->px_h; y++) {
         uint8_t *row = (uint8_t *)p->map + (size_t)slot * stride * w->px_h + (size_t)y * stride;
         for (x = 0; x < w->px_w; x++) {
             const uint8_t *s = w->soft_px + ((size_t)y * w->px_w + x) * 4u;
-            unsigned r8 = s[0], g8 = s[1], b8 = s[2], a = s[3];
-            if (a < 255u) {
-                r8 = r8 * a / 255u;
-                g8 = g8 * a / 255u;
-                b8 = b8 * a / 255u;
-            }
+            unsigned a = s[3];
+            unsigned r8 = s[0] * a / 255u;
+            unsigned g8 = s[1] * a / 255u;
+            unsigned b8 = s[2] * a / 255u;
             row[x * 4u + 0] = (uint8_t)b8;
             row[x * 4u + 1] = (uint8_t)g8;
             row[x * 4u + 2] = (uint8_t)r8;
@@ -958,6 +1150,12 @@ static neox_result wl_present_soft(neox_window *w)
     if (w->vsync) {
         for (i = 0; i < 5 && !p->frame_done; i++) {
             if (wl_pump(p, 20) != 0) break;
+        }
+        /* 帧回调没等到（合成器慢）不算错误——缓冲已经 commit；连接死亡
+         * 才是错误。 */
+        if (p->dead) {
+            nx_win_set_error("Wayland: display connection is gone");
+            return NEOX_ERROR_BACKEND;
         }
     } else if (g_wl.flush(p->dpy) < 0 && errno != EAGAIN) {
         p->dead = 1;
@@ -1058,15 +1256,29 @@ static neox_result wl_open(neox_window *w)
         wl_close(w);
         return NEOX_ERROR_BACKEND;
     }
-    if (!w->scale_locked && p->output_scale > 0)
+    /* wl_surface 版本决定能否用整数倍缓冲（P2-1）：v<3 没有
+     * set_buffer_scale，强制 1 倍——像素尺寸等于逻辑尺寸，缓冲不会被
+     * 合成器再放大一次。 */
+    p->surf_ver = p->comp_ver ? p->comp_ver : 1;
+    if (p->surf_ver < 3) {
+        w->scale = 1.0f;
+    } else if (!w->scale_locked && p->output_scale > 0) {
         w->scale = (float)p->output_scale;
-    if (nx_win_set_geometry(w, w->pt_w, w->pt_h, (float)shell_scale(w)) != NEOX_OK) {
+    }
+    if (nx_win_set_geometry(w, w->pt_w, w->pt_h,
+                            (float)(p->surf_ver >= 3 ? shell_scale(w) : 1)) != NEOX_OK) {
         wl_close(w);
         return NEOX_ERROR_INVALID_ARGUMENT;
     }
 
-    p->surf_ver = p->comp_ver ? p->comp_ver : 1;
     p->surface = g_wl.marshal(p->compositor, 0, g_wl.surface, p->surf_ver, 0, NULL);
+    if (p->surface && p->surf_ver >= 5) {
+        static const struct {
+            void (*enter)(void *, void *, void *);
+            void (*leave)(void *, void *, void *);
+        } surf_lis = { on_surf_enter, on_surf_leave };
+        g_wl.listen(p->surface, (void *)&surf_lis, p);
+    }
     p->xdg_surface = g_wl.marshal(p->wm, 2, &xdg_surface_interface, p->wm_ver, 0,
                                   NULL, p->surface);
     if (!p->surface || !p->xdg_surface) {

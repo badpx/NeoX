@@ -589,6 +589,76 @@ static uint32_t font_glyph_index(nx_font *f, uint32_t codepoint)
     return (uint32_t)stbtt_FindGlyphIndex(&f->stb, (int)codepoint);
 }
 
+/* ------------------------------------------------------------------ 字体头校验
+ * stb_truetype 假定输入是可信字体：ttcf 头里任意的表偏移/长度都会被直接
+ * 用于越界读取。Text 层在把数据交给 stb 之前做长度感知的结构校验：
+ *   - sfnt 头（0x00010000 / 'true' / 'OTTO'）或 'ttcf' 集合头；
+ *   - TTC 目录与 offset table（numTables、各表 offset/length）全部在缓冲内；
+ *   - 每个表目录项的 offset 与 length 均不超过文件长度，且不溢出。
+ * 任何一项失败都返回 INVALID_ARGUMENT，绝不进入 stbtt_InitFont（P0-3）。 */
+#define NX_SFNT_MAX_TABLES 512u
+
+static uint32_t tx_rd_u16(const uint8_t *p) { return (uint32_t)p[0] << 8 | p[1]; }
+static uint32_t tx_rd_u32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static int tx_sfnt_tag_ok(uint32_t tag)
+{
+    return tag == 0x00010000u || tag == 0x4F54544Fu /* 'OTTO' */ ||
+           tag == 0x74727565u /* 'true' */ || tag == 0x74797031u /* 'typ1' */;
+}
+
+/* 校验 offset 处的 SFNT 头与表目录；返回 1 = 合法。 */
+static int tx_check_sfnt(const uint8_t *d, size_t size, size_t offset)
+{
+    uint32_t num_tables, i;
+    size_t dir_start, dir_bytes;
+    if (offset > size || size - offset < 12) return 0;
+    if (!tx_sfnt_tag_ok(tx_rd_u32(d + offset))) return 0;
+    num_tables = tx_rd_u16(d + offset + 4);
+    if (num_tables == 0 || num_tables > NX_SFNT_MAX_TABLES) return 0;
+    dir_start = offset + 12;
+    /* numTables × 16 字节目录；用除法形式避免 32 位乘法溢出。 */
+    if ((size - dir_start) / 16u < num_tables) return 0;
+    dir_bytes = (size_t)num_tables * 16u;
+    (void)dir_bytes;
+    for (i = 0; i < num_tables; i++) {
+        const uint8_t *rec = d + dir_start + (size_t)i * 16u;
+        uint32_t off = tx_rd_u32(rec + 8);
+        uint32_t len = tx_rd_u32(rec + 12);
+        if ((uint64_t)off + (uint64_t)len > (uint64_t)size) return 0;
+        if (off < offset) return 0; /* 表不能落在文件头之前 */
+    }
+    return 1;
+}
+
+/* 校验整份字体（TTC 目录 + 指定 index 的 SFNT 头）；返回 1 = 合法。 */
+static int tx_font_header_ok(const uint8_t *d, size_t size, int ttc_index)
+{
+    if (!d || size < 12) return 0;
+    if (tx_rd_u32(d) == 0x74746366u /* 'ttcf' */) {
+        uint32_t num_fonts, i;
+        uint32_t want;
+        if (size < 16) return 0;
+        num_fonts = tx_rd_u32(d + 8);
+        if (num_fonts == 0 || num_fonts > 0xFFFFu) return 0;
+        if ((size - 12u) / 4u < num_fonts) return 0;
+        if ((uint32_t)ttc_index >= num_fonts) return 0;
+        want = tx_rd_u32(d + 12 + (size_t)ttc_index * 4u);
+        for (i = 0; i < num_fonts; i++) {
+            uint32_t off = tx_rd_u32(d + 12 + (size_t)i * 4u);
+            if (off >= size) return 0;
+        }
+        return tx_check_sfnt(d, size, (size_t)want);
+    }
+    /* 非集合：只有 index 0 合法（stbtt_GetFontOffsetForIndex 返回 -1 否则）。 */
+    if (ttc_index != 0) return 0;
+    return tx_check_sfnt(d, size, 0);
+}
+
 static neox_result font_load(nx_text_context *t, const void *data, size_t size,
                              int ttc_index, nx_font **out)
 {
@@ -598,6 +668,10 @@ static neox_result font_load(nx_text_context *t, const void *data, size_t size,
         TX_ERR(t, "invalid font header or TTC index", NEOX_ERROR_INVALID_ARGUMENT);
     if (size > INT32_MAX)
         TX_ERR(t, "font exceeds parser offset range", NEOX_ERROR_UNSUPPORTED);
+    /* P0-3：先把不可信的字体结构校验干净，再让 stb 解析。 */
+    if (!tx_font_header_ok((const uint8_t *)data, size, ttc_index))
+        TX_ERR(t, "malformed TrueType/OpenType header, table directory or TTC index",
+               NEOX_ERROR_INVALID_ARGUMENT);
     neox_result result = font_alloc(t, &f);
     if (result != NEOX_OK) return result;
     f->data = (uint8_t *)tx_alloc(t, size, 16);

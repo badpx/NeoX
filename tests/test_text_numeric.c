@@ -81,7 +81,7 @@ static void layout_numeric(nx_text_context *t)
     float box[4]={1,2,3,4},before[4];memcpy(before,box,sizeof(box));
     CHECK(nx_text_measure(&fake,box)==NEOX_ERROR_INVALID_ARGUMENT && !memcmp(box,before,sizeof(box)));
     fake.tctx=t;fake.line_count=UINT32_MAX;
-    CHECK(layout_finish_line(&fake,0,0)==NEOX_ERROR_OUT_OF_MEMORY && !fake.line);
+    CHECK(layout_finish_line(&fake,0,0,0)==NEOX_ERROR_OUT_OF_MEMORY && !fake.line);
     nx_font_backend bad=f->be;bad.ascent=NAN;nx_font *rejected=(nx_font*)(uintptr_t)1;
     CHECK(nx_font_create_custom(t,&bad,&rejected)==NEOX_ERROR_INVALID_ARGUMENT && !rejected);
     unsigned char header[12]={0};nx_font *invalid=NULL;size_t used=t->core->used;

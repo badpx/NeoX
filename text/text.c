@@ -13,6 +13,7 @@
  * 内存：持久与 stb 临时分配均经注入分配器，并计入所属核心 context 预算。
  * =========================================================================*/
 #include "neox_text.h"
+
 #include "module.h"
 #include <float.h>
 
@@ -808,7 +809,9 @@ static int nx_is_cjk(uint32_t cp)
 /* 行表项（结构体定义在头文件前向声明为不完整类型，此处补全） */
 struct nx_line_info {
     uint32_t start, count;
-    float width;
+    float width;      /* 行内容宽（不含行尾空白，P1-15） */
+    float trail;      /* 行尾空白宽：只参与"是否能放下"的判定，不计入行宽 */
+    float x0;         /* 对齐后第一个字形的 x（测量包围盒用，P1-16） */
 };
 typedef struct nx_line_info nx_line_info;
 
@@ -825,10 +828,13 @@ neox_result nx_text_measure(const nx_layout *lo, float out_bbox[4])
     if (!lo || !out_bbox) return NEOX_ERROR_INVALID_ARGUMENT;
     double bottom = (double)(lo->line_count ? lo->line_count-1 : 0) *
                     lo->line_height - lo->descent;
-    if (!isfinite(lo->ascent) || !isfinite(lo->width) || !tx_float_range(bottom))
+    if (!isfinite(lo->ascent) || !isfinite(lo->width) || !tx_float_range(bottom) ||
+        !tx_float_range((double)lo->bbox_x0) || !tx_float_range((double)lo->bbox_x1))
         return NEOX_ERROR_INVALID_ARGUMENT;
-    out_bbox[0] = 0.0f; out_bbox[1] = -lo->ascent;
-    out_bbox[2] = lo->width; out_bbox[3] = (float)bottom;
+    /* 水平范围含对齐偏移（P1-16）：右/居中对齐的行整体右移，包围盒随之
+     * 从 x0 = min(line_off) 到 x1 = max(line_off + width)，而不是恒为 0。 */
+    out_bbox[0] = lo->bbox_x0; out_bbox[1] = -lo->ascent;
+    out_bbox[2] = lo->bbox_x1; out_bbox[3] = (float)bottom;
     return NEOX_OK;
 }
 
@@ -840,9 +846,22 @@ typedef struct nx_token {
     int hard_break;    /* '\n'：强制断行占位（count=0） */
 } nx_token;
 
-static neox_result layout_finish_line(nx_layout *lo, uint32_t g0, double width)
+/* 行尾空白：只记录"最后一个可见字形之后还有多少空白宽"，对齐与行宽都用
+ * 内容宽（P1-15）。空白字形本身仍然保留在字形数组里。 */
+
+/* 行内"空白"的判定：只在末尾截掉不需要计宽、也不需要占位的空白，因此
+ * 覆盖常见的空格、制表与不换行空格即可（全角空格 U+3000 同样处理）。 */
+static int nx_layout_is_blank(nx_font *font, uint32_t g)
 {
-    if (!tx_float_range(width)) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (g == (uint32_t)' ' || g == (uint32_t)'\t') return 1;
+    if (font && !font->is_custom) return g == 0x3000u || g == 0x00A0u;
+    return 0;
+}
+
+static neox_result layout_finish_line(nx_layout *lo, uint32_t g0, double width,
+                                      double trail)
+{
+    if (!tx_float_range(width) || !tx_float_range(trail)) return NEOX_ERROR_INVALID_ARGUMENT;
     if (lo->line_count == UINT32_MAX) return NEOX_ERROR_OUT_OF_MEMORY;
     nx_line_info *nl = tx_array_grow(lo->tctx, lo->line, sizeof(*nl),
                                     &lo->line_cap, lo->line_count+1);
@@ -851,6 +870,8 @@ static neox_result layout_finish_line(nx_layout *lo, uint32_t g0, double width)
     lo->line[lo->line_count].start = g0;
     lo->line[lo->line_count].count = lo->glyph_count - g0;
     lo->line[lo->line_count].width = (float)width;
+    lo->line[lo->line_count].trail = (float)trail;
+    lo->line[lo->line_count].x0 = 0.0f;
     lo->line_count++;
     return NEOX_OK;
 }
@@ -873,6 +894,9 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
     nx_token *tok = NULL;
     uint8_t *cls = NULL;
     uint32_t ntok = 0, tokcap = 0;
+    double line_trail = 0.0;   /* 当前行行尾空白宽（P1-15） */
+    double line_w = 0.0;       /* 当前行内容宽（不含行尾空白） */
+    int line_has_content = 0;
 
     if (!t || !font || !utf8 || !out_layout) return NEOX_ERROR_INVALID_ARGUMENT;
     *out_layout = NULL;
@@ -931,7 +955,6 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
         cls = (uint8_t *)tx_alloc(t, n ? n : 1, 16);
         double pen;
         uint32_t line_g0 = 0;
-        double line_w = 0.0;
         uint32_t tok_i;
 
         if (!cls) goto oom;
@@ -997,26 +1020,33 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
         pen = 0.0f;
         line_g0 = 0;
         line_w = 0.0f;
+        line_trail = 0.0;
+        line_has_content = 0;
         for (tok_i = 0; tok_i < ntok; tok_i++) {
             nx_token *tk = &tok[tok_i];
             if (tk->hard_break) {
-                r = layout_finish_line(lo, line_g0, line_w);
+                r = layout_finish_line(lo, line_g0, line_w, line_trail);
                 if (r != NEOX_OK) goto fail;
                 pen = 0.0f;
                 line_w = 0.0f;
+                line_trail = 0.0;
+                line_has_content = 0;
                 line_g0 = lo->glyph_count;
                 continue;
             }
             /* 行首空白丢弃 */
             if (tk->is_space && lo->glyph_count == line_g0)
                 continue;
-            /* 贪心换行：本行已有内容且放不下 */
-            if (max_width > 0.0f && lo->glyph_count > line_g0 &&
+            /* 贪心换行：本行已有内容且"内容 + 已累积的行尾空白 + 本词"放不
+             * 下（行尾空白仍然参与是否换行的判定，只是不计入行宽，P1-15）。 */
+            if (max_width > 0.0f && line_has_content &&
                 pen + tk->width > max_width) {
-                r = layout_finish_line(lo, line_g0, line_w);
+                r = layout_finish_line(lo, line_g0, line_w, line_trail);
                 if (r != NEOX_OK) goto fail;
                 pen = 0.0f;
                 line_w = 0.0f;
+                line_trail = 0.0;
+                line_has_content = 0;
                 line_g0 = lo->glyph_count;
                 if (tk->is_space)
                     continue;   /* 换行后行首空白同样丢弃 */
@@ -1024,7 +1054,14 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
             /* 放置词内字形 */
             {
                 uint32_t k;
-                double adv = pen;
+                double adv;
+                /* 放置位置就是被丢弃的行尾空白之前的位置：间隔由前导空白
+                 * 的宽度占住，但它的字形不进入字形数组（P1-15）。 */
+                if (tk->is_space && line_has_content && line_trail > 0.0 &&
+                    pen - line_trail >= 0.0)
+                    adv = pen - line_trail;
+                else
+                    adv = pen;
                 for (k = 0; k < tk->count; k++) {
                     uint32_t gi = tk->glyph0 + k;
                     nx_laid_glyph lg;
@@ -1050,16 +1087,47 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
                 }
                 if (!tx_float_range(adv)) goto invalid;
                 pen = adv;
-                line_w += tk->width;
+                if (tk->is_space && line_has_content) {
+                    /* 行尾空白：不计入内容宽，只保留"是否放得下"所需的宽度 */
+                    line_trail += tk->width;
+                } else {
+                    /* 前导空白（行内、后接内容）的宽度已通过 pen 体现在下一个
+                     * 词的位置上：它不属于"行尾空白"，因此计入行宽；只有真正
+                     * 位于行尾的空白才被排除（P1-15）。 */
+                    line_trail = 0.0;
+                    line_w += tk->width;
+                    line_has_content = 1;
+                }
             }
         }
         /* 收尾行 */
-        r = layout_finish_line(lo, line_g0, line_w);
+        r = layout_finish_line(lo, line_g0, line_w, line_trail);
         if (r != NEOX_OK) goto fail;
+
+        /* 行尾空白（P1-15）：每行末尾的空白字形不进入字形数组。它们的宽度
+         * 已经只用于"是否放得下"的判定，保留在字形数组里只会让行尾多出
+         * 不可见但占位的内容，并在对齐/包围盒里多算一段空白。 */
+        if (lo->line_count > 0) {
+            uint32_t keep = 0;
+            for (i = 0; i < lo->line_count; i++) {
+                uint32_t g0 = lo->line[i].start, cnt = lo->line[i].count;
+                while (cnt > 0 && nx_layout_is_blank(font, lo->glyphs[keep + cnt - 1].glyph_index))
+                    cnt--;
+                if (g0 != keep && cnt > 0)
+                    memmove(&lo->glyphs[keep], &lo->glyphs[g0], (size_t)cnt *
+                            sizeof(nx_laid_glyph));
+                lo->line[i].start = keep;
+                lo->line[i].count = cnt;
+                keep += cnt;
+            }
+            lo->glyph_count = keep;
+        }
 
         /* 4) 对齐 + 基线 y + 包围盒 */
         {
-            float box_w = 0.0f;
+            float x0 = 0.0f, x1 = 0.0f;
+            int have_box = 0;
+            /* 行宽在放置阶段已排除行尾空白（line_w），对齐直接用它。 */
             for (i = 0; i < lo->line_count; i++) {
                 uint32_t g0 = lo->line[i].start;
                 uint32_t cnt = lo->line[i].count;
@@ -1077,9 +1145,34 @@ neox_result nx_text_layout(nx_text_context *t, nx_font *font, float size_px,
                     lo->glyphs[g0+k].x = (float)x;
                     lo->glyphs[g0+k].y = (float)ybase;
                 }
-                if (lo->line[i].width > box_w) box_w = lo->line[i].width;
+                /* 对齐后这一行的实际范围 = [off, off + 已放置字形的右端]
+                 * （P1-16：包围盒含对齐偏移）。行宽取已放置字形决定的内容宽
+                 * （行尾空白被丢弃后，它小于含空白的排版宽度）。 */
+                lo->line[i].x0 = (float)off;
+                if (cnt > 0) {
+                    float lx1;
+                    /* 行尾空白已不计入行宽：只在"行尾空白恰好是行的全部内容"
+                     * （一行只有空白）时把它按空白宽记下，其余情况行宽就是
+                     * 放置阶段累计的内容宽。 */
+                    if (lo->line[i].width == 0.0f && lo->line[i].trail > 0.0f)
+                        lo->line[i].width = lo->line[i].trail;
+                    if (!tx_float_range(off + (double)lo->line[i].width)) goto invalid;
+                    lx1 = (float)(off + (double)lo->line[i].width);
+                    if (!have_box) {
+                        x0 = (float)off;
+                        x1 = lx1;
+                        have_box = 1;
+                    } else {
+                        if ((float)off < x0) x0 = (float)off;
+                        if (lx1 > x1) x1 = lx1;
+                    }
+                }
             }
-            lo->width = box_w;
+            /* 宽度取整行区间宽度（对齐后的 x1 − x0）；lo->width 保留最大行宽
+             * 以便左对齐时二者相同。 */
+            lo->bbox_x0 = have_box ? x0 : 0.0f;
+            lo->bbox_x1 = have_box ? x1 : 0.0f;
+            lo->width = have_box ? (x1 - x0) : 0.0f;
             double bottom = (double)(lo->line_count ? lo->line_count-1 : 0) *
                             lo->line_height - lo->descent;
             double height = bottom + lo->ascent;

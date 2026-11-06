@@ -117,15 +117,17 @@ typedef struct nx_laid_glyph {
 typedef struct nx_layout {
     nx_laid_glyph *glyphs;
     uint32_t glyph_count;
-    float width, height;             /* 内容包围盒（已含对齐偏移） */
+    float width;                     /* 内容宽度 = bbox_x1 − bbox_x0（P1-15/16） */
+    float height;                    /* 内容包围盒（已含对齐偏移） */
     float ascent, descent, line_gap; /* 该字号行度量 */
     float line_height;
     uint32_t line_count;
     float size_px;
+    float bbox_x0, bbox_x1;          /* 含对齐偏移的水平范围（nx_text_measure） */
     nx_font *font;                   /* [borrow] 字体必须比此布局存活更久 */
     /* —— 内部字段（实现使用，调用方勿依赖，v0 后为不透明化预留） —— */
     uint32_t glyph_cap;
-    struct nx_line_info *line;       /* 行表：范围 + 自然宽度（对齐前） */
+    struct nx_line_info *line;       /* 行表：范围 + 内容宽（不含行尾空白） */
     uint32_t line_cap;
     struct nx_text_context *tctx;
 } nx_layout;

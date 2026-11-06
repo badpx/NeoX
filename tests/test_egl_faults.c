@@ -1,5 +1,32 @@
 /* Test the real EGL adapter with injected dispatch; no display or driver needed. */
+#define NX_TEST_HOOK_DLOPEN 1
 #include "../src/gl_ctx_egl.c"
+
+/* 评审 4489969142：libEGL 的加载器（gl_ctx_egl.c 的 load_lib）必须真正被
+ * 驱动一次——只声明 EGL hook 不等于运行了这段加载路径。这里用"缺一个入口
+ * 的假 libEGL"走真实 dlopen/dlsym/dlclose 钩子：第一次失败必须关闭句柄并
+ * 清空整张函数表，补齐后第二次必须重新加载成功。 */
+static int egl_dlopen_calls, egl_dlclose_calls;
+const char *egl_missing_symbol;
+void *nx_test_egl_dlopen(const char *name, int flags)
+{
+    (void)name; (void)flags;
+    egl_dlopen_calls++;
+    return (void *)(uintptr_t)0xE61;
+}
+void *nx_test_egl_dlsym(void *handle, const char *symbol)
+{
+    (void)handle;
+    if (egl_missing_symbol && strcmp(symbol, egl_missing_symbol) == 0) return NULL;
+    return (void *)(uintptr_t)0xE61;
+}
+int nx_test_egl_dlclose(void *handle)
+{
+    (void)handle;
+    egl_dlclose_calls++;
+    return 0;
+}
+#include <string.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); exit(1); } } while (0)
 
 static EGLint error_code;
@@ -16,6 +43,26 @@ static EGLBoolean destroy_surface(EGLDisplay d, EGLSurface s)
 
 int main(void)
 {
+    /* libEGL 加载器：失败 → dlclose + 清表 → 补齐后重新加载成功。 */
+    {
+        int first, second;
+        egl_missing_symbol = "eglDestroyContext";
+        egl_dlopen_calls = egl_dlclose_calls = 0;
+        first = load_lib();
+        second = load_lib();
+        CHECK(!first && !second);
+        CHECK(g_lib == NULL && p_destroyContext == NULL && p_makeCurrent == NULL);
+        CHECK(g_load_state == NX_EGL_LOAD_FAILED);
+        CHECK(egl_dlopen_calls == 2 && egl_dlclose_calls == 2);
+        egl_missing_symbol = NULL;
+        CHECK(load_lib() == 1);
+        CHECK(g_lib != NULL && p_destroyContext != NULL && p_getError != NULL);
+        CHECK(g_load_state == NX_EGL_LOAD_OK);
+        /* 再次进入成功态不重复 dlopen。 */
+        egl_dlopen_calls = 0;
+        CHECK(load_lib() == 1 && egl_dlopen_calls == 0);
+        unload_lib();
+    }
     nx_gl_ctx ctx = {0};
     ctx.dpy = (EGLDisplay)(uintptr_t)1; ctx.ctx = (EGLContext)(uintptr_t)1;
     ctx.win_cfg = (EGLConfig)(uintptr_t)1; ctx.can_window = 1;

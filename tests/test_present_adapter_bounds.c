@@ -46,6 +46,19 @@ static int capture_listen(void *proxy, void *lis, void *data)
     (void)lis;
     return 0;
 }
+static int stub_getattr_unmapped(void *dpy, unsigned long win, void *attr)
+{
+    int state = 0; /* IsUnmapped */
+    (void)dpy; (void)win;
+    memset(attr, 0, 136);
+    memcpy((unsigned char *)attr + 82, &state, sizeof state);
+    return 1;
+}
+static int stub_getattr_fail(void *dpy, unsigned long win, void *attr)
+{
+    (void)dpy; (void)win; (void)attr;
+    return 0;
+}
 static int stub_flush_ok(void *dpy) { (void)dpy; return 0; }
 static int stub_pending_zero(void *dpy) { (void)dpy; return 0; }
 static int event_left;
@@ -113,6 +126,23 @@ int main(void)
         CHECK(wl.buttons==7u);
         on_button(&wl,NULL,0,0,0x111u,0);
         CHECK(wl.buttons==3u);
+        /* 评审 4489969148：只有 enter、还没有 motion 时按下右键，按钮事件
+         * 必须携带 enter 给出的坐标（旧实现给 0,0）。 */
+        {
+            neox_window_event ev2;
+            wl.buttons = 0;
+            on_ptr_enter(&wl,NULL,1,NULL,256*13,256*11);
+            CHECK(wl.pointer_x==13.0f && wl.pointer_y==11.0f);
+            w.qn = 0; w.qh = w.qt = 0;
+            on_button(&wl,NULL,0,0,0x111u,1);
+            CHECK(w.qn == 1);
+            ev2 = w.q[0];
+            CHECK(ev2.kind == NEOX_WINDOW_POINTER);
+            CHECK(ev2.x == 13.0f && ev2.y == 11.0f);
+            CHECK(ev2.buttons == 4u);
+            wl.buttons = 0;
+            w.qn = 0; w.qh = w.qt = 0;
+        }
     }
     /* 评审 4489969071：wl_compositor 必须按服务端实际版本（上限 5）绑定，
      * wl_surface 的 enter/leave（v5 事件）才可能注册。旧实现 clamp 到 4，
@@ -215,6 +245,34 @@ int main(void)
         wp.dead = 1;
         CHECK(wl_present_soft(&ww) == NEOX_ERROR_BACKEND);
         CHECK(wp.busy[0] && wp.busy[1]);
+    }
+
+    /* 评审 4489969168：viewable 等待必须有界且失败时返回明确错误码（不是把
+     * 空白图当成功）。这里用桩：窗口始终 IsViewable=false，等待耗尽后
+     * x11_wait_ready 返回 BACKEND；XGetWindowAttributes 失败也返回 BACKEND。 */
+    {
+        struct fk_attr { unsigned char raw[136]; } attr;
+        nx_x11 xp;
+        neox_window wq;
+        int saved_ready;
+        memset(&xp, 0, sizeof xp);
+        memset(&wq, 0, sizeof wq);
+        xp.win = (unsigned long)0x5a5a;
+        xp.dpy = sentinel;
+        wq.plat = &xp;
+        wq.px_w = 8; wq.px_h = 8;
+        g_x.getattr = stub_getattr_unmapped;   /* 永不 Viewable */
+        g_x.resize = NULL;
+        g_x.pending = NULL;
+        saved_ready = 1;
+        (void)saved_ready;
+        CHECK(x11_wait_ready(&wq) == NEOX_ERROR_BACKEND);
+        CHECK(neox_window_last_error() != NULL);
+        g_x.getattr = stub_getattr_fail;       /* 属性查询失败 */
+        CHECK(x11_wait_ready(&wq) == NEOX_ERROR_BACKEND);
+        g_x.getattr = NULL;                    /* 无 XGetWindowAttributes 的桩：直接成功 */
+        OK(x11_wait_ready(&wq));
+        (void)attr;
     }
 
     /* X11 CARD16 boundary and ConfigureNotify's exact physical dimensions. */

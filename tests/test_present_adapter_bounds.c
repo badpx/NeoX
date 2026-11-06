@@ -39,13 +39,41 @@ int main(void)
     w.scale=1.5f;CHECK(shell_scale(&w)==2);
     w.scale=0.5f;CHECK(shell_scale(&w)==1);
     memset(&wl,0,sizeof(wl));wl.win=&w;wl.opened=1;
+    /* 输出 scale 只跟随"当前 output"（P1-6）：先登记一个已绑定的 wl_output
+     * 槽位，未 enter 之前的第一份 scale 作为窗口初值。 */
+    wl.outputs[0]=sentinel;wl.noutputs=1;wl.output_scale=0;
     OK(nx_win_set_geometry(&w,8,8,2));
     neox_window before=w;
     on_out_scale(&wl,NULL,INT32_MAX);CHECK(memcmp(&before,&w,sizeof(w))==0);
     on_tl_configure(&wl,NULL,INT32_MAX,8,NULL);CHECK(memcmp(&before,&w,sizeof(w))==0);
     on_tl_configure(&wl,NULL,9,7,NULL);
     CHECK(w.pt_w==9 && w.pt_h==7 && w.px_w==18 && w.px_h==14 && w.qn==1);
-    on_out_scale(&wl,NULL,3);CHECK(w.scale==3 && w.px_w==27 && w.qn==2);
+    on_out_scale(&wl,sentinel,3);CHECK(w.scale==3 && w.px_w==27 && w.qn==2);
+    /* 第二个 output 的 scale 不能改变窗口；compositor 把窗口挪过去（enter）
+     * 之后才跟随。 */
+    wl.outputs[1]=(void*)(uintptr_t)2;wl.noutputs=2;
+    before=w;
+    on_out_scale(&wl,wl.outputs[1],2);CHECK(memcmp(&before,&w,sizeof(w))==0);
+    on_surf_enter(&wl,NULL,wl.outputs[1]);
+    CHECK(w.scale==2 && w.px_w==18);
+    on_surf_enter(&wl,NULL,sentinel);
+    CHECK(w.scale==3 && w.px_w==27);
+    /* wl_surface v<3 没有 set_buffer_scale：shell_scale 仍按整数倍，但
+     * wl_open 会强制 1 倍（P2-1），此处验证按钮映射与指针坐标缓存。 */
+    {
+        neox_window_event ev;
+        memset(&ev,0,sizeof(ev));
+        on_ptr_enter(&wl,NULL,0,NULL,256*7,256*5);
+        CHECK(wl.pointer_x==7.0f && wl.pointer_y==5.0f);
+        on_button(&wl,NULL,0,0,0x111u,1);   /* BTN_RIGHT */
+        CHECK(wl.buttons==4u);
+        on_button(&wl,NULL,0,0,0x112u,1);   /* BTN_MIDDLE */
+        CHECK(wl.buttons==6u);
+        on_button(&wl,NULL,0,0,0x110u,1);   /* BTN_LEFT */
+        CHECK(wl.buttons==7u);
+        on_button(&wl,NULL,0,0,0x111u,0);
+        CHECK(wl.buttons==3u);
+    }
     /* X11 CARD16 boundary and ConfigureNotify's exact physical dimensions. */
     memset(&w,0,sizeof(w));w.plat=&x;w.vt=nx_present_x11_vt();x.win=1;x.dpy=sentinel;
     OK(nx_win_set_geometry(&w,8,8,1));before=w;

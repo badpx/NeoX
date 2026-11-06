@@ -183,6 +183,8 @@ static neox_result cocoa_soft(neox_window *w)
     if(w->dev->active_frame || w->dev->pending_count)return NEOX_ERROR_INVALID_ARGUMENT;
     nx_cocoa *p=(nx_cocoa *)w->plat;
     @autoreleasepool {
+        /* 统一的不透明窗口策略（P1-5）：Soft 帧缓冲是预乘 RGBA，窗口不透明，
+         * 因此图像按 kCGImageAlphaNoneSkipLast 只取 RGB（预乘值）显示。 */
         CFDataRef data=CFDataCreate(kCFAllocatorDefault,w->soft_px,(CFIndex)((size_t)w->px_w*w->px_h*4));
         if(!data)return NEOX_ERROR_OUT_OF_MEMORY;
         CGDataProviderRef provider=CGDataProviderCreateWithCFData(data);CFRelease(data);
@@ -202,7 +204,15 @@ static int cocoa_read(neox_window *w,uint8_t *out)
     if(!p->image || p->image_w!=w->px_w || p->image_h!=w->px_h)return -1;
     CFDataRef data=CGDataProviderCopyData(CGImageGetDataProvider(p->image));
     if(!data)return -1;
-    memcpy(out,CFDataGetBytePtr(data),(size_t)w->px_w*w->px_h*4);CFRelease(data);return 0;
+    {
+        const uint8_t *src=(const uint8_t *)CFDataGetBytePtr(data);
+        size_t n=(size_t)w->px_w*w->px_h;
+        /* 与 Soft/GL/Metal 的读回一致：不透明窗口读回 alpha = 255，RGB 为
+         * 预乘后（RGB *= a）的值。图像本身不含 alpha 通道。 */
+        memcpy(out,src,n*4);
+        for(size_t i=0;i<n;i++)out[i*4+3]=255;
+    }
+    CFRelease(data);return 0;
 }
 #if NEOX_ENABLE_METAL
 static int current(neox_window *w)
@@ -237,6 +247,8 @@ static neox_result cocoa_gpu_acquire(neox_window *w,neox_target_desc *out)
         p->metal_layer.drawableSize=CGSizeMake(w->px_w,w->px_h);
     }
     p->target_valid=1;p->capture=p->captured=0;
+    /* 不透明窗口：缺省清屏为不透明黑（P1-5）。 */
+    if(!out->clear)out->clear=&w->opaque_clear;
     out->kind=NEOX_BACKEND_GPU;out->surface=p->surface;return NEOX_OK;
 }
 static neox_result cocoa_gpu_present(neox_window *w)
@@ -264,7 +276,10 @@ static neox_result cocoa_gpu_read(neox_window *w,uint8_t *out)
 }
 static void cocoa_gpu_detach(neox_window *w)
 {
-    nx_cocoa *p=(nx_cocoa *)w->plat;p->surface=NULL;p->width=p->height=0;p->target_valid=p->capture=p->captured=0;
+    /* Soft detach 保留 image/图层：present.c 只在 is_gpu 时调用本函数，
+     * 这里再防御一次（P2-3）。 */
+    nx_cocoa *p=(nx_cocoa *)w->plat;if(!w->is_gpu || !p)return;
+    p->surface=NULL;p->width=p->height=0;p->target_valid=p->capture=p->captured=0;
     @autoreleasepool {p->view.layer=[CALayer layer];[p->metal_layer release];p->metal_layer=nil;}
     if(p->image){CGImageRelease(p->image);p->image=NULL;}
 }

@@ -317,6 +317,8 @@ typedef struct nx_mtl_rt {          /* 渲染目标池项（层 / 掩码纹理�
     uint32_t w, h;
     int in_use;
     int is_layer;                   /* 1 = RGBA32Float 层；0 = R32Float 掩码 */
+    id<MTLRenderCommandEncoder> enc;/* 保留字段：活动通道由执行器的局部
+                                       nx_mtl_channel 管理，enc_fail 统一结束 */
 } nx_mtl_rt;
 
 typedef struct nx_mtl_texent {      /* 纹理槽 → MTLTexture（惰性上传） */
@@ -592,6 +594,7 @@ typedef struct nx_mtl_enc {
      * command buffer 完成（由 inflight 接管，poll 时归还池） */
     nx_mtl_rt **held;
     uint32_t nheld, capheld;
+    id<MTLTexture> snap_tex;   /* 本次提交的基底快照纹理（held 持有） */
 } nx_mtl_enc;
 
 static neox_result mtl_hold(neox_context *ctx, nx_mtl_enc *e, nx_mtl_rt *rt)
@@ -602,20 +605,6 @@ static neox_result mtl_hold(neox_context *ctx, nx_mtl_enc *e, nx_mtl_rt *rt)
     e->held = nh;
     e->held[e->nheld++] = rt;
     return NEOX_OK;
-}
-
-static id<MTLRenderCommandEncoder> mtl_pass(nx_mtl_dev *g, nx_mtl_enc *e,
-                                            id<MTLTexture> tex, MTLLoadAction load)
-{
-    MTLRenderPassDescriptor *pd = [MTLRenderPassDescriptor renderPassDescriptor];
-    id<MTLRenderCommandEncoder> enc;
-    (void)g;
-    pd.colorAttachments[0].texture = tex;
-    pd.colorAttachments[0].loadAction = load;
-    pd.colorAttachments[0].storeAction = MTLStoreActionStore;
-    pd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
-    enc = [e->cb renderCommandEncoderWithDescriptor:pd];
-    return enc;
 }
 
 static void mtl_emit(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineState> ps,
@@ -643,11 +632,23 @@ static NSUInteger mtl_stage_full(nx_mtl_enc *e, float w, float h, float *tmp)
     return mtl_stage(e->vbo, &e->used, tmp, 6);
 }
 
-/* 层清零（隔离组层；等价 glClear） */
+static MTLRenderPassDescriptor *mtl_desc(id<MTLTexture> tex, MTLLoadAction load)
+{
+    MTLRenderPassDescriptor *pd = [MTLRenderPassDescriptor renderPassDescriptor];
+    pd.colorAttachments[0].texture = tex;
+    pd.colorAttachments[0].loadAction = load;
+    pd.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+    return pd;
+}
+
+/* 层清零（隔离组层；等价 glClear）：自己的 encoder 自己结束，不碰活动通道。 */
 static void mtl_clear_layer(nx_mtl_dev *g, nx_mtl_enc *e, nx_mtl_rt *layer)
 {
-    id<MTLRenderCommandEncoder> enc = mtl_pass(g, e, layer->tex, MTLLoadActionClear);
+    id<MTLRenderCommandEncoder> enc =
+        [e->cb renderCommandEncoderWithDescriptor:mtl_desc(layer->tex, MTLLoadActionClear)];
     [enc endEncoding];
+    (void)g;
 }
 
 /* scissor 拷回（ping-pong 第二步；bbox 为设备像素） */
@@ -663,7 +664,7 @@ static void mtl_copy_back(nx_mtl_dev *g, nx_mtl_enc *e, nx_mtl_rt *src,
     minx = fmaxf(0.0f, floorf(minx)); miny = fmaxf(0.0f, floorf(miny));
     maxx = fminf((float)e->W, ceilf(maxx)); maxy = fminf((float)e->H, ceilf(maxy));
     if (maxx <= minx || maxy <= miny) return;
-    enc = mtl_pass(g, e, dst->tex, MTLLoadActionLoad);
+    enc = [e->cb renderCommandEncoderWithDescriptor:mtl_desc(dst->tex, MTLLoadActionLoad)];
     sc.x = (NSUInteger)(minx * NEOX_MTL_SS);
     sc.y = (NSUInteger)(miny * NEOX_MTL_SS);
     sc.width = (NSUInteger)((maxx - minx) * NEOX_MTL_SS);
@@ -708,6 +709,38 @@ static int mtl_inflate_quad(const float xc[4], const float yc[4], float d,
     return 1;
 }
 
+/* ------------------------------------------------------------------ 编码延续
+ * 每个渲染通道（mtl_pass）返回一个 encoder，且同一纹理上不能有第二个未结束
+ * 的通道。执行器在"非隔离 PUSH"处需要离开父层通道、在 POP 之后需要重新开始
+ * 父层通道；进入隔离层时则要结束父层通道。活动通道记在执行器局部变量 cur 中
+ * （不是全局状态），并由 enc_fail 的统一清理路径收尾。 */
+typedef struct nx_mtl_channel {
+    id<MTLRenderCommandEncoder> enc;
+    nx_mtl_rt *target;
+} nx_mtl_channel;
+
+static void mtl_end_channel(nx_mtl_channel *ch)
+{
+    if (!ch) return;
+    if (ch->enc) [ch->enc endEncoding];
+    ch->enc = nil;
+    ch->target = nil;
+}
+
+/* 在 layer 上开一个新通道（同一时刻只有一个通道：先结束旧的）。 */
+static neox_result mtl_begin_channel(nx_mtl_dev *g, nx_mtl_enc *e,
+                                     nx_mtl_channel *ch, nx_mtl_rt *layer,
+                                     MTLLoadAction load)
+{
+    mtl_end_channel(ch);
+    if (!layer) return NEOX_ERROR_BACKEND;
+    ch->enc = [e->cb renderCommandEncoderWithDescriptor:
+               mtl_desc(layer->tex, load)];
+    ch->target = layer;
+    if (!ch->enc) return NEOX_ERROR_OUT_OF_MEMORY;
+    return NEOX_OK;
+}
+
 /* PLUS 后的整层 clamp（等价 gl_clamp_layer：tmp clamp 再拷回） */
 static neox_result mtl_clamp_layer(neox_context *ctx, nx_mtl_dev *g, nx_mtl_enc *e,
                                    nx_mtl_rt *layer)
@@ -718,7 +751,7 @@ static neox_result mtl_clamp_layer(neox_context *ctx, nx_mtl_dev *g, nx_mtl_enc 
     NSUInteger off;
     neox_result r = mtl_rt_acquire(ctx, g, e->SSW, e->SSH, 1, &tmp);
     if (r != NEOX_OK) return r;
-    enc = mtl_pass(g, e, tmp->tex, MTLLoadActionDontCare);
+    enc = [e->cb renderCommandEncoderWithDescriptor:mtl_desc(tmp->tex, MTLLoadActionDontCare)];
     off = mtl_stage_full(e, (float)e->SSW, (float)e->SSH, v);
     mtl_emit(enc, g->ps_clamp, e, off, 3, NULL, 0, layer->tex, nil, nil);
     [enc endEncoding];
@@ -1105,7 +1138,7 @@ static neox_result mtl_draw_pingpong(neox_context *ctx, nx_mtl_dev *g,
     }
     r = mtl_rt_acquire(ctx, g, e->SSW, e->SSH, 1, &tmp);
     if (r != NEOX_OK) return r;
-    enc = mtl_pass(g, e, tmp->tex, MTLLoadActionDontCare);
+    enc = [e->cb renderCommandEncoderWithDescriptor:mtl_desc(tmp->tex, MTLLoadActionDontCare)];
     mtl_emit(enc, ptmp, e, off, 6, fsu, fsulen, t0, t1, t2);
     [enc endEncoding];
     mtl_copy_back(g, e, tmp, layer, minx, miny, maxx, maxy);
@@ -1175,7 +1208,7 @@ static neox_result mtl_fill_path(neox_device *dev, nx_mtl_dev *g, nx_mtl_enc *e,
             ctx->last_error = "MTL vertex buffer exhausted";
             r = NEOX_ERROR_BACKEND;
         } else {
-            enc = mtl_pass(g, e, layer->tex, MTLLoadActionLoad);
+            enc = [e->cb renderCommandEncoderWithDescriptor:mtl_desc(layer->tex, MTLLoadActionLoad)];
             mtl_emit(enc, NX_MTL_COV[blend].dual ? g->ps_fill_ds[blend]
                                                  : g->ps_fill[blend],
                      e, off, 6, fb, sizeof(fb), mrt->tex, prt->tex, nil);
@@ -1239,7 +1272,7 @@ static neox_result mtl_draw_tex(neox_device *dev, nx_mtl_dev *g, nx_mtl_enc *e,
         dev->ctx->last_error = "MTL vertex buffer exhausted";
         return NEOX_ERROR_BACKEND;
     }
-    enc = mtl_pass(g, e, layer->tex, MTLLoadActionLoad);
+    enc = [e->cb renderCommandEncoderWithDescriptor:mtl_desc(layer->tex, MTLLoadActionLoad)];
     mtl_emit(enc, g->ps_tex[blend],
              e, off, 6, ut, sizeof(ut), g->texs[idx].tex, nil, nil);
     [enc endEncoding];
@@ -1336,7 +1369,7 @@ static neox_result mtl_draw_glyphs(neox_device *dev, nx_mtl_dev *g, nx_mtl_enc *
                 dev->ctx->last_error = "MTL vertex buffer exhausted";
                 return NEOX_ERROR_BACKEND;
             }
-            enc = mtl_pass(g, e, layer->tex, MTLLoadActionLoad);
+            enc = [e->cb renderCommandEncoderWithDescriptor:mtl_desc(layer->tex, MTLLoadActionLoad)];
             mtl_emit(enc, dual ? g->ps_glyph_ds[blend] : g->ps_glyph[blend],
                      e, off, 6, ug, sizeof(ug), g->texs[idx].tex, nil, nil);
             [enc endEncoding];
@@ -1403,6 +1436,14 @@ static neox_result mtl_resolve(neox_context *ctx, nx_mtl_dev *g, nx_mtl_rt *base
  * 只编码 + 提交：submission 保持 PENDING，完成事件由 completedHandler 登记
  * （回调只触碰 lock/completed 标志与 vbo 释放），poll 收割时做 resolve 与
  * 状态推进。编码期错误置 FAILED 并返回（pump 按失败收割）。 */
+/* §7：PUSH 是否构成隔离边界（组的 blend 或 opacity 需要自己的层）。 */
+static int mtl_needs_layer(float opacity, neox_blend blend)
+{
+    return opacity < 1.0f || blend != NEOX_BLEND_SRC_OVER;
+}
+
+static uint32_t mtl_poll(neox_device *dev);
+
 static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
 {
     neox_context *ctx = dev->ctx;
@@ -1417,6 +1458,7 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
     uint32_t sidx;
     size_t vbo_len;
     nx_mtl_enc e = {};
+    nx_mtl_channel cur = { nil, nil };
     id<MTLCommandBuffer> cb;
     id<MTLBuffer> vbo = nil;
     nx_mtl_rt *base = nil;
@@ -1429,6 +1471,7 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
         neox_blend blend;
         const float *clip;
         int32_t layer;
+        int owns_layer;   /* 本作用域是隔离层：其 blend/opacity 只在 POP 生效 */
     } mtl_ex_state;
     mtl_ex_state *stk = NULL;
 
@@ -1439,20 +1482,43 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
         return NEOX_ERROR_BACKEND;
     }
     sidx = (uint32_t)(sub - (nx_sub_slot *)dev->subs.slots);
-
-    /* Count in bytes without a 32-bit intermediate. Check the device limit
-     * before asking Metal to allocate; huge counts must never wrap to a small
-     * staging buffer or trigger a platform validation exception. */
-    if (!nx_size_mul(sub->cmd_count, 2, &vbo_len) ||
-        !nx_size_add(vbo_len, 8, &vbo_len))
+    /* P1-12：同一表面的连续帧必须在 GPU 上按提交顺序完成。Metal 队列按
+     * 入队顺序执行，但"在途只有一条"才是可推理的完成序：这里先等上一条
+     * 提交结束（完成回调置 completed），并就地收割其状态。CPU 侧此前已经
+     * 用 waitUntilCompleted 等待过一个提交（MTL surface 的 read_pixels 会
+     * 同步），因此这一步在实际使用中不会引入额外阻塞。 */
+    if (g->ninflight > 0) {
+        uint32_t k, n;
+        id<MTLCommandBuffer> cbs[8];
+        n = g->ninflight < 8 ? g->ninflight : 8;
+        pthread_mutex_lock(&g->lock);
+        for (k = 0; k < n; k++) cbs[k] = [g->inflight[k].cb retain];
+        pthread_mutex_unlock(&g->lock);
+        for (k = 0; k < n; k++) { [cbs[k] waitUntilCompleted]; [cbs[k] release]; }
+        mtl_poll(dev);
+    }
+    /* 顶点缓冲预检按真实顶点数累计（P2-8）：每个三角形 3 个 8 字节顶点，
+     * 每个字形四边形 6 个顶点。旧实现在此按每个绘制命令额外加 1024 字节
+     * 放大，正常帧也可能被误判为"超出设备上限"。这里只加固定余量，并且
+     * 32 位计数器本身另有上限（mtl_stage_full 溢出返回 NSUIntegerMax →
+     * 编码期以明确错误失败），不会写越界。 */
+    vbo_len = 0;
+    if (!nx_size_add(vbo_len, 8, &vbo_len) ||
+        !nx_size_mul(vbo_len, 256, &vbo_len)) /* 每个缓冲区最多交错 8 个全屏三角形 */
         NX_ERR(ctx, "MTL vertex buffer size overflow", NEOX_ERROR_OUT_OF_MEMORY);
     for (i = 0; i < sub->cmd_count; i++) {
-        if (sub->cmds[i].op == NXC_GLYPHS &&
-            !nx_size_add(vbo_len, sub->cmds[i].glyph_count, &vbo_len))
-            NX_ERR(ctx, "MTL glyph count exceeds staging range", NEOX_ERROR_OUT_OF_MEMORY);
+        const nx_cmd *vc = &sub->cmds[i];
+        size_t verts = 0;
+        if (vc->op == NXC_PATH || vc->op == NXC_TEX) verts = 3;
+        else if (vc->op == NXC_GLYPHS) {
+            if (!nx_size_mul(vc->glyph_count, 6, &verts))
+                NX_ERR(ctx, "MTL glyph vertex count overflow", NEOX_ERROR_OUT_OF_MEMORY);
+        }
+        if (!nx_size_mul(verts, 8, &verts) ||
+            !nx_size_add(vbo_len, verts, &vbo_len))
+            NX_ERR(ctx, "MTL vertex buffer size overflow", NEOX_ERROR_OUT_OF_MEMORY);
     }
-    if (!nx_size_mul(vbo_len, 1024, &vbo_len) ||
-        !nx_size_add(vbo_len, 4096, &vbo_len) ||
+    if (!nx_size_add(vbo_len, 8, &vbo_len) ||
         vbo_len > [g->device maxBufferLength])
         NX_ERR(ctx, "MTL vertex buffer exceeds device limit", NEOX_ERROR_OUT_OF_MEMORY);
     @autoreleasepool {
@@ -1476,26 +1542,9 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
             r = mtl_rt_acquire(ctx, g, W, H, 1, &snap_rt);
             if (r != NEOX_OK) goto enc_fail;
             mtl_upload(snap_rt->tex, W, H, sub->accum, W * 16u);
+            e.snap_tex = snap_rt->tex;
             r = mtl_hold(ctx, &e, snap_rt);
             if (r != NEOX_OK) { mtl_rt_release(snap_rt); goto enc_fail; }
-
-            {
-                id<MTLRenderCommandEncoder> enc;
-                float v[6];
-                NSUInteger off;
-                float ublit[4] = { (float)NEOX_MTL_SS, 0.0f, 0.0f, 0.0f };
-                enc = mtl_pass(g, &e, base->tex, MTLLoadActionDontCare);
-                off = mtl_stage_full(&e, (float)SSW, (float)SSH, v);
-                if (off == NSUIntegerMax) {
-                    [enc endEncoding];
-                    ctx->last_error = "MTL vertex buffer exhausted";
-                    r = NEOX_ERROR_BACKEND;
-                    goto enc_fail;
-                }
-                mtl_emit(enc, g->ps_blit, &e, off, 3, ublit, sizeof(ublit),
-                         snap_rt->tex, nil, nil);
-                [enc endEncoding];
-            }
         }
 
         {
@@ -1518,7 +1567,26 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
             stk[0].blend = NEOX_BLEND_SRC_OVER;
             stk[0].clip = NULL;
             stk[0].layer = 0;
+            stk[0].owns_layer = 0;
             nstk = 1;
+        }
+
+        /* 基底装载（快照或清屏色 → 快照纹理 → 放大 blit 进基底层）：
+         * 通道留到随后的子绘制使用（同一层不必重复开通道）。 */
+        {
+            float v[6];
+            NSUInteger off;
+            float ublit[4] = { (float)NEOX_MTL_SS, 0.0f, 0.0f, 0.0f };
+            r = mtl_begin_channel(g, &e, &cur, base, MTLLoadActionDontCare);
+            if (r != NEOX_OK) goto enc_fail;
+            off = mtl_stage_full(&e, (float)SSW, (float)SSH, v);
+            if (off == NSUIntegerMax) {
+                ctx->last_error = "MTL vertex buffer exhausted";
+                r = NEOX_ERROR_OUT_OF_MEMORY;
+                goto enc_fail;
+            }
+            mtl_emit(cur.enc, g->ps_blit, &e, off, 3, ublit, sizeof(ublit),
+                     e.snap_tex, nil, nil);
         }
 
         for (i = 0; i < sub->cmd_count; i++) {
@@ -1528,7 +1596,11 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
             case NXC_PUSH: {
                 mtl_ex_state *nst;
                 int32_t layer_idx = top->layer;
-                if (c->owns_layer) {
+                /* §7 隔离边界：组（blend != SRC_OVER 或 opacity < 1）必须有
+                 * 自己的层；组的 blend/opacity 只在 POP 组合成时作用于源，
+                 * 组内子绘制一律 SRC_OVER（nx_exec_isolated_blend）。 */
+                int group_layer = mtl_needs_layer(c->opacity, c->blend);
+                if (group_layer) {
                     nx_mtl_rt *lb;
                     nx_mtl_rt **nl;
                     r = mtl_rt_acquire(ctx, g, SSW, SSH, 1, &lb);
@@ -1550,7 +1622,7 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
                 nst = (mtl_ex_state *)nx_array_grow(ctx, stk, sizeof(mtl_ex_state),
                                                     &capstk, nstk + 1);
                 if (!nst) {
-                    if (c->owns_layer) {
+                    if (group_layer) {
                         mtl_rt_release(layers[nlayers - 1]);
                         nlayers--;
                     }
@@ -1562,12 +1634,35 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
                 stk[nstk].ctm = c->ctm;
                 stk[nstk].opacity = c->opacity;
                 stk[nstk].blend = c->blend;
-                r = nx_execution_clip_push(dev, &execution_clips, c, sub->width, sub->height, &stk[nstk].clip);
-            if (r != NEOX_OK) goto enc_fail;
                 stk[nstk].layer = layer_idx;
+                stk[nstk].owns_layer = group_layer;
+                r = nx_execution_clip_push(dev, &execution_clips, c, sub->width,
+                                           sub->height, &stk[nstk].clip);
+                if (r != NEOX_OK) {
+                    /* 裁剪准备失败：失败码已由 helper 返回，走统一清理——
+                     * 清理路径不依赖偶然的 r 值（P0-2）。 */
+                    if (group_layer) {
+                        mtl_rt_release(layers[nlayers - 1]);
+                        nlayers--;
+                    }
+                    goto enc_fail;
+                }
+                if (group_layer) {
+                    /* 结束父层通道，进入新隔离层通道；组内绘制都写在这里。
+                     * 失败时状态已发布：回收该组层并把栈指针撤回上一个
+                     * 作用域，让统一清理只保留仍在使用的层。 */
+                    r = mtl_begin_channel(g, &e, &cur, layers[layer_idx],
+                                          MTLLoadActionDontCare);
+                    if (r != NEOX_OK) {
+                        mtl_rt_release(layers[layer_idx]);
+                        nlayers--;
+                        goto enc_fail;
+                    }
+                }
                 nstk++;
                 break;
             }
+
             case NXC_POP: {
                 mtl_ex_state *top2 = &stk[nstk - 1];
                 mtl_ex_state *parent = &stk[nstk - 2];
@@ -1575,12 +1670,14 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
                     nx_mtl_rt *clip_rt = nil;
                     id<MTLRenderCommandEncoder> enc;
                     float v[6];
+                    /* §7 组合成：先结束子层通道，再写父层。 */
+                    mtl_end_channel(&cur);
                     NSUInteger off;
                     float uc[4];
                     if (top2->clip) {
                         nx_mtl_rt **nc;
                         r = mtl_rt_acquire(ctx, g, W, H, 0, &clip_rt);
-                        if (r != NEOX_OK) goto enc_fail;
+                        if (r != NEOX_OK) { goto enc_fail; }
                         mtl_upload(clip_rt->tex, W, H, top2->clip,
                                    W * 4u);
                         nc = (nx_mtl_rt **)nx_array_grow(ctx, clips,
@@ -1594,62 +1691,76 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
                         clips = nc;
                         clips[nclips++] = clip_rt;
                     }
-                    enc = mtl_pass(g, &e, layers[parent->layer]->tex,
-                                   MTLLoadActionLoad);
+                    r = mtl_begin_channel(g, &e, &cur, layers[parent->layer],
+                                          MTLLoadActionLoad);
+                    if (r != NEOX_OK) goto enc_fail;
+                    enc = cur.enc;
                     uc[0] = (float)NEOX_MTL_SS;
                     uc[1] = top2->opacity;
                     uc[2] = clip_rt ? 1.0f : 0.0f;
                     uc[3] = 0;
                     off = mtl_stage_full(&e, (float)SSW, (float)SSH, v);
                     if (off == NSUIntegerMax) {
-                        [enc endEncoding];
                         ctx->last_error = "MTL vertex buffer exhausted";
-                        r = NEOX_ERROR_BACKEND;
+                        r = NEOX_ERROR_OUT_OF_MEMORY;
                         goto enc_fail;
                     }
                     mtl_emit(enc, g->ps_comp[top2->blend], &e, off, 3,
                              uc, sizeof(uc), layers[top2->layer]->tex,
                              clip_rt ? clip_rt->tex : nil, nil);
-                    [enc endEncoding];
+                    mtl_end_channel(&cur);
                     if (top2->blend == NEOX_BLEND_PLUS) {
+                        /* PLUS 的整层 clamp 在父层上做（失败码直接传播）。 */
                         r = mtl_clamp_layer(ctx, g, &e, layers[parent->layer]);
-                        if (r != NEOX_OK) goto enc_fail;
+                        if (r != NEOX_OK) { goto enc_fail; }
                     }
+                    /* 组合成已完成：子层回池、栈弹出，然后为后续子绘制
+                     * 重新开始父层通道。 */
+                    mtl_rt_release(layers[top2->layer]);
+                    nlayers--;
                     if (clip_rt) {
                         clips[nclips - 1] = nil;
                         nclips--;
                         r = mtl_hold(ctx, &e, clip_rt);
                         if (r != NEOX_OK) { mtl_rt_release(clip_rt); goto enc_fail; }
                     }
-                    mtl_rt_release(layers[top2->layer]);
-                    nlayers--;
+                    nstk--;
+                    if (top2->clip) nx_execution_clip_pop(ctx, &execution_clips);
+                    r = mtl_begin_channel(g, &e, &cur, layers[parent->layer],
+                                          MTLLoadActionLoad);
+                    if (r != NEOX_OK) goto enc_fail;
+                    break;
                 }
+                /* 非隔离作用域：只影响变换/裁剪，不需要组合成。 */
                 if (top2->clip) nx_execution_clip_pop(ctx, &execution_clips);
-            nstk--;
+                nstk--;
                 break;
             }
             case NXC_PATH: {
                 const nx_path_slot *ps =
                     &((nx_path_slot *)dev->paths.slots)[c->res_idx];
                 r = mtl_fill_path(dev, g, &e, ps, top->ctm, &c->color,
-                                  top->blend, layers[top->layer]);
-                if (r != NEOX_OK) goto enc_fail;
+                                  nx_exec_isolated_blend(top->blend, top->owns_layer),
+                                  layers[top->layer]);
+                if (r != NEOX_OK) { goto enc_fail; }
                 break;
             }
             case NXC_TEX: {
                 const nx_tex_slot *tx =
                     &((nx_tex_slot *)dev->textures.slots)[c->res_idx];
-                r = mtl_draw_tex(dev, g, &e, tx, c, top->ctm, top->blend,
+                r = mtl_draw_tex(dev, g, &e, tx, c, top->ctm,
+                                 nx_exec_isolated_blend(top->blend, top->owns_layer),
                                  layers[top->layer]);
-                if (r != NEOX_OK) goto enc_fail;
+                if (r != NEOX_OK) { goto enc_fail; }
                 break;
             }
             case NXC_GLYPHS: {
                 const nx_tex_slot *at =
                     &((nx_tex_slot *)dev->textures.slots)[c->res_idx];
-                r = mtl_draw_glyphs(dev, g, &e, at, c, top->ctm, top->blend,
+                r = mtl_draw_glyphs(dev, g, &e, at, c, top->ctm,
+                                    nx_exec_isolated_blend(top->blend, top->owns_layer),
                                     layers[top->layer]);
-                if (r != NEOX_OK) goto enc_fail;
+                if (r != NEOX_OK) { goto enc_fail; }
                 break;
             }
             default:
@@ -1658,6 +1769,9 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
                 goto enc_fail;
             }
         }
+        /* 提交前结束仍在编码的通道：未结束的 encoder 会让 command buffer
+         * 永不完成（commit 后永久 PENDING）。这里显式收尾（P0-2）。 */
+        mtl_end_channel(&cur);
         [vbo didModifyRange:NSMakeRange(0, e.used)];
 
         /* 完成回调：只登记 completed 标志（不触碰 neox 状态与资源所有权） */
@@ -1712,6 +1826,9 @@ static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub)
     }
 
 enc_fail:
+    /* 统一清理：先结束仍然挂着的渲染通道，再回收资源。任何 goto enc_fail
+     * 都不会漏掉这一步，也不依赖 r 的偶然取值（P0-2）。 */
+    mtl_end_channel(&cur);
     nx_execution_clips_destroy(ctx, &execution_clips);
     if (r != NEOX_OK) {
         uint32_t k;
@@ -1791,6 +1908,16 @@ static uint32_t mtl_poll(neox_device *dev)
             result = nx_device_mark_lost(dev, "Metal command buffer execution fault");
         }
         nx_memory_probe_end(dev->ctx, &probe, &sub->report);
+        /* 在完成序里推进状态：读回过的表面不再要求在 present 前另做一次
+         * 空转（P1-14：提交完成即压缩 pending，present 只看状态）。 */
+        if (result == NEOX_OK) {
+            sub->result = NEOX_OK;
+            sub->status = NEOX_SUBMISSION_COMPLETE;
+        } else {
+            sub->result = result;
+            sub->status = NEOX_SUBMISSION_FAILED;
+            dev->ctx->last_error = "Metal resolve failed";
+        }
         for (h2 = 0; h2 < nheld; h2++)
             mtl_rt_release(held[h2]);  /* GPU 已完成：归还执行期占用纹理 */
         if (held)
@@ -1805,19 +1932,33 @@ static uint32_t mtl_poll(neox_device *dev)
     return done;
 }
 
-/* block（submission_wait）：等待最旧在途 command buffer 完成（真实进度，
- * 回调随即置位 completed，下一次 pump 收割） */
+/* block（submission_wait）：等待全部在途 command buffer 完成（真实进度）。
+ * 回调随即置位 completed，但状态推进只在调用线程的 mtl_poll 里发生；因此
+ * 这里在等待之后必须就地调用一次 mtl_poll，把完成事件推进为终态（P1-14：
+ * wait 返回后 submission 已经 COMPLETE，而不是留着 PENDING 让下一次
+ * present 误判为"仍在途"）。 */
 static void mtl_block(neox_device *dev)
 {
     nx_mtl_dev *g = (nx_mtl_dev *)dev->bstate;
-    id<MTLCommandBuffer> cb = nil;
+    uint32_t i, n, progress;
     if (!g) return;
-    pthread_mutex_lock(&g->lock);
-    if (g->ninflight > 0) cb = [g->inflight[0].cb retain];
-    pthread_mutex_unlock(&g->lock);
-    if (cb) {
-        [cb waitUntilCompleted];
-        [cb release];
+    for (;;) {
+        id<MTLCommandBuffer> *cbs = NULL;
+        n = 0;
+        pthread_mutex_lock(&g->lock);
+        if (g->ninflight > 0) {
+            cbs = (id<MTLCommandBuffer> *)calloc(g->ninflight, sizeof(*cbs));
+            if (cbs) {
+                for (i = 0; i < g->ninflight; i++)
+                    cbs[n++] = [g->inflight[i].cb retain];
+            }
+        }
+        pthread_mutex_unlock(&g->lock);
+        for (i = 0; i < n; i++) [cbs[i] waitUntilCompleted];
+        for (i = 0; i < n; i++) [cbs[i] release];
+        free(cbs);
+        progress = mtl_poll(dev);
+        if (progress == 0) break;
     }
 }
 
@@ -1961,6 +2102,24 @@ const nx_backend *nx_backend_mtl(void)
 }
 
 
+/* 统一的不透明窗口策略（P1-5）：present 着色器做 RGB *= a、alpha = 1。
+ * 快照读自 drawable（呈现后的像素），必须做同样的变换，否则 window
+ * readback 与屏幕、与 Soft/GL 的读回不一致。BGRA8Unorm 的 alpha 是未预乘
+ * 的 0..1，按其重新预乘（逐通道四舍五入）。 */
+static void mtl_snapshot_opaque(uint8_t *rgba, uint32_t w, uint32_t h)
+{
+    uint32_t x, y;
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            uint8_t *q = rgba + ((size_t)y * w + x) * 4u;
+            uint32_t a = q[3];
+            q[0] = (uint8_t)((q[0] * a + 127u) / 255u);
+            q[1] = (uint8_t)((q[1] * a + 127u) / 255u);
+            q[2] = (uint8_t)((q[2] * a + 127u) / 255u);
+            q[3] = 255;
+        }
+}
+
 neox_result nx_mtl_present(neox_mtl_surface *surface, void *native_layer, uint8_t *snapshot)
 {
     if (!surface || !native_layer) return NEOX_ERROR_INVALID_ARGUMENT;
@@ -1973,7 +2132,10 @@ neox_result nx_mtl_present(neox_mtl_surface *surface, void *native_layer, uint8_
         if (!g->ps_present) {
             NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
                 "vertex float4 vp(uint i [[vertex_id]]) { float2 p[3]={float2(-1,-1),float2(3,-1),float2(-1,3)}; return float4(p[i],0,1); }\n"
-                "fragment float4 fp(float4 p [[position]], texture2d<float> t [[texture(0)]]) { return float4(t.read(uint2(p.xy)).rgb,1); }\n";
+                /* 统一的不透明窗口策略（P1-5）：与 Soft/GL/Cocoa 一致，present
+                 * 时做 RGB *= a 再令 alpha = 1，而不是只丢 alpha。 */
+                "fragment float4 fp(float4 p [[position]], texture2d<float> t [[texture(0)]]) {"
+                " float4 c = t.read(uint2(p.xy)); return float4(c.rgb * c.a, 1.0); }\n";
             NSError *error = nil;
             id<MTLLibrary> lib = [g->device newLibraryWithSource:source options:nil error:&error];
             if (!lib) return NEOX_ERROR_BACKEND;
@@ -2027,6 +2189,7 @@ neox_result nx_mtl_present(neox_mtl_surface *surface, void *native_layer, uint8_
                 uint8_t *q = snapshot+((size_t)y*surface->w+x)*4;
                 q[0]=p[2]; q[1]=p[1]; q[2]=p[0]; q[3]=p[3];
             }
+            mtl_snapshot_opaque(snapshot, surface->w, surface->h);
         }
         [readback release]; return r;
     }

@@ -102,6 +102,13 @@ extern void *nx_test_dlsym(void *handle, const char *symbol);
 #define nx_dlopen(n, f) dlopen((n), (f))
 #define nx_dlsym(h, s) dlsym((h), (s))
 #endif
+/* 失败路径的关闭同样经过测试钩子（与 nx_dlopen 配对，见 tests/）。 */
+#if NX_TEST_HOOK_DLOPEN
+extern int nx_test_dlclose(void *handle);
+#define nx_dlclose(h) nx_test_dlclose((h))
+#else
+#define nx_dlclose(h) ((h) ? dlclose((h)) : 0)
+#endif
 
 static const struct wl_interface *xdg_types[26];
 
@@ -230,14 +237,14 @@ static int g_egl_state = NX_LOAD_UNTRIED;
 
 static void unload_wl(void)
 {
-    if (g_wl.lib) dlclose(g_wl.lib);
+    if (g_wl.lib) nx_dlclose(g_wl.lib);
     memset(&g_wl, 0, sizeof g_wl);
     g_wl_state = NX_LOAD_FAILED;
 }
 
 static void unload_egl(void)
 {
-    if (g_egl_lib) dlclose(g_egl_lib);
+    if (g_egl_lib) nx_dlclose(g_egl_lib);
     g_egl_lib = NULL;
     g_ewin_create = NULL;
     g_ewin_resize = NULL;

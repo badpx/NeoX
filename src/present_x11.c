@@ -133,6 +133,12 @@ extern void *nx_test_x11_dlsym(void *handle, const char *symbol);
 #define nx_x_dlopen(n, f) dlopen((n), (f))
 #define nx_x_dlsym(h, s) dlsym((h), (s))
 #endif
+#if NX_TEST_HOOK_DLOPEN
+extern int nx_test_x11_dlclose(void *handle);
+#define nx_x_dlclose(h) nx_test_x11_dlclose((h))
+#else
+#define nx_x_dlclose(h) ((h) ? dlclose((h)) : 0)
+#endif
 
 /* Xlib 的请求错误处理器是进程级全局状态：任何一次 X 请求失败都会到这里。
  * 协议错误不能被吞掉（P1-3）：记下"自上次 XSync 之后发生过错误"以及失败的
@@ -182,7 +188,7 @@ static int on_xio(void *dpy)
 
 static void unload_x11(void)
 {
-    if (g_x.lib) dlclose(g_x.lib);
+    if (g_x.lib) nx_x_dlclose(g_x.lib);
     memset(&g_x, 0, sizeof g_x);
     g_x_state = NX_X_LOAD_FAILED;
 }

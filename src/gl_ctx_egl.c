@@ -153,6 +153,12 @@ extern void *nx_test_egl_dlsym(void *handle, const char *symbol);
 #define nx_egl_dlopen(n, f) dlopen((n), (f))
 #define nx_egl_dlsym(h, s) dlsym((h), (s))
 #endif
+#if NX_TEST_HOOK_DLOPEN
+extern int nx_test_egl_dlclose(void *handle);
+#define nx_egl_dlclose(h) nx_test_egl_dlclose((h))
+#else
+#define nx_egl_dlclose(h) ((h) ? dlclose((h)) : 0)
+#endif
 
 size_t nx_gl_ctx_struct_size(void) { return sizeof(struct nx_gl_ctx); }
 
@@ -222,7 +228,7 @@ static int ext_has(const char *ext, const char *name)
 
 static void unload_lib(void)
 {
-    if (g_lib) dlclose(g_lib);
+    if (g_lib) nx_egl_dlclose(g_lib);
     g_lib = NULL;
     p_getProc = NULL; p_getDisplay = NULL; p_initialize = NULL;
     p_terminate = NULL; p_bindAPI = NULL; p_chooseConfig = NULL;

@@ -556,10 +556,10 @@ struct neox_gl_surface {
     void *win_egl;              /* EGLSurface；离屏为 NULL */
     void *native_window;
     int vsync;
-    uint8_t *presented;         /* 最近一次呈现的窗口像素快照（复用，resize 时释放） */
+    uint8_t *presented;         /* 显式 request_readback 之后的窗口像素快照（复用） */
     int presented_valid;
-    int snapshot_seq;           /* 每次成功 present 递增（连续帧顺序，P1-12） */
-    int snapshot_from_frame;    /* 快照由一次真实 window present 产生（P1-14） */
+    int capture_next;           /* 下一次 present 要捕获快照（request_readback 置位） */
+    int snapshot_seq;           /* 每次成功捕获递增（同一表面连续帧顺序，P1-12） */
 };
 
 typedef struct nx_gl_host_ctx nx_gl_host_ctx;
@@ -2642,8 +2642,26 @@ neox_result neox_gl_surface_request_readback(neox_gl_surface *surface)
     if (!surface || !surface->dev) return NEOX_ERROR_INVALID_ARGUMENT;
     if (nx_device_check_live(surface->dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
     if (!surface->win_egl) return NEOX_ERROR_UNSUPPORTED;
-    /* 每次 window present 都保存它实际交换的像素，读回请求无需再预留一次
-     * 特殊捕获：下一次 present 的快照总是可用的（P1-14）。 */
+    /* 契约（include/neox_present.h）：只有显式 request 之后的那次 present
+     * 捕获窗口像素；普通 present 不读回、不分配。 */
+    surface->capture_next = 1;
+    return NEOX_OK;
+}
+
+/* 公开读回 API 的单一实现：present.c（窗口层）与 GL 表面 API 都经这里读
+ * 快照，避免每个编译单元各自内联一份表面布局逻辑（同一 .a 里 -O0 下
+ * 多翻译单元仍可能给出不一致的内联结果，见 tests/test_present.c 的
+ * “普通 present 不捕获”断言）。 */
+neox_result nx_gl_surface_read_presented_impl(neox_gl_surface *surface,
+                                              uint8_t *out_pixels)
+{
+    if (!surface || !out_pixels) return NEOX_ERROR_INVALID_ARGUMENT;
+    if (nx_device_check_live(surface->dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
+    /* 只有 request_readback 之后的那次 window present 才留下快照；普通
+     * present 不捕获，读回继续返回 UNSUPPORTED（既有契约）。 */
+    if (!surface->presented_valid)
+        return NEOX_ERROR_UNSUPPORTED;
+    memcpy(out_pixels, surface->presented, (size_t)surface->w * surface->h * 4);
     return NEOX_OK;
 }
 
@@ -2654,6 +2672,8 @@ neox_result neox_gl_surface_present(neox_gl_surface *surface)
     uint32_t w, h;
     neox_result result = NEOX_OK;
     float v[6];
+    /* 先取本帧要用的字段：捕获标志只在开 GL 通道之前使用。 */
+    int capture;
     if (!surface || !surface->dev) return NEOX_ERROR_INVALID_ARGUMENT;
     if (nx_device_check_live(surface->dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
     if (!surface->win_egl) return NEOX_ERROR_UNSUPPORTED;
@@ -2661,14 +2681,20 @@ neox_result neox_gl_surface_present(neox_gl_surface *surface)
     ctx = surface->dev->ctx;
     if (!g || !g->p_present.id) return gl_failure(g);
     w = surface->w; h = surface->h;
+    capture = surface->capture_next;
+    /* 一次性捕获：只有 request_readback 之后的这一次 present 捕获（并在
+     * 交换成功后发布）；任何一次 present 都先撤销上一次发布的状态，下一次
+     * 普通 present 之后读回返回 UNSUPPORTED（既有契约，评审 4489969103）。 */
     surface->presented_valid = 0;
-    /* 呈现时保存窗口缓冲（GPU 目标；比离屏 FBO 多一次 sRGB 编码）供
-     * read_pixels 使用，这正是"读回的是上屏像素"的语义。存储复用到
-     * resize/销毁为止：每个表面一次分配，开销等于一帧。 */
-    if (!surface->presented) {
+    /* 普通呈现不分配、不做 CPU 读回；只有请求过 readback 的那一次才保存
+     * 窗口缓冲。快照存储复用，直到 resize/销毁才归还。捕获失败不阻断
+     * 呈现本身。 */
+    if (capture && !surface->presented) {
         surface->presented = nx_alloc(ctx,(size_t)w*h*4,16);
-        if (!surface->presented)
-            NX_ERR(ctx,"snapshot allocation failed",NEOX_ERROR_OUT_OF_MEMORY);
+        if (!surface->presented) {
+            capture = 0;
+            ctx->last_error = "snapshot allocation failed";
+        }
     }
     if (!nx_gl_ctx_window_make_current(g->ctx, surface->win_egl))
         NX_ERR(ctx,"GL: could not make window current",gl_failure(g));
@@ -2686,12 +2712,12 @@ neox_result neox_gl_surface_present(neox_gl_surface *surface)
     v[2] = 2.0f * (float)w; v[3] = 0.0f;
     v[4] = 0.0f; v[5] = 2.0f * (float)h;
     gl_draw(g, v, 3);
-    {
+    if (capture) {
         glPixelStorei(GL_PACK_ALIGNMENT,4);
         g->stats.pixel_readback_bytes+=(uint64_t)w*h*4;g->stats.readback_calls++;
         glReadPixels(0,0,(GLsizei)w,(GLsizei)h,GL_RGBA,GL_UNSIGNED_BYTE,surface->presented);
-        /* 窗口缓冲即屏幕像素（P1-5 不透明窗口）：present 着色器已做 RGB *= a
-         * 并写入 alpha = 1，与环境是否提供 alpha 位面无关，读回同样如此。 */
+        /* 窗口缓冲即屏幕像素（不透明窗口）：present 着色器已写入 alpha = 1，
+         * RGB 是预乘 sRGB（只编码一次）。 */
         /* In-place row reversal needs no second full-window allocation. */
         for (uint32_t y=0;y<h/2;y++) {
             uint8_t *top=surface->presented+(size_t)y*w*4;
@@ -2708,13 +2734,14 @@ neox_result neox_gl_surface_present(neox_gl_surface *surface)
         if (!nx_gl_ctx_window_swap(g->ctx,surface->win_egl)) {
             ctx->last_error="EGL window swap failed";
             result=gl_failure(g);
-        } else {
+        } else if (capture) {
             /* 快照与本次交换同属一帧：交换成功才发布。 */
             surface->presented_valid = 1;
-            surface->snapshot_from_frame = 1;
             surface->snapshot_seq++;
         }
     }
+    /* 请求是一次性的：无论成败，下一次 present 默认不再捕获。 */
+    surface->capture_next = 0;
     /* Restore even on readback/draw failure so later rendering can recover. */
     if (!gl_make_current(g))
         NX_ERR(ctx,"GL: could not restore offscreen current",gl_failure(g));
@@ -2724,14 +2751,7 @@ neox_result neox_gl_surface_present(neox_gl_surface *surface)
 neox_result neox_gl_surface_read_presented(neox_gl_surface *surface,
                                            uint8_t *out_pixels)
 {
-    if (!surface || !out_pixels) return NEOX_ERROR_INVALID_ARGUMENT;
-    if (nx_device_check_live(surface->dev) != NEOX_OK) return NEOX_ERROR_DEVICE_LOST;
-    /* 快照来自一次真实的 window present（P1-14）：普通 present 之后读回的
-     * 就是刚才上屏的像素，不会被当作"没有最新帧"拒绝。 */
-    if (!surface->presented_valid || !surface->snapshot_from_frame)
-        return NEOX_ERROR_UNSUPPORTED;
-    memcpy(out_pixels, surface->presented, (size_t)surface->w * surface->h * 4);
-    return NEOX_OK;
+    return nx_gl_surface_read_presented_impl(surface, out_pixels);
 }
 
 neox_result neox_gl_device_native_visual(neox_device *dev, uint32_t *out_visual_id)

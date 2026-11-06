@@ -509,7 +509,12 @@ neox_result neox_window_read_pixels(neox_window *win, uint8_t *out_pixels)
     if (win->is_gpu) {
         if (!win->gl_surf || win->gl_w != win->px_w || win->gl_h != win->px_h)
             return NEOX_ERROR_INVALID_ARGUMENT;
-        return neox_gl_surface_read_presented(win->gl_surf, out_pixels);
+        neox_result r = nx_gl_surface_read_presented_impl(win->gl_surf, out_pixels);
+        if (r != NEOX_OK)
+            nx_win_set_error(r == NEOX_ERROR_UNSUPPORTED
+                             ? "no requested GPU snapshot (call request_readback before present)"
+                             : "GPU snapshot readback failed");
+        return r;
     }
 #endif
     if (!win->is_gpu && !soft_target_current(win)) {

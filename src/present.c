@@ -123,7 +123,6 @@ neox_result neox_window_create(const neox_present_desc *desc, neox_window **out)
     w->scale_locked = desc->scale > 0.0f;
     w->scale = w->scale_locked ? desc->scale : 1.0f;
     w->vsync = desc->vsync ? 1 : 0;
-    w->opaque_clear = (neox_color){ 0.0f, 0.0f, 0.0f, 1.0f }; /* P1-5 */
     r = nx_win_set_geometry(w, w->pt_w, w->pt_h, w->scale);
     if (r != NEOX_OK) { free(w); return r; }
 
@@ -362,14 +361,6 @@ neox_result neox_window_create_device(neox_window *win, neox_context *ctx,
 #endif
 }
 
-/* 窗口恒不透明（P1-5）：窗口目标未指定清屏色时以不透明黑为底，这样
- * 半透明内容在 Soft/GL/Metal/Cocoa 上都按同一合成规则落到不透明背景上。
- * 状态栈回调（不透明窗口设备）负责设置它；适配器只读取 win->opaque_clear。 */
-static void nx_win_state_bridge(neox_window *win, neox_target_desc *td)
-{
-    if (win && td && !td->clear) td->clear = &win->opaque_clear;
-}
-
 neox_result neox_window_acquire_target(neox_window *win, neox_device *dev,
                                        neox_target_desc *out_target)
 {
@@ -401,7 +392,6 @@ neox_result neox_window_acquire_target(neox_window *win, neox_device *dev,
         }
         memset(win->soft_px, 0, n);
         win->soft_w = win->px_w; win->soft_h = win->px_h;
-        nx_win_state_bridge(win, out_target);
         out_target->kind = NEOX_BACKEND_SOFT;
         out_target->soft.pixels = win->soft_px;
         out_target->soft.stride = (size_t)win->px_w * 4u;
@@ -457,7 +447,6 @@ neox_result neox_window_acquire_target(neox_window *win, neox_device *dev,
             win->gl_w = win->px_w;
             win->gl_h = win->px_h;
         }
-        nx_win_state_bridge(win, out_target);
         out_target->kind = NEOX_BACKEND_GPU;
         out_target->surface = win->gl_surf;
         return NEOX_OK;

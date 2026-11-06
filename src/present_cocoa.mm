@@ -247,8 +247,6 @@ static neox_result cocoa_gpu_acquire(neox_window *w,neox_target_desc *out)
         p->metal_layer.drawableSize=CGSizeMake(w->px_w,w->px_h);
     }
     p->target_valid=1;p->capture=p->captured=0;
-    /* 不透明窗口：缺省清屏为不透明黑（P1-5）。 */
-    if(!out->clear)out->clear=&w->opaque_clear;
     out->kind=NEOX_BACKEND_GPU;out->surface=p->surface;return NEOX_OK;
 }
 static neox_result cocoa_gpu_present(neox_window *w)

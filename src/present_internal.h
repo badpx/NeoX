@@ -34,7 +34,6 @@ struct neox_window {
     int is_gpu;
     uint8_t *soft_px;
     size_t soft_bytes;
-    neox_color opaque_clear; /* [borrow] 窗口不透明：缺省清屏色（不透明黑，P1-5） */
     uint32_t soft_w, soft_h; /* dimensions of the acquired CPU target */
 #if NEOX_ENABLE_GL
     neox_gl_surface *gl_surf;

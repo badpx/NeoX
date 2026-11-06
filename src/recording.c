@@ -94,6 +94,12 @@ neox_result nx_emit_push(neox_frame *fr, neox_affine ctm, float opacity,
      * Reject before allocating masks, publishing commands or touching CAP. */
     if (!nx_affine_is_finite(ctm))
         NX_ERR(ctx, "composed transform exceeds numeric range", NEOX_ERROR_INVALID_ARGUMENT);
+    /* P1-9 / P2-4：每个前端最终都经过这里，未定义 flags 或负 blend 在此统一
+     * 拒绝（CAP 回放同样经此；与 capture.c 的预校验一致）。 */
+    if (flags & ~NEOX_ALLOW_APPROXIMATE)
+        NX_ERR(ctx, "undefined state flags", NEOX_ERROR_INVALID_ARGUMENT);
+    if ((unsigned)blend > (unsigned)NEOX_BLEND_PLUS)
+        NX_ERR(ctx, "invalid blend mode", NEOX_ERROR_INVALID_ARGUMENT);
     /* The mean is bounded by twice the largest coefficient. Keep ordinary
      * recording free of the distance-field square root. */
     if ((fabsf(ctm.a) > FLT_MAX*0.5f || fabsf(ctm.b) > FLT_MAX*0.5f ||
@@ -275,8 +281,14 @@ neox_result neox_push_state(neox_frame *frame, const neox_state *state)
         NX_ERR(ctx, "state is NULL", NEOX_ERROR_INVALID_ARGUMENT);
     if (nx_float_bad(state->opacity) || state->opacity < 0.0f || state->opacity > 1.0f)
         NX_ERR(ctx, "opacity out of range or NaN", NEOX_ERROR_INVALID_ARGUMENT);
-    if (state->blend > NEOX_BLEND_PLUS)
+    /* 负的枚举值（以 int 传入负数的 neox_blend）必须同样被拒绝：与有符号 0
+     * 比较会让 -1 通过（P2-4）。 */
+    if ((unsigned)state->blend > (unsigned)NEOX_BLEND_PLUS)
         NX_ERR(ctx, "invalid blend mode", NEOX_ERROR_INVALID_ARGUMENT);
+    /* 立即模式与 CAP 回放使用同一 flags 契约（P1-9）：只接受已定义的位，
+     * 未定义位一律 INVALID_ARGUMENT，而不是录制下来后回放时被拒。 */
+    if (state->flags & ~NEOX_ALLOW_APPROXIMATE)
+        NX_ERR(ctx, "undefined state flags", NEOX_ERROR_INVALID_ARGUMENT);
     {
         const float *m = &state->transform.a;
         uint32_t i;

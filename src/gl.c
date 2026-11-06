@@ -259,21 +259,28 @@ static const char *NX_GLSL_FS_CLAMP =
  * 真实窗口的底边是视觉底边，所以这里按高度翻转，让设备顶行出现在窗口顶边。
  * u_ss 复用为像素高度。离屏 read_pixels 不走这个 shader。
  *
- * 不透明窗口策略（P1-5）：与 Soft（X11/Wayland/Cocoa 的 RGB *= a、丢弃
- * alpha）和 Metal（present 着色器 RGB *= a、a = 1）统一——呈现像素 = 预乘
- * 后的 RGB（sRGB 编码）+ 不透明 alpha 1。窗口缓冲的 alpha 因此恒为 255
- * （评审要求显示/读回一致，不再保留 128 → Soft=128,0,0,255 = GL 现在）。 */
+ * 颜色链（P1-5 + shader 类型修正）：surface 纹理在 gl_resolve / encode pass
+ * 已经做过**一次** sRGB 量化（NX_GLSL_FS_ENCODE；GL_FRAMEBUFFER_SRGB 恒关，
+ * 见 gl_device_init），是预乘 sRGB8。present 只负责翻转行序与输出，不能再做
+ * 一次 sRGB 编码（会二次编码、把 128 变成约 188）。
+ *
+ * 不透明窗口策略：与 Soft（X11/Wayland/Cocoa 的 RGB *= a、丢弃 alpha）和
+ * Metal（present 着色器 RGB *= a、a = 1）统一——呈现像素 = 预乘后的 RGB
+ * （sRGB 编码）+ 不透明 alpha 1。窗口缓冲的 alpha 恒为 255。
+ *
+ * 注意：这里只写标量分量，不调用任何 enc 函数。此前版本写成
+ * enc(clamp(p.rgb, ...)) 而 enc 只有 float 版本、外层 vec4 也缺一个分量，
+ * shader 编译失败会让 gl_device_init 无条件失败（包括离屏设备）。 */
 static const char *NX_GLSL_FS_PRESENT =
     "#version 410 core\n"
     "uniform sampler2D u_tex;\n"
     "uniform float u_ss;\n"
     "out vec4 o_color;\n"
-    "float enc(float v) { return v<=0.0031308 ? v*12.92 : 1.055*pow(v,1.0/2.4)-0.055; }\n"
     "void main(void)\n"
     "{\n"
     "    int y = int(u_ss) - 1 - int(gl_FragCoord.y);\n"
     "    vec4 p = texelFetch(u_tex, ivec2(int(gl_FragCoord.x), y), 0);\n"
-    "    o_color = vec4(enc(clamp(p.rgb, 0.0, 1.0)), 1.0);\n"
+    "    o_color = vec4(clamp(p.rgb, 0.0, 1.0), 1.0);\n"
     "}\n";
 
 /* PLUS（§6.1）：clamp 非线性 + 覆盖率插值无法由固定功能因子表达。
@@ -555,11 +562,12 @@ struct neox_gl_surface {
     int snapshot_from_frame;    /* 快照由一次真实 window present 产生（P1-14） */
 };
 
-#define NX_HOST_CTX_SLOTS 8 /* 上下文外壳记账槽；单进程设备数远小于此 */
+typedef struct nx_gl_host_ctx nx_gl_host_ctx;
 
 typedef struct nx_gl_dev {
     neox_device *dev;
     nx_gl_ctx *ctx;             /* 平台上下文；shared_context 只加入共享组 */
+    nx_gl_host_ctx *host_ctx;   /* 本设备的外壳记账块（销毁时归还；P2-7） */
     int gl_ready;               /* 入口已解析，销毁时可以发 GL 调用 */
     int dual_ok;                /* GL_MAX_DUAL_SOURCE_DRAW_BUFFERS >= 1 且探测链接成功 */
     GLuint vao, vbo;
@@ -582,6 +590,16 @@ typedef struct nx_gl_dev {
     uint32_t max_tex;
     int failed;                 /* 执行期 GL 错误粘滞标记（跨 draw  early-exit） */
 } nx_gl_dev;
+
+/* 平台上下文外壳的记账块：紧挨在外壳之前由注入分配器分配，头部记住外壳
+ * 字节数、所属设备与归属上下文，并串进该设备的链表。释放只经设备自己的
+ * 链表/context，不存在进程级固定容量，也不依赖任何临时全局参数
+ * （评审 P2-7 的“把分配尺寸放进分配块头部/所属设备”要求）。 */
+struct nx_gl_host_ctx {
+    size_t bytes;               /* 外壳字节数（不含本头部） */
+    nx_gl_dev *owner;           /* 分配该外壳的设备 */
+    nx_gl_host_ctx *next;       /* 同一设备的其他外壳（当前最多一个） */
+};
 
 /* ------------------------------------------------------------------ GL 小工具 */
 
@@ -994,48 +1012,48 @@ static neox_result gl_tex_ensure(neox_context *ctx, nx_gl_dev *g,
 
 /* ------------------------------------------------------------------ 设备初始化 / 销毁 */
 
-/* 平台上下文外壳：宿主（本文件）经注入分配器分配，平台层只填字段。
- * 平台层通过 nx_gl_ctx_struct_size() 告知外壳大小。平台层内部再向对齐
- * 分配器申请 size+16；本文件把地址与这次记账尺寸一起记住（每个设备最多
- * 一个上下文外壳），释放时按同一尺寸归还。 */
-#define NX_HOST_CTX_PAD 16u
-typedef struct nx_host_ctx_block {
-    void *p;
-    size_t bytes;
-    int used;
-} nx_host_ctx_block;
-static nx_host_ctx_block g_host_ctx[NX_HOST_CTX_SLOTS];
-
+/* 平台上下文外壳：宿主（本文件）经注入分配器分配，平台层只填字段
+ * （nx_gl_ctx_alloc_host）。外壳前放一个 nx_gl_host_ctx 头部，记录外壳
+ * 字节数与所属设备，并串进所属设备的 host_ctx 链：分配/释放都只经过
+ * context 的分配器和设备自身，不存在进程级固定槽位或临时全局参数，因此
+ * 同时存在的 GL 设备数不受任何固定上限限制（评审 P2-7）。
+ *
+ * 生命周期：平台层 nx_gl_ctx_destroy 只释放平台资源；外壳由宿主用
+ * nx_gl_ctx_free_host 释放一次（内部就是 gl_ctx_host_free），与 EGL/CGL
+ * 的约定一致。gl_ctx_host_free 只按头部归还内存，不解引用外壳。 */
 static void *gl_ctx_host_alloc(void *user, size_t bytes)
 {
     neox_context *ctx = (neox_context *)user;
-    size_t i;
+    nx_gl_host_ctx *h;
+    nx_gl_dev *g = NULL;
+    neox_device *d;
     uint8_t *raw;
-    if (bytes == 0 || bytes > SIZE_MAX - NX_HOST_CTX_PAD) return NULL;
-    raw = (uint8_t *)nx_alloc(ctx, bytes + NX_HOST_CTX_PAD, 16);
-    if (!raw) return NULL;
-    for (i = 0; i < NX_HOST_CTX_SLOTS; i++) {
-        if (g_host_ctx[i].used) continue;
-        g_host_ctx[i].used = 1;
-        g_host_ctx[i].p = raw;
-        g_host_ctx[i].bytes = bytes + NX_HOST_CTX_PAD;
-        return raw; /* 对齐分配器已保证 16 字节对齐 */
+    if (bytes == 0 || bytes > SIZE_MAX - sizeof(nx_gl_host_ctx)) return NULL;
+    /* 归属：user 是分配器上下文；找到该 context 上尚未持有外壳的设备。 */
+    for (d = ctx->devices; d; d = d->next) {
+        if (d->vt != nx_backend_gl() || !d->bstate) continue;
+        g = (nx_gl_dev *)d->bstate;
+        if (!g->host_ctx) break;
+        g = NULL;
     }
-    nx_free(ctx, raw, bytes + NX_HOST_CTX_PAD, 16);
-    return NULL;
+    if (!g) return NULL;
+    if (g->gl_ready) return NULL; /* 外壳只在初始化阶段分配 */
+    raw = (uint8_t *)nx_alloc(ctx, sizeof(nx_gl_host_ctx) + bytes, 16);
+    if (!raw) return NULL;
+    h = (nx_gl_host_ctx *)raw;
+    h->bytes = bytes;
+    h->owner = g;
+    h->next = g->host_ctx;
+    g->host_ctx = h;
+    return raw + sizeof(nx_gl_host_ctx);
 }
 
 static void gl_ctx_host_free(void *user, void *p)
 {
-    size_t i;
+    nx_gl_host_ctx *h;
     if (!p) return;
-    for (i = 0; i < NX_HOST_CTX_SLOTS; i++) {
-        if (!g_host_ctx[i].used || g_host_ctx[i].p != p) continue;
-        nx_free((neox_context *)user, p, g_host_ctx[i].bytes, 16);
-        g_host_ctx[i].used = 0;
-        g_host_ctx[i].p = NULL;
-        return;
-    }
+    h = (nx_gl_host_ctx *)((uint8_t *)p - sizeof(nx_gl_host_ctx));
+    nx_free((neox_context *)user, h, sizeof(nx_gl_host_ctx) + h->bytes, 16);
 }
 
 static void gl_state_destroy(neox_context *ctx, nx_gl_dev *g)
@@ -1079,9 +1097,12 @@ static void gl_state_destroy(neox_context *ctx, nx_gl_dev *g)
     }
     g->nsurfs = 0;
     if (g->ctx) {
+        /* 外壳由宿主释放一次：destroy 只拆平台资源（EGL/CGL），
+         * free_host 归还外壳；之后不能再读 g->ctx 的任何字段。 */
         nx_gl_ctx_destroy(g->ctx);
         nx_gl_ctx_free_host(g->ctx);
         g->ctx = NULL;
+        g->host_ctx = NULL;
     }
     if (g->mask) nx_free(ctx, g->mask, (size_t)g->mask_w * g->mask_h * 4, 16);
     if (g->premul) nx_free(ctx, g->premul, (size_t)g->premul_w * g->premul_h * 16, 16);
@@ -1208,6 +1229,11 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
     }
     g->output_mode = gld.output_mode;
     (void)nx_gl_ctx_struct_size(); /* 外壳大小由平台层在其分配回调内使用 */
+    /* 外壳分配器按“该 context 上还没有外壳的 GL 设备”认领归属，所以
+     * bstate 必须先发布；init 之后任何失败都由 x 的 gl_state_destroy 统一
+     * 清理（此时 bstate 指回同一个 g）。core.c 的 neox_device_create 在
+     * init 前挂链、init 失败时摘链并释放设备（§10.1）。 */
+    dev->bstate = g;
     g->ctx = nx_gl_ctx_create_hosted(platform ? &gld : NULL, gl_ctx_host_alloc,
                                      gl_ctx_host_free, ctx);
     if (!g->ctx) {
@@ -1285,6 +1311,11 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
 #undef NX_BUILD_FS
 #undef NX_BUILD
 #undef NX_BUILD_MODE
+#ifdef NEOX_GL_SHADER_LIST_ONLY
+    /* （测试构建）只编译 GLSL 源码本身，不建程序/池。 */
+    (void)vs;
+    return NEOX_OK;
+#endif
     glDeleteShader(vs);
     if (gl_error(g) != GL_NO_ERROR) {
         gl_state_destroy(ctx, g);
@@ -1308,7 +1339,6 @@ static neox_result gl_device_init(neox_device *dev, const void *platform,
     glDisable(GL_BLEND);
     glDisable(GL_DITHER);          /* 浮点目标上本应是空操作；关掉以免量化抖动 */
     glDisable(GL_FRAMEBUFFER_SRGB); /* sRGB 编码由 resolve shader 手工完成 */
-    dev->bstate = g;
     return NEOX_OK;
 }
 

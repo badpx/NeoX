@@ -141,6 +141,7 @@ typedef void           GLvoid;
     X(void, glGetIntegerv, (GLenum pname, GLint *data)) \
     X(void, glGetProgramiv, (GLuint program, GLenum pname, GLint *params)) \
     X(void, glGetShaderiv, (GLuint shader, GLenum pname, GLint *params)) \
+    X(void, glGetShaderInfoLog, (GLuint shader, GLsizei bufsize, GLsizei *length, char *info)) \
     X(const GLubyte *, glGetString, (GLenum name)) \
     X(GLint, glGetUniformLocation, (GLuint program, const char *name)) \
     X(void, glLinkProgram, (GLuint program)) \

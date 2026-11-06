@@ -172,12 +172,16 @@ void *nx_gl_ctx_get_proc(nx_gl_ctx *ctx, const char *name)
     return dlsym(RTLD_DEFAULT, name);
 }
 
+/* 只释放平台资源（CGL 上下文），不释放外壳：外壳的所有权归宿主，宿主在
+ * 本调用之后用 nx_gl_ctx_free_host 释放一次（与 EGL 的实现一致）。此前这里
+ * 也调用 free_host，而 gl_state_destroy 之后还会再调一次，第二次会读取已
+ * 释放外壳里的 dealloc/alloc_user（use-after-free）。 */
 void nx_gl_ctx_destroy(nx_gl_ctx *ctx)
 {
     if (!ctx) return;
     if (ctx->cgl) {
         CGLSetCurrentContext(NULL);
         CGLReleaseContext(ctx->cgl);
+        ctx->cgl = NULL;
     }
-    nx_gl_ctx_free_host(ctx);
 }

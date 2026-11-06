@@ -260,16 +260,20 @@ neox_result neox_device_create(neox_context *ctx, const neox_device_desc *desc,
         nx_free(ctx, dev, sizeof(neox_device), 16);
         NX_ERR(ctx, "device identity space exhausted", NEOX_ERROR_BACKEND);
     }
+    /* 先挂到 context 设备链表再 init：后端的宿主分配器（如 GL 的上下文
+     * 外壳）需要从所属设备认领自己的记账块。init 失败时由下面统一摘链。 */
+    dev->next = ctx->devices;
+    ctx->devices = dev;
     r = vt->init(dev, desc ? desc->platform : NULL,
                  desc ? desc->platform_size : 0); /* 失败须自行清理已分配部分 */
     if (r != NEOX_OK) {
+        neox_device **link = &ctx->devices;
+        while (*link && *link != dev) link = &(*link)->next;
+        if (*link) *link = dev->next;
         nx_device_release_tables(dev);
         nx_free(ctx, dev, sizeof(neox_device), 16);
         return r;
     }
-    /* 挂到 context 设备链表 */
-    dev->next = ctx->devices;
-    ctx->devices = dev;
     *out_dev = dev;
     return NEOX_OK;
 }

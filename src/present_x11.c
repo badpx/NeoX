@@ -8,7 +8,9 @@
  * 窗口管理器异步映射：须等到 IsViewable 再读写屏幕，否则 XGetImage
  * 会 BadMatch，或被个别服务器交回空白图。
  * =========================================================================*/
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include "present_internal.h"
 
 #include <dlfcn.h>

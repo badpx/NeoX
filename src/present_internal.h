@@ -77,6 +77,13 @@ int nx_win_rgba_size(uint32_t width, uint32_t height, size_t *bytes);
 void nx_win_push_event(neox_window *w, const neox_window_event *ev);
 void nx_win_set_error(const char *msg);
 
+#if NEOX_ENABLE_GL
+struct neox_gl_surface;
+/* 唯一实现位于 gl.c；窗口层经它读回 GL 快照（不内联表面布局）。 */
+neox_result nx_gl_surface_read_presented_impl(struct neox_gl_surface *surface,
+                                              uint8_t *out_pixels);
+#endif
+
 const nx_win_vt *nx_present_x11_vt(void);
 const nx_win_vt *nx_present_wl_vt(void);
 

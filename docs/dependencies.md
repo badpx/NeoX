@@ -1,8 +1,10 @@
 # NeoX 依赖清单
 
 按 design-v0.2.md §9 三级分类：**核心必需 / 模块必需（可裁剪）/ 仅工具链**。
-核心级依赖目标数量为零——当前核心（`src/core.c`、`geom.c`、`soft.c`、
-`gl.c`、`metal.mm`）除 C/POSIX 标准库与平台系统库外无第三方依赖。
+核心级第三方依赖为零——当前核心（`src/core.c`、`geom.c`、`soft.c`、
+`gl.c`、`metal.mm`、窗口呈现 `present*.c/.mm`）除 C/POSIX 标准库与平台系统库外
+不依赖任何第三方库。唯一的 vendored 第三方代码在 **可选** 的 NeoX-Text 模块里
+（stb_truetype，见下表），`-DNEOX_WITH_TEXT=OFF` 可把 Text 模块连同它一起裁掉。
 macOS 链接 OpenGL.framework / Metal.framework / Foundation.framework /
 QuartzCore.framework；可选 Cocoa 窗口模块另链接 AppKit.framework。Linux GL 后端不在链接期依赖 libEGL：运行期
 `dlopen("libEGL.so.1")`，并需要一份桌面 GL 4.1 驱动（CI 与无头环境用
@@ -13,7 +15,7 @@ Mesa llvmpipe，包名见下）。找不到库时 GL 设备创建返回
 
 | 依赖 | 版本 | 许可证 | 用途 | 裁剪方式 | 获取 |
 |---|---|---|---|---|---|
-| stb_truetype.h（notions/stb） | v1.26（2021-08-28） | public domain（仓库以 MIT/Unlicense 双授权发布） | NeoX-Text 字体解析与字形 A8 光栅化 | 单头文件全量 vendor，保留少量 OOM 检查补丁 | `third_party/stb/`（详见 `third_party/README.md`） |
+| Text 模块内置：stb_truetype.h（notions/stb） | v1.26（2021-08-28） | public domain（仓库以 MIT/Unlicense 双授权发布） | NeoX-Text 字体解析与字形 A8 光栅化 | 单头文件全量 vendor，保留少量 OOM 检查补丁 | `third_party/stb/`（详见 `third_party/README.md`） |
 
 - 构建开关：`NEOX_WITH_TEXT=OFF` 时 `neox_text` 库、测试与示例不参与构建，
   核心与其余测试不受影响（ubuntu CI 无字体环境走此路径 + 集成测试 SKIP）。

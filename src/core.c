@@ -260,27 +260,42 @@ neox_result neox_device_create(neox_context *ctx, const neox_device_desc *desc,
         nx_free(ctx, dev, sizeof(neox_device), 16);
         NX_ERR(ctx, "device identity space exhausted", NEOX_ERROR_BACKEND);
     }
+    /* 先挂到 context 设备链表再 init：后端的宿主分配器（如 GL 的上下文
+     * 外壳）需要从所属设备认领自己的记账块。init 失败时由下面统一摘链。 */
+    dev->next = ctx->devices;
+    ctx->devices = dev;
     r = vt->init(dev, desc ? desc->platform : NULL,
                  desc ? desc->platform_size : 0); /* 失败须自行清理已分配部分 */
     if (r != NEOX_OK) {
+        neox_device **link = &ctx->devices;
+        while (*link && *link != dev) link = &(*link)->next;
+        if (*link) *link = dev->next;
         nx_device_release_tables(dev);
         nx_free(ctx, dev, sizeof(neox_device), 16);
         return r;
     }
-    /* 挂到 context 设备链表 */
-    dev->next = ctx->devices;
-    ctx->devices = dev;
     *out_dev = dev;
     return NEOX_OK;
 }
 
 /* ------------------------------------------------------------------ context */
 
+/* 没有 context 可承载的失败（保留字段非零）在这里留下静态详情，
+ * 经 neox_get_error_detail(NULL) 读取。 */
+static const char *g_context_create_error;
+
 neox_result neox_context_create(const neox_context_desc *desc, neox_context **out_ctx)
 {
     static const neox_allocator sys = { NULL, sys_alloc, sys_free };
     if (!out_ctx) return NEOX_ERROR_INVALID_ARGUMENT;
     *out_ctx = NULL;
+    /* neox_context_desc.flags 是保留字段，契约要求为 0（P2-5）：旧实现直接
+     * 忽略非零取值，调用方会误以为标志生效。 */
+    if (desc && desc->flags != 0) {
+        g_context_create_error = "neox_context_desc.flags must be zero (reserved)";
+        return NEOX_ERROR_INVALID_ARGUMENT;
+    }
+    g_context_create_error = NULL;
     /* 结构本身也经注入分配器分配（desc 在栈上，可用其分配器） */
     const neox_allocator *al = (desc && desc->allocator) ? desc->allocator : &sys;
     neox_context *ctx = (neox_context *)al->alloc(al->user, sizeof(neox_context), 16);
@@ -309,7 +324,7 @@ uint32_t neox_version(void) { return NEOX_VER; }
 
 const char *neox_get_error_detail(neox_context *ctx)
 {
-    if (!ctx) return NULL;
+    if (!ctx) return g_context_create_error;
     return ctx->last_error;
 }
 

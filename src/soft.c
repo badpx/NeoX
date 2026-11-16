@@ -158,6 +158,7 @@ typedef struct ex_state {
     neox_blend  blend;
     const float *clip;
     int32_t     layer_idx;
+    int         owns_layer; /* 本作用域有隔离层：blend 只在 POP 组合成时生效 */
 } ex_state;
 
 static void ex_composite(float *dst, const float *src, const float *clip,
@@ -191,10 +192,14 @@ static neox_result ex_draw_path(neox_device *dev, nx_sub_slot *sub,
                                       mask);
     if (r != NEOX_OK) return r;
     nx_paint_to_premul_linear(cmd->color, base);
-    for (i = 0; i < npix; i++) {
-        float cov = mask[i];
-        if (cov == 0.0f) continue;
-        nx_blend_pixel_cov(&layer[i * 4], base, top->blend, cov);
+    {
+        /* P1-8：隔离层内子绘制一律 SRC_OVER，组 blend 留到 POP 组合成。 */
+        neox_blend mode = nx_exec_isolated_blend(top->blend, top->owns_layer);
+        for (i = 0; i < npix; i++) {
+            float cov = mask[i];
+            if (cov == 0.0f) continue;
+            nx_blend_pixel_cov(&layer[i * 4], base, mode, cov);
+        }
     }
     return NEOX_OK;
 }
@@ -246,7 +251,8 @@ static neox_result ex_draw_tex(neox_device *dev, nx_sub_slot *sub,
             v = cmd->src.y + tv * cmd->src.h;
             sample_tex(tx, u, v, cmd->filter, smp);
             for (c = 0; c < 4; c++) s[c] = smp[c] * cmd->tex_opacity;
-            nx_blend_pixel(&layer[(row + (size_t)px) * 4], s, top->blend);
+            nx_blend_pixel(&layer[(row + (size_t)px) * 4], s,
+                           nx_exec_isolated_blend(top->blend, top->owns_layer));
         }
     }
     return NEOX_OK;
@@ -321,7 +327,9 @@ static neox_result ex_draw_glyphs(neox_device *dev, nx_sub_slot *sub,
                 }
                 if (cov <= 0.0f) continue;
                 nx_blend_pixel_cov(&layer[((size_t)py * sub->width + (size_t)px) * 4],
-                                   base, top->blend, cov);
+                                   base,
+                                   nx_exec_isolated_blend(top->blend, top->owns_layer),
+                                   cov);
             }
         }
     }
@@ -364,6 +372,7 @@ static neox_result soft_execute(neox_device *dev, nx_sub_slot *sub)
     stk[0].blend = NEOX_BLEND_SRC_OVER;
     stk[0].clip = NULL;
     stk[0].layer_idx = 0;
+    stk[0].owns_layer = 0;
     nstk = 1;
 
     for (i = 0; i < sub->cmd_count; i++) {
@@ -398,6 +407,7 @@ static neox_result soft_execute(neox_device *dev, nx_sub_slot *sub)
             if (r != NEOX_OK) goto cleanup;
             stk[nstk].layer_idx = c->owns_layer ? (int32_t)(nlayers - 1)
                                                 : stk[nstk - 1].layer_idx;
+            stk[nstk].owns_layer = c->owns_layer;
             nstk++;
             break;
         }

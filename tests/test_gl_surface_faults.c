@@ -52,6 +52,8 @@ static void red_pixels(neox_gl_surface *surface)
 int main(void)
 {
     neox_context *ctx; neox_device *dev; neox_gl_surface *surface;
+    nx_gl_ctx *native = nx_gl_ctx_create(NULL);
+    if (native) { nx_gl_ctx_destroy(native); nx_gl_ctx_free_host(native); }
     OK(neox_context_create(NULL, &ctx));
     neox_gl_device_desc gd = {0}; gd.struct_size = sizeof(gd); gd.magic = NEOX_GL_DESC_MAGIC;
     neox_device_desc dd = {0}; dd.backend = NEOX_BACKEND_GPU;
@@ -92,6 +94,16 @@ int main(void)
     CHECK(!surface->presented && !surface->presented_valid && ctx->used == used - 8*8*4);
     OK(neox_frame_end(begin(dev, surface), &sub)); OK(neox_submission_wait(dev, sub));
     neox_submission_release(dev, sub); red_pixels(surface);
+    /* An explicit capture must report OOM before touching the native window.
+     * Retain the request so allocation can be retried; do not publish stale pixels. */
+    surface->win_egl = (void *)(uintptr_t)1;
+    OK(neox_gl_surface_request_readback(surface));
+    uint64_t budget = ctx->budget;
+    ctx->budget = ctx->used;
+    CHECK(neox_gl_surface_present(surface) == NEOX_ERROR_OUT_OF_MEMORY);
+    CHECK(surface->capture_next && !surface->presented && !surface->presented_valid);
+    ctx->budget = budget;
+    surface->win_egl = NULL;
     fail_texture = 1; allocation_error = 0x0507u; /* observed GL_CONTEXT_LOST */
     CHECK(neox_gl_surface_resize(surface, 8, 8) == NEOX_ERROR_DEVICE_LOST);
     CHECK(neox_device_is_lost(dev));

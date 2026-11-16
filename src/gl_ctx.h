@@ -9,11 +9,19 @@
 
 #include "neox_gl.h"
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct nx_gl_ctx nx_gl_ctx;
+
+/* 上下文外壳的宿主分配：gl.c 用 neox 注入分配器（nx_alloc/nx_free）分配
+ * 外壳，经 desc 的 *host 字段交给平台层填充；平台层不再自行 malloc。
+ * 未提供时（旧路径/测试桩）平台层退回 malloc，仍可用。 */
+typedef void *(*nx_gl_host_alloc)(void *user, size_t bytes);
+typedef void  (*nx_gl_host_free)(void *user, void *p);
 
 /* desc == NULL：自建离屏上下文，不加入外部 share group。
  * desc != NULL：只读取 shared_context（struct_size / magic 由调用方协商）。
@@ -24,7 +32,18 @@ int         nx_gl_ctx_make_current(nx_gl_ctx *ctx);
 int         nx_gl_ctx_is_lost(const nx_gl_ctx *ctx);
 /* 解析当前上下文的 GL 入口。须在 make_current 成功之后调用。 */
 void       *nx_gl_ctx_get_proc(nx_gl_ctx *ctx, const char *name);
+/* 只释放平台资源；外壳由宿主用 nx_gl_ctx_free_host 释放。
+ * host_alloc 非 NULL 时外壳改由宿主分配（见 nx_gl_ctx_alloc_host）。 */
 void        nx_gl_ctx_destroy(nx_gl_ctx *ctx);
+nx_gl_ctx  *nx_gl_ctx_create_hosted(const neox_gl_device_desc *desc,
+                                    nx_gl_host_alloc alloc,
+                                    nx_gl_host_free dealloc, void *user);
+/* 外壳字节数（gl.c 先前知道尺寸，才能用对齐分配器成对分配/释放）。 */
+size_t      nx_gl_ctx_struct_size(void);
+/* 宿主分配外壳（*host 由 gl.c 设置），与 nx_gl_ctx_free_host 配对。 */
+nx_gl_ctx  *nx_gl_ctx_alloc_host(nx_gl_host_alloc alloc, nx_gl_host_free dealloc,
+                                 void *user);
+void        nx_gl_ctx_free_host(nx_gl_ctx *ctx);
 const char *nx_gl_ctx_last_error(void);
 /* 诊断用："cgl" / "egl-surfaceless" / "egl-x11" / "egl-wayland" 等。 */
 const char *nx_gl_ctx_kind(const nx_gl_ctx *ctx);

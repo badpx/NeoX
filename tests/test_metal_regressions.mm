@@ -65,6 +65,17 @@ static void failures_and_order(neox_device *dev, neox_mtl_surface *surf)
     for (unsigned i=0;i<3;i++) completed(dev,subs[i]);
     for (unsigned i=0;i<g->nrts;i++) CHECK(!g->rts[i].in_use);
 }
+static void queued_clear_dependency(neox_device *dev, neox_mtl_surface *surf)
+{
+    neox_submission first=clear_frame(dev,surf,(neox_color){1,0,0,1});
+    neox_target_desc td={}; td.kind=NEOX_BACKEND_GPU; td.surface=surf;
+    neox_frame *frame=NULL; neox_submission second={};
+    OK(neox_frame_begin(dev,&td,&frame));
+    OK(neox_frame_end(frame,&second));
+    completed(dev,second);
+    completed(dev,first);
+    pixel(surf,255,0,0,255);
+}
 static void glyph_staging(neox_device *dev, neox_mtl_surface *surf)
 {
     uint8_t coverage=255; neox_texture atlas;
@@ -141,10 +152,11 @@ int main(void)
             fprintf(stderr,"SKIP Metal: %s\n",neox_get_error_detail(ctx)); neox_context_destroy(ctx); return 77;
         }
         OK(neox_mtl_surface_create(dev,8,8,&surf));
-        failures_and_order(dev,surf); glyph_staging(dev,surf); group_then_upload(dev,surf); present_color(dev,surf);
+        failures_and_order(dev,surf); queued_clear_dependency(dev,surf);
+        glyph_staging(dev,surf); group_then_upload(dev,surf); present_color(dev,surf);
         neox_mtl_surface_destroy(dev,surf); neox_device_destroy(dev); CHECK(ctx->used==0);
         neox_context_destroy(ctx);
     }
-    puts("ALL PASS (Metal cleanup, failed retry, ordered publication, glyph staging and present colors)");
+    puts("ALL PASS (Metal cleanup, queued clear dependency, ordered publication, glyph staging and present colors)");
     return 0;
 }

@@ -629,6 +629,39 @@ static int tx_in(const uint8_t *d, size_t size, uint64_t base, uint64_t rel, uin
     return base <= size && rel <= size - base && n <= size - base - rel;
 }
 
+static int tx_check_cmap4(const uint8_t *p, uint32_t len)
+{
+    uint32_t seg2 = tx_rd_u16(p + 6), seg, power = 1, selector = 0;
+    uint32_t search_range, range_shift, i, previous_end = 0;
+    if (!seg2 || (seg2 & 1u)) return 0;
+    seg = seg2 / 2u;
+    if (seg > (len - 16u) / 8u) return 0;
+    while (power * 2u <= seg) { power *= 2u; selector++; }
+    search_range = power * 2u;
+    range_shift = seg2 - search_range;
+    if (tx_rd_u16(p + 8) != search_range ||
+        tx_rd_u16(p + 10) != selector ||
+        tx_rd_u16(p + 12) != range_shift ||
+        tx_rd_u16(p + 14 + seg2) != 0) return 0;
+    for (i = 0; i < seg; i++) {
+        uint32_t end = tx_rd_u16(p + 14 + i * 2u);
+        uint32_t start = tx_rd_u16(p + 16 + seg2 + i * 2u);
+        uint32_t range_pos = 16 + seg2 * 3u + i * 2u;
+        uint32_t offset = tx_rd_u16(p + range_pos);
+        if (start > end || (i && start <= previous_end)) return 0;
+        if (i + 1u == seg && end != 0xffffu) return 0;
+        previous_end = end;
+        if (!offset) continue;
+        if (offset & 1u) return 0;
+        {
+            uint64_t first = (uint64_t)range_pos + offset;
+            uint64_t last = first + (uint64_t)(end - start) * 2u;
+            if (first + 2u > len || last + 2u > len) return 0;
+        }
+    }
+    return 1;
+}
+
 /* 必需表的最小长度：
  *   head  : 54 字节（indexToLocFormat 在 +50）
  *   hhea  : 36 字节（numberOfHMetrics 在 +34）
@@ -731,12 +764,9 @@ static int tx_check_required_tables(const uint8_t *d, size_t size,
                  * font buffer. This is structural hardening, not a validator
                  * for every nested reference used by the font parser. */
                 switch (fmt) {
-                case 4: {
-                    uint32_t seg2 = tx_rd_u16(p + 6);
-                    if (!seg2 || (seg2 & 1u) || seg2 / 2u > (len - 16u) / 8u)
-                        return 0;
+                case 4:
+                    if (!tx_check_cmap4(p, len)) return 0;
                     break;
-                }
                 case 6:
                     if (tx_rd_u16(p + 8) > (len - 10u) / 2u) return 0;
                     break;

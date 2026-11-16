@@ -1031,9 +1031,37 @@ static void mtl_get_caps(neox_device *dev, neox_caps *out_caps)
     out_caps->backend_memory_limit = 0;
 }
 
+static uint32_t mtl_poll(neox_device *dev);
+
+static neox_result mtl_wait_surface(neox_device *dev, neox_mtl_surface *surf)
+{
+    nx_mtl_dev *g = (nx_mtl_dev *)dev->bstate;
+    neox_device_pump(dev);
+    while (surf->resolved_seq < surf->submit_seq) {
+        id<MTLCommandBuffer> cb = nil;
+        uint64_t best_seq = UINT64_MAX;
+        pthread_mutex_lock(&g->lock);
+        for (uint32_t k = 0; k < g->ninflight; k++) {
+            nx_mtl_inflight *item = &g->inflight[k];
+            nx_sub_slot *slot = &((nx_sub_slot *)dev->subs.slots)[item->sub_idx];
+            if (slot->surface == surf && item->seq < best_seq) {
+                best_seq = item->seq;
+                cb = [item->cb retain];
+            }
+        }
+        pthread_mutex_unlock(&g->lock);
+        if (!cb) NX_ERR(dev->ctx, "MTL surface submission sequence is inconsistent",
+                        NEOX_ERROR_BACKEND);
+        [cb waitUntilCompleted];
+        [cb release];
+        (void)mtl_poll(dev);
+    }
+    return NEOX_OK;
+}
+
 /* ------------------------------------------------------------------ begin_target
  * 校验表面归属、确定帧尺寸、装载基底（与 gl_begin_target 镜像；clear==NULL 时
- * getBytes 快照 → 预乘线性 float） */
+ * 先发布同表面的前序帧，再以 getBytes 快照 → 预乘线性 float） */
 static neox_result mtl_begin_target(neox_frame *fr,
                                     const neox_target_desc *target)
 {
@@ -1051,6 +1079,10 @@ static neox_result mtl_begin_target(neox_frame *fr,
     fr->surface = surf;
     fr->width = surf->w;
     fr->height = surf->h;
+    if (!target->clear) {
+        neox_result r = mtl_wait_surface(dev, surf);
+        if (r != NEOX_OK) return r;
+    }
     npix = (size_t)fr->width * fr->height;
     fr->base = (float *)nx_alloc(ctx, npix * 4 * sizeof(float), 16);
     if (!fr->base) NX_ERR(ctx, "frame buffer allocation failed",
@@ -1471,7 +1503,6 @@ static neox_result mtl_resolve(neox_context *ctx, nx_mtl_dev *g, nx_mtl_rt *base
  * seq 排序收割，并且只有在同一表面更早的提交都已 resolve 后才把该帧写进
  * surface。即使 Metal 乱序完成，旧帧也不可能覆盖新帧。
  */
-static uint32_t mtl_poll(neox_device *dev);
 static neox_result mtl_execute(neox_device *dev, nx_sub_slot *sub);
 
 /* Charge every individual staging call, including its alignment padding. */

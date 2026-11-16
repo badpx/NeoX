@@ -70,6 +70,47 @@ static size_t small_cmap_font(uint8_t *d)
     return 304;
 }
 
+static size_t small_cmap4_font(uint8_t *d)
+{
+    static const char *tags[] = { "head", "hhea", "maxp", "hmtx", "loca", "cmap", "glyf" };
+    static const unsigned offsets[] = { 124, 180, 216, 248, 256, 264, 308 };
+    static const unsigned lengths[] = { 54, 36, 32, 8, 6, 44, 0 };
+    unsigned i;
+    memset(d, 0, 308);
+    put32(d, 0x00010000u);
+    put16(d + 4, 7);
+    for (i = 0; i < 7; i++) {
+        memcpy(d + 12 + i * 16, tags[i], 4);
+        put32(d + 20 + i * 16, offsets[i]);
+        put32(d + 24 + i * 16, lengths[i]);
+    }
+    put16(d + 124 + 18, 1000);
+    put16(d + 180 + 4, 800);
+    put16(d + 180 + 6, (unsigned)(uint16_t)-200);
+    put16(d + 180 + 34, 2);
+    put32(d + 216, 0x00010000u);
+    put16(d + 216 + 4, 2);
+    put16(d + 248, 500);
+    put16(d + 252, 500);
+    put16(d + 264 + 2, 1);
+    put16(d + 264 + 4, 3);
+    put16(d + 264 + 6, 1);
+    put32(d + 264 + 8, 12);
+    put16(d + 276, 4);
+    put16(d + 276 + 2, 32);
+    put16(d + 276 + 6, 4);
+    put16(d + 276 + 8, 4);
+    put16(d + 276 + 10, 1);
+    put16(d + 276 + 12, 0);
+    put16(d + 276 + 14, 'A');
+    put16(d + 276 + 16, 0xffff);
+    put16(d + 276 + 20, 'A');
+    put16(d + 276 + 22, 0xffff);
+    put16(d + 276 + 24, (unsigned)(uint16_t)(1 - 'A'));
+    put16(d + 276 + 26, 1);
+    return 308;
+}
+
 int main(void)
 {
     neox_context *ctx = NULL;
@@ -213,6 +254,33 @@ int main(void)
         small_cmap_font(buf);
         put16(buf + 264 + 2, 5); /* encoding records spill outside cmap */
         expect_bad(t, buf, sizeof buf, 0, "cmap records exceed table, not file");
+    }
+
+    {
+        nx_font *f = NULL;
+        nx_layout *layout = NULL;
+        size_t size = small_cmap4_font(buf);
+        CHECK(nx_font_load_memory(t, buf, size, 0, &f) == NEOX_OK);
+        CHECK(nx_text_layout(t, f, 10, "A", 0, NX_ALIGN_LEFT, &layout) == NEOX_OK);
+        CHECK(layout->glyph_count == 1 && layout->glyphs[0].glyph_index == 1);
+        nx_layout_destroy(layout);
+        nx_font_destroy(f);
+
+        small_cmap4_font(buf);
+        put16(buf + 276 + 8, 0xfffe);
+        expect_bad(t, buf, size, 0, "format 4 searchRange outside endCount");
+        small_cmap4_font(buf);
+        put16(buf + 276 + 10, 15);
+        expect_bad(t, buf, size, 0, "format 4 entrySelector outside endCount");
+        small_cmap4_font(buf);
+        put16(buf + 276 + 12, 0xfffe);
+        expect_bad(t, buf, size, 0, "format 4 rangeShift outside endCount");
+        small_cmap4_font(buf);
+        put16(buf + 276 + 28, 0xfffe);
+        expect_bad(t, buf, size, 0, "format 4 glyphIdArray outside subtable");
+        small_cmap4_font(buf);
+        put16(buf + 276 + 28, 4);
+        expect_bad(t, buf, size, 0, "format 4 glyphIdArray starts outside subtable");
     }
 
     nx_text_context_destroy(t);

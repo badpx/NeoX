@@ -1,5 +1,5 @@
-/* P1-11：场景树深度。深链的销毁必须走显式栈（不递归），超过上限的挂接
- * 与渲染返回 UNSUPPORTED 而不是把默认线程栈压爆。
+/* P1-11：场景树深度。深链的销毁使用常数额外空间的迭代遍历，超过上限的
+ * 挂接与渲染返回 UNSUPPORTED 而不是把默认线程栈压爆。
  * 测试自身也只用迭代构造，不依赖递归。 */
 #include "neox.h"
 
@@ -10,6 +10,33 @@
 #define CHECK(x) do { if (!(x)) { \
     fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); exit(1); } } while (0)
 #define OK(x) CHECK((x) == NEOX_OK)
+
+typedef struct { size_t live, allocs; int fail; } scene_tracker;
+typedef struct { size_t size; } scene_header;
+static void *scene_alloc(void *user, size_t size, size_t align)
+{
+    scene_tracker *tr = user;
+    scene_header *h;
+    (void)align;
+    if (tr->fail) return NULL;
+    h = malloc(sizeof(*h) + size);
+    if (!h) return NULL;
+    h->size = size;
+    tr->live += size;
+    tr->allocs++;
+    return h + 1;
+}
+static void scene_free(void *user, void *ptr, size_t size, size_t align)
+{
+    scene_tracker *tr = user;
+    scene_header *h;
+    (void)align;
+    if (!ptr) return;
+    h = (scene_header *)ptr - 1;
+    CHECK(h->size == size);
+    tr->live -= size;
+    free(h);
+}
 
 static neox_node group_node(neox_device *dev, neox_scene sc)
 {
@@ -220,6 +247,40 @@ int main(void)
 
     neox_device_destroy(dev);
     neox_context_destroy(ctx);
-    puts("ALL PASS (scene depth limit and iterative teardown)");
+
+    {
+        scene_tracker tr = {0};
+        neox_allocator allocator = { &tr, scene_alloc, scene_free };
+        neox_context_desc desc = { &allocator, 0, 0 };
+        size_t allocs;
+        OK(neox_context_create(&desc, &ctx));
+        OK(neox_device_create(ctx, NULL, &dev));
+        sc = neox_scene_create(dev);
+        CHECK(sc.id != 0);
+        {
+            neox_node top = build_chain(dev, sc, 128);
+            allocs = tr.allocs;
+            tr.fail = 1;
+            neox_node_release(dev, top);
+            CHECK(tr.allocs == allocs);
+            tr.fail = 0;
+        }
+        (void)build_chain(dev, sc, 128);
+        allocs = tr.allocs;
+        tr.fail = 1;
+        neox_scene_destroy(dev, sc);
+        CHECK(tr.allocs == allocs);
+        tr.fail = 0;
+        sc = neox_scene_create(dev);
+        CHECK(sc.id != 0);
+        (void)build_chain(dev, sc, 128);
+        allocs = tr.allocs;
+        tr.fail = 1;
+        neox_device_destroy(dev);
+        CHECK(tr.allocs == allocs);
+        neox_context_destroy(ctx);
+        CHECK(tr.live == 0);
+    }
+    puts("ALL PASS (scene depth limit and allocation-free iterative teardown)");
     return 0;
 }

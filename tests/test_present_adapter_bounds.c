@@ -3,6 +3,7 @@
 #include "../src/present_wl.c"
 #include "../src/present_x11.c"
 #include <float.h>
+#include <stdarg.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); exit(1); } } while (0)
 #define OK(x) CHECK((x)==NEOX_OK)
 static int native_resizes, native_syncs;
@@ -18,11 +19,13 @@ struct fake_marshal_rec {
     void *args[8];
 };
 static struct fake_marshal_rec *g_marshals;
+static int native_marshals;
 static void *capture_marshal(void *proxy, uint32_t op,
                              const struct wl_interface *iface, uint32_t ver,
                              uint32_t flags, ...)
 {
     (void)flags;
+    native_marshals++;
     if (g_marshals) {
         g_marshals->proxy = proxy;
         g_marshals->op = op;
@@ -30,6 +33,25 @@ static void *capture_marshal(void *proxy, uint32_t op,
         g_marshals->ver = ver;
     }
     return (void *)(uintptr_t)0x9000;
+}
+static void *output_marshal(void *proxy, uint32_t op,
+                            const struct wl_interface *iface, uint32_t ver,
+                            uint32_t flags, ...)
+{
+    uint32_t name;
+    va_list ap;
+    (void)proxy; (void)op; (void)iface; (void)ver; (void)flags;
+    va_start(ap, flags);
+    name = va_arg(ap, uint32_t);
+    va_end(ap);
+    return (void *)(uintptr_t)name;
+}
+static int native_destroys;
+static void *last_destroyed;
+static void capture_destroy(void *proxy)
+{
+    native_destroys++;
+    last_destroyed = proxy;
 }
 struct fake_listen_rec {
     void *proxy;
@@ -224,6 +246,43 @@ int main(void)
         g_listens = NULL;
     }
 
+    {
+        PFN_marshal saved_marshal = g_wl.marshal;
+        PFN_listen saved_listen = g_wl.listen;
+        PFN_pdestroy saved_destroy = g_wl.destroy;
+        nx_wl outputs = {0};
+        neox_window ww = {0};
+        void *first = (void *)(uintptr_t)41;
+        void *second = (void *)(uintptr_t)42;
+        outputs.win = &ww;
+        outputs.opened = 1;
+        outputs.surf_ver = 4;
+        OK(nx_win_set_geometry(&ww, 8, 8, 1));
+        g_wl.marshal = output_marshal;
+        g_wl.listen = capture_listen;
+        g_wl.destroy = capture_destroy;
+        g_listens = NULL;
+        on_global(&outputs, sentinel, 41, "wl_output", 2);
+        on_global(&outputs, sentinel, 42, "wl_output", 2);
+        CHECK(outputs.noutputs == 2 && outputs.outputs[0] == first && outputs.outputs[1] == second);
+        on_out_scale(&outputs, first, 2);
+        on_out_scale(&outputs, second, 3);
+        on_surf_enter(&outputs, NULL, second);
+        CHECK(outputs.enter_output == second && outputs.output_scale == 3 && ww.scale == 3);
+        native_destroys = 0;
+        on_global_remove(&outputs, NULL, 42);
+        CHECK(native_destroys == 1 && last_destroyed == second);
+        CHECK(outputs.noutputs == 1 && outputs.outputs[0] == first && outputs.output_names[0] == 41);
+        CHECK(outputs.enter_output == NULL && outputs.output_scale == 2 && ww.scale == 2);
+        on_global_remove(&outputs, NULL, 99);
+        CHECK(native_destroys == 1 && outputs.noutputs == 1);
+        on_surf_enter(&outputs, NULL, first);
+        CHECK(outputs.enter_output == first && outputs.output_scale == 2);
+        g_wl.marshal = saved_marshal;
+        g_wl.listen = saved_listen;
+        g_wl.destroy = saved_destroy;
+    }
+
     /* 评审 4489969158：两个槽都在合成器手里时，present 必须返回可重试的
      * BACKEND 错误，且不写任何 busy 槽（P2-2）；连接已死时同样返回失败
      * 而不是"成功但没上屏"（P1-4）。这里用真实的 wl_present_soft。 */
@@ -256,6 +315,37 @@ int main(void)
         wp.dead = 1;
         CHECK(wl_present_soft(&ww) == NEOX_ERROR_BACKEND);
         CHECK(wp.busy[0] && wp.busy[1]);
+    }
+
+    {
+        nx_wl wp = {0};
+        neox_window ww = {0};
+        uint8_t frame[8 * 8 * 4] = {0};
+        PFN_marshal saved_marshal = g_wl.marshal;
+        void *mapping = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(mapping != MAP_FAILED);
+        wp.pool = sentinel;
+        wp.map = mapping;
+        wp.map_bytes = 4096;
+        wp.buf_w = wp.buf_h = 4;
+        wp.shm_fd = -1;
+        wp.busy[0] = wp.busy[1] = 1;
+        wp.bufs[0] = (void *)(uintptr_t)0x40;
+        wp.bufs[1] = (void *)(uintptr_t)0x41;
+        ww.plat = &wp;
+        ww.soft_px = frame;
+        ww.px_w = ww.px_h = 8;
+        g_wl.marshal = capture_marshal;
+        g_marshals = NULL;
+        native_marshals = 0;
+        CHECK(wl_present_soft(&ww) == NEOX_ERROR_BACKEND);
+        CHECK(native_marshals == 0);
+        CHECK(wp.map == mapping && wp.map_bytes == 4096 && wp.pool == sentinel);
+        CHECK(wp.buf_w == 4 && wp.buf_h == 4 && wp.busy[0] && wp.busy[1]);
+        CHECK(wp.bufs[0] == (void *)(uintptr_t)0x40 && wp.bufs[1] == (void *)(uintptr_t)0x41);
+        g_wl.marshal = saved_marshal;
+        CHECK(munmap(mapping, 4096) == 0);
     }
 
     /* 评审 4489969168：viewable 等待必须有界且失败时返回明确错误码（不是把

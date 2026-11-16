@@ -362,6 +362,7 @@ typedef struct nx_wl {
     int surf_enter_ready;      /* 已注册 enter/leave */
     int output_scale;          /* 当前 output 的整数 scale；0 = 未知（P1-6） */
     void *outputs[NX_WL_OUTPUTS]; /* 绑定的全部 wl_output（P1-6） */
+    uint32_t output_names[NX_WL_OUTPUTS];
     int output_scales[NX_WL_OUTPUTS];
     int noutputs;
     const void *enter_output;  /* wl_surface.enter 的当前 output（v1+） */
@@ -755,8 +756,10 @@ static void output_destroy(nx_wl *p, int i)
     if (out == p->enter_output) p->enter_output = NULL;
     if (g_wl.destroy && out) g_wl.destroy(out);
     p->outputs[i] = p->outputs[p->noutputs - 1];
+    p->output_names[i] = p->output_names[p->noutputs - 1];
     p->output_scales[i] = p->output_scales[p->noutputs - 1];
     p->outputs[p->noutputs - 1] = NULL;
+    p->output_names[p->noutputs - 1] = 0;
     p->output_scales[p->noutputs - 1] = 0;
     p->noutputs--;
 }
@@ -1032,6 +1035,7 @@ static void on_global(void *data, void *registry, uint32_t name,
         if (!out) return;
         g_wl.listen(out, (void *)&lis, p);
         p->outputs[p->noutputs] = out;
+        p->output_names[p->noutputs] = name;
         p->output_scales[p->noutputs] = 0;
         p->noutputs++;
     }
@@ -1039,7 +1043,25 @@ static void on_global(void *data, void *registry, uint32_t name,
 
 static void on_global_remove(void *data, void *registry, uint32_t name)
 {
-    (void)data; (void)registry; (void)name;
+    nx_wl *p = (nx_wl *)data;
+    int i;
+    (void)registry;
+    for (i = 0; i < p->noutputs; i++) {
+        int current;
+        if (p->output_names[i] != name) continue;
+        current = p->outputs[i] == p->enter_output;
+        output_destroy(p, i);
+        if (current) {
+            p->output_scale = 0;
+            for (i = 0; i < p->noutputs; i++) {
+                if (p->output_scales[i] > 0) {
+                    follow_output(p, p->outputs[i]);
+                    break;
+                }
+            }
+        }
+        return;
+    }
 }
 
 static void on_buf_release(void *data, void *buf)
@@ -1069,6 +1091,10 @@ static neox_result ensure_pool(nx_wl *p, uint32_t w, uint32_t h)
     }
     bytes *= 2u;
     if (p->pool && p->buf_w == w && p->buf_h == h && p->map) return NEOX_OK;
+    if (p->busy[0] || p->busy[1]) {
+        nx_win_set_error("Wayland: cannot resize shared buffers still held by the compositor");
+        return NEOX_ERROR_BACKEND;
+    }
     drop_buffers(p);
     p->shm_fd = memfd_new(bytes);
     if (p->shm_fd < 0) {

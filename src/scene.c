@@ -78,13 +78,6 @@ neox_scene neox_scene_create(neox_device *dev)
     return (neox_scene){ nx_make_handle(dev->id, NX_TYPE_SCENE, sidx, sc->gen) };
 }
 
-/* 释放一棵子树。显式栈（迭代）而不是递归：场景树的深度只受节点数量限制，
- * 深层链在默认线程栈上会栈溢出（P1-11）。释放发生在销毁路径上、不能失败，
- * 所以工作栈直接向系统堆要内存（不占 neox 内存预算，也不计入内存统计）。
- *
- * 顺序与"后序递归"完全一致：先处理完所有孩子、最后释放父节点。这样孩子
- * 槽位可能被复用，但父亲的孩子列表在真正释放前一直有效；父节点最后释放，
- * 因而不会读到已释放的孩子列表。 */
 static void node_free_one(neox_device *dev, uint32_t idx)
 {
     neox_context *ctx = dev->ctx;
@@ -96,57 +89,21 @@ static void node_free_one(neox_device *dev, uint32_t idx)
     nx_table_release(ctx, &dev->nodes, idx);
 }
 
-typedef struct nx_free_frame {
-    uint32_t node;
-    uint32_t next_child;
-} nx_free_frame;
-
-/* 按"父先于子"释放整棵子树（也是递归释放的逆后序）。注意不能在遍历的
- * 同时读父亲的孩子列表：nx_table_alloc 复用空闲槽前可能扩容槽数组并移动
- * slots，而祖先的孩子列表里仍是旧下标的"正确"值——所以顺序必须是先拷贝
- * 一层孩子、再释放父亲，然后才处理孩子。 */
 static void node_free_subtree(neox_device *dev, uint32_t idx)
 {
-    size_t cap = 64, n = 0;
-    uint32_t *work = (uint32_t *)malloc(cap * sizeof(uint32_t));
-    if (!work) {
-        /* 工作队列分配失败：只释放根节点（泄漏优于崩溃）。 */
-        node_free_one(dev, idx);
-        return;
-    }
-    work[n++] = idx;
-    while (n > 0) {
-        uint32_t cur = work[--n];
-        nx_node_slot *sn = &((nx_node_slot *)dev->nodes.slots)[cur];
-        uint32_t nc = sn->child_count, k;
-        if (nc) {
-            /* 先拷贝孩子下标，再释放父亲（父亲释放会归还孩子列表内存）。 */
-            uint32_t *kids = (uint32_t *)malloc((size_t)nc * sizeof(uint32_t));
-            if (kids) memcpy(kids, sn->children, (size_t)nc * sizeof(uint32_t));
-            node_free_one(dev, cur);
-            if (!kids) continue; /* 极端内存压力：放弃这棵子树 */
-            if (n + nc > cap) {
-                size_t ncap = cap;
-                uint32_t *nw;
-                while (ncap < n + nc) ncap *= 2;
-                nw = (uint32_t *)realloc(work, ncap * sizeof(uint32_t));
-                if (!nw) {
-                    /* 放弃剩余孩子（泄漏优于崩溃） */
-                    for (k = 0; k < nc; k++) { (void)k; }
-                    free(kids);
-                    continue;
-                }
-                work = nw;
-                cap = ncap;
-            }
-            memcpy(work + n, kids, (size_t)nc * sizeof(uint32_t));
-            n += nc;
-            free(kids);
+    uint32_t cur = idx;
+    for (;;) {
+        nx_node_slot *n = &((nx_node_slot *)dev->nodes.slots)[cur];
+        uint32_t parent;
+        if (n->child_count) {
+            cur = n->children[--n->child_count];
             continue;
         }
+        parent = n->parent;
         node_free_one(dev, cur);
+        if (cur == idx) break;
+        cur = parent;
     }
-    free(work);
 }
 
 void neox_scene_destroy(neox_device *dev, neox_scene scene)

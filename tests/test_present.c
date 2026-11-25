@@ -65,7 +65,7 @@ static int pix_near(const uint8_t *p, int r, int g, int b)
     return dr <= 3 && dg <= 3 && db <= 3 && p[3] >= 250;
 }
 
-static int draw_bars(neox_window *win, neox_device *dev)
+static int draw_bars_opt(neox_window *win, neox_device *dev, int request_readback)
 {
     neox_target_desc td;
     neox_frame *fr = NULL;
@@ -126,7 +126,9 @@ static int draw_bars(neox_window *win, neox_device *dev)
         return 0;
     }
     neox_submission_release(dev,sub);
-    if (neox_window_request_readback(win) != NEOX_OK) return 0;
+    /* 契约：普通 present 不捕获；只有显式 request 之后的那次 present 才
+     * 留下可读回的窗口像素（include/neox_present.h）。 */
+    if (request_readback && neox_window_request_readback(win) != NEOX_OK) return 0;
     if (neox_window_present(win) != NEOX_OK) {
         fprintf(stderr, "present: %s\n", neox_window_last_error());
         return 0;
@@ -134,6 +136,11 @@ static int draw_bars(neox_window *win, neox_device *dev)
     neox_path_release(dev, top);
     neox_path_release(dev, bot);
     return 1;
+}
+
+static int draw_bars(neox_window *win, neox_device *dev)
+{
+    return draw_bars_opt(win, dev, 1);
 }
 
 static int check_orientation(neox_window *win, const char *tag)
@@ -207,13 +214,20 @@ static void run_backend(neox_context *ctx, neox_backend_kind kind, const char *t
     expect(draw_bars(win, dev), "draw/present");
     check_orientation(win, tag);
     if (kind==NEOX_BACKEND_GPU) {
-        /* A regular present must not silently capture or expose an old snapshot. */
-        expect(neox_window_present(win)==NEOX_OK,"ordinary present");
+        /* 契约：普通 present 不捕获窗口像素——没有 request 时的读回是
+         * UNSUPPORTED；request 之后的那次 present 才可读回，且内容就是
+         * 刚上屏的那一帧（显式 request 路径的正确性保留）。 */
+        expect(draw_bars_opt(win,dev,0),"ordinary present (no capture)");
         uint8_t *pixels=malloc((size_t)px_w*px_h*4);
         expect(pixels!=NULL,"snapshot check allocation");
         if(pixels) {
             expect(neox_window_read_pixels(win,pixels)==NEOX_ERROR_UNSUPPORTED,
-                   "ordinary present invalidates explicit snapshot");
+                   "read_pixels after ordinary present is UNSUPPORTED");
+            expect(draw_bars(win,dev),"present after request_readback");
+            expect(neox_window_read_pixels(win,pixels)==NEOX_OK,
+                   "read_pixels after an explicit request returns the frame");
+            expect(pix_near(pixels + ((size_t)px_w*2u + px_w/2u)*4u, 255, 0, 0),
+                   "readback after explicit request shows the red bar");
             free(pixels);
         }
     }

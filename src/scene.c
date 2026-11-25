@@ -28,6 +28,26 @@ static void node_mark_dirty(neox_device *dev, uint32_t idx, uint32_t bits)
     }
 }
 
+static void node_refresh_heights(neox_device *dev, uint32_t idx);
+static void node_mark_dirty(neox_device *dev, uint32_t idx, uint32_t bits);
+
+/* §10.1：场景树深度上限。渲染与释放路径都只受节点数量限制，过深的树在
+ * 递归遍历（render）或默认线程栈上会溢出；这里用统一的显式上限，超限的
+ * render 返回 NEOX_ERROR_UNSUPPORTED（P1-11）。 */
+#define NX_SCENE_MAX_DEPTH 4096u
+
+/* 自 idx 沿父链走到场景根，返回边数（根为 0）。父链最长 nodes.count。 */
+static uint32_t node_depth(neox_device *dev, uint32_t idx)
+{
+    uint32_t d = 0, guard = 0;
+    for (;;) {
+        nx_node_slot *n = &((nx_node_slot *)dev->nodes.slots)[idx];
+        if (n->parent == idx) return d;
+        if (++d > dev->nodes.count || ++guard > dev->nodes.count) return d;
+        idx = n->parent;
+    }
+}
+
 neox_scene neox_scene_create(neox_device *dev)
 {
     neox_context *ctx;
@@ -58,18 +78,32 @@ neox_scene neox_scene_create(neox_device *dev)
     return (neox_scene){ nx_make_handle(dev->id, NX_TYPE_SCENE, sidx, sc->gen) };
 }
 
-static void node_free_subtree(neox_device *dev, uint32_t idx)
+static void node_free_one(neox_device *dev, uint32_t idx)
 {
     neox_context *ctx = dev->ctx;
     nx_node_slot *n = &((nx_node_slot *)dev->nodes.slots)[idx];
-    uint32_t i;
-    for (i = 0; i < n->child_count; i++)
-        node_free_subtree(dev, n->children[i]);
     if (n->children) nx_free(ctx, n->children, (size_t)n->child_cap * 4, 16);
     if (n->kind == NEOX_NODE_GLYPHS && n->u.glyphs.glyphs)
         nx_free(ctx, n->u.glyphs.glyphs,
                 (size_t)n->u.glyphs.count * sizeof(neox_glyph), 16);
     nx_table_release(ctx, &dev->nodes, idx);
+}
+
+static void node_free_subtree(neox_device *dev, uint32_t idx)
+{
+    uint32_t cur = idx;
+    for (;;) {
+        nx_node_slot *n = &((nx_node_slot *)dev->nodes.slots)[cur];
+        uint32_t parent;
+        if (n->child_count) {
+            cur = n->children[--n->child_count];
+            continue;
+        }
+        parent = n->parent;
+        node_free_one(dev, cur);
+        if (cur == idx) break;
+        cur = parent;
+    }
 }
 
 void neox_scene_destroy(neox_device *dev, neox_scene scene)
@@ -108,7 +142,8 @@ neox_result neox_node_create(neox_device *dev, neox_scene scene,
     if (r != NEOX_OK) return r;
     if (desc->kind < NEOX_NODE_GROUP || desc->kind > NEOX_NODE_GLYPHS)
         NX_ERR(ctx, "invalid node kind", NEOX_ERROR_INVALID_ARGUMENT);
-    if (desc->blend > NEOX_BLEND_PLUS)
+    /* 负枚举值同样拒绝（P2-4）。 */
+    if ((unsigned)desc->blend > (unsigned)NEOX_BLEND_PLUS)
         NX_ERR(ctx, "invalid blend mode", NEOX_ERROR_INVALID_ARGUMENT);
     if (nx_float_bad(desc->opacity) || desc->opacity < 0.0f || desc->opacity > 1.0f)
         NX_ERR(ctx, "opacity out of range or NaN", NEOX_ERROR_INVALID_ARGUMENT);
@@ -254,6 +289,7 @@ void neox_node_release(neox_device *dev, neox_node node)
         }
         p->child_count = out;
         node_mark_dirty(dev, n->parent, NX_DIRTY_CHILDREN);
+        node_refresh_heights(dev, n->parent);
     }
     node_free_subtree(dev, idx);
 }
@@ -283,6 +319,10 @@ neox_result neox_node_append_child(neox_device *dev, neox_node parent,
         if (wn->parent == walk) break;
         walk = wn->parent;
     }
+    /* 深度上限（P1-11）：把 ci 挂到 pi 之下后，最深叶节点的深度为
+     * depth(pi)+1+height(ci)；超过上限返回 UNSUPPORTED 且不改动树。 */
+    if (node_depth(dev, pi) + 1u + c->height > NX_SCENE_MAX_DEPTH)
+        NX_ERR(ctx, "scene depth exceeds limit", NEOX_ERROR_UNSUPPORTED);
     /* Reserve before detaching so allocation failure preserves the tree. */
     uint32_t *nc = (uint32_t *)nx_array_grow(ctx, p->children, 4,
                                             &p->child_cap, p->child_count + 1);
@@ -290,16 +330,56 @@ neox_result neox_node_append_child(neox_device *dev, neox_node parent,
     p->children = nc;
     if (c->parent != ci) {
         nx_node_slot *op = &((nx_node_slot *)dev->nodes.slots)[c->parent];
-        uint32_t out = 0;
+        uint32_t out = 0, old_parent = c->parent;
         for (i = 0; i < op->child_count; i++)
             if (op->children[i] != ci) op->children[out++] = op->children[i];
         op->child_count = out;
-        node_mark_dirty(dev, c->parent, NX_DIRTY_CHILDREN);
+        node_mark_dirty(dev, old_parent, NX_DIRTY_CHILDREN);
+        /* 评审 4489969077：直接 reparent 时旧祖先的高度也要刷新，否则旧链上
+         * 的 height 继续把已经搬走的子树算进去。 */
+        node_refresh_heights(dev, old_parent);
     }
     p->children[p->child_count++] = ci;
     c->parent = pi;
     node_mark_dirty(dev, pi, NX_DIRTY_CHILDREN);
+    /* 更新祖先高度：从 pi 向上直到高度不再增长。 */
+    for (;;) {
+        nx_node_slot *an = &((nx_node_slot *)dev->nodes.slots)[pi];
+        uint32_t h = 0, k;
+        for (k = 0; k < an->child_count; k++) {
+            uint32_t ch = ((nx_node_slot *)dev->nodes.slots)[an->children[k]].height;
+            if (ch > h) h = ch;
+        }
+        {
+            uint32_t nh = h + 1;
+            uint32_t parent = an->parent;
+            if (!an->in_use || an->height == nh) break;
+            an->height = nh;
+            if (parent == pi) break;
+            pi = parent;
+        }
+    }
     return NEOX_OK;
+}
+
+/* 摘下一个孩子后刷新祖先高度（根为自身，停止）。 */
+static void node_refresh_heights(neox_device *dev, uint32_t idx)
+{
+    for (;;) {
+        nx_node_slot *an = &((nx_node_slot *)dev->nodes.slots)[idx];
+        uint32_t h = 0, k, parent, nh;
+        if (!an->in_use) return;
+        for (k = 0; k < an->child_count; k++)
+            if (((nx_node_slot *)dev->nodes.slots)[an->children[k]].height > h)
+                h = ((nx_node_slot *)dev->nodes.slots)[an->children[k]].height;
+        /* 空组也按叶算：0；有孩子则至少 1。 */
+        nh = an->child_count ? h + 1u : 0u;
+        if (an->height == nh) return;
+        an->height = nh;
+        parent = an->parent;
+        if (parent == idx) return;
+        idx = parent;
+    }
 }
 
 neox_result neox_node_remove_from_parent(neox_device *dev, neox_node child)
@@ -318,7 +398,15 @@ neox_result neox_node_remove_from_parent(neox_device *dev, neox_node child)
     }
     p->child_count = out;
     node_mark_dirty(dev, c->parent, NX_DIRTY_CHILDREN);
-    c->parent = ci;
+    {
+        uint32_t old_parent = c->parent;
+        c->parent = ci;
+        /* 评审 4489969077：摘下的节点仍带着整棵子树，height 必须保留，
+         * 否则之后 append 到别处时深度检查会把整棵子树当成 0 层，允许挂出
+         * 超过 NX_SCENE_MAX_DEPTH 的树、直到渲染才失败。这里只刷新旧祖先
+         * （根为自身，也是 "detached" 的标志）。 */
+        node_refresh_heights(dev, old_parent);
+    }
     return NEOX_OK;
 }
 
@@ -410,7 +498,8 @@ neox_result neox_node_set_visible(neox_device *dev, neox_node node, int visible)
 }
 
 /* scene_render：遍历节点树，发射与立即模式完全相同的命令流（§10.2-1 的构造性证明） */
-static neox_result scene_emit(neox_frame *fr, uint32_t idx, neox_affine parent_ctm)
+static neox_result scene_emit(neox_frame *fr, uint32_t idx, neox_affine parent_ctm,
+                              uint32_t depth)
 {
     neox_device *dev = fr->dev;
     nx_node_slot *n = &((nx_node_slot *)dev->nodes.slots)[idx];
@@ -418,6 +507,12 @@ static neox_result scene_emit(neox_frame *fr, uint32_t idx, neox_affine parent_c
     uint32_t i;
     neox_result r;
     if (!n->visible) return NEOX_OK;
+    /* 深度上限（P1-11）：渲染路径是递归的，超限的树返回 UNSUPPORTED，
+     * 而不是把线程栈压爆。 */
+    if (depth > NX_SCENE_MAX_DEPTH) {
+        dev->ctx->last_error = "scene depth exceeds limit";
+        return NEOX_ERROR_UNSUPPORTED;
+    }
     if (n->kind == NEOX_NODE_GROUP) {
         int32_t clip_idx = -1;
         uint64_t clip_id = 0;
@@ -428,16 +523,18 @@ static neox_result scene_emit(neox_frame *fr, uint32_t idx, neox_affine parent_c
             clip_idx = (int32_t)p;
             clip_id = n->u.group.clip_id;
         }
-        r = nx_emit_push(fr, ctm, n->opacity, n->blend, 0, clip_idx, clip_id);
+        /* 组节点始终隔离（§7.1）：force_isolate=1 保证建立组层，
+         * 组的 blend 在 POP 时作用于整层；立即 PUSH 可不建立隔离层。 */
+        r = nx_emit_push(fr, ctm, n->opacity, n->blend, 0, clip_idx, clip_id, 1);
         if (r != NEOX_OK) return r;
         for (i = 0; i < n->child_count; i++) {
-            r = scene_emit(fr, n->children[i], ctm);
+            r = scene_emit(fr, n->children[i], ctm, depth + 1);
             if (r != NEOX_OK) return r;
         }
         return nx_emit_pop(fr);
     }
     /* 叶子：push（transform/opacity/blend）→ 绘制 → pop */
-    r = nx_emit_push(fr, ctm, n->opacity, n->blend, 0, -1, 0);
+    r = nx_emit_push(fr, ctm, n->opacity, n->blend, 0, -1, 0, 0);
     if (r != NEOX_OK) return r;
     switch (n->kind) {
     case NEOX_NODE_PATH: {
@@ -497,7 +594,10 @@ neox_result neox_scene_render(neox_frame *frame, neox_scene scene, neox_node roo
     neox_capture *capture = dev->cap;
     staged.cmds = NULL; staged.cmd_count = staged.cmd_cap = staged.draw_calls = 0;
     dev->cap = NULL;
-    r = scene_emit(&staged, root_idx, frame->ctm_stack[frame->ctm_count - 1]);
+    /* 显式根节点的深度从它自根起算（含未渲染的祖先）只有可见性影响，
+     * 这里按场景根开始计数即可覆盖真实递归深度。 */
+    r = scene_emit(&staged, root_idx, frame->ctm_stack[frame->ctm_count - 1],
+                   node_depth(dev, root_idx));
     dev->cap = capture;
     return nx_frame_finish_staged(frame, &staged, capture, r);
 }

@@ -79,15 +79,18 @@ static void test_events(neox_window *w)
     pthread_t thread;CHECK(pthread_create(&thread,NULL,wrong_thread,NULL)==0);
     CHECK(pthread_join(thread,NULL)==0);
 }
-static void draw(neox_window *w,neox_device *dev,int snapshot)
+static void draw_color(neox_window *w,neox_device *dev,neox_color color,int snapshot)
 {
     neox_target_desc td={};neox_frame *fr=NULL;neox_submission sub={};
-    neox_color red={1,0,0,1};
-    OK(neox_window_acquire_target(w,dev,&td));td.clear=&red;
+    OK(neox_window_acquire_target(w,dev,&td));td.clear=&color;
     OK(neox_frame_begin(dev,&td,&fr));OK(neox_frame_end(fr,&sub));
     OK(neox_submission_wait(dev,sub));neox_submission_release(dev,sub);
     if(snapshot)OK(neox_window_request_readback(w));
     OK(neox_window_present(w));
+}
+static void draw(neox_window *w,neox_device *dev,int snapshot)
+{
+    draw_color(w,dev,(neox_color){1,0,0,1},snapshot);
 }
 static void test_target(neox_window *w,neox_context *ctx,neox_backend_kind kind)
 {
@@ -125,6 +128,19 @@ static void test_target(neox_window *w,neox_context *ctx,neox_backend_kind kind)
     CHECK(neox_window_present(w)==NEOX_ERROR_INVALID_ARGUMENT);
     CHECK(neox_window_read_pixels(w,pixels)==NEOX_ERROR_INVALID_ARGUMENT);
     draw(w,dev,1);
+    if(kind==NEOX_BACKEND_SOFT) {
+        draw_color(w,dev,(neox_color){0.5f,0.5f,0.5f,0.5f},1);
+        OK(neox_window_read_pixels(w,pixels));
+        CHECK(pixels[0]==128 && pixels[1]==128 && pixels[2]==128 && pixels[3]==128);
+        CGImageRef image=(CGImageRef)native_window().contentView.layer.contents;
+        CHECK(image!=NULL);
+        CFDataRef presented=CGDataProviderCopyData(CGImageGetDataProvider(image));
+        CHECK(presented!=NULL);
+        const uint8_t *shown=CFDataGetBytePtr(presented);
+        CHECK(CFDataGetLength(presented)>3);
+        CHECK(shown[0]==64 && shown[1]==64 && shown[2]==64 && shown[3]==255);
+        CFRelease(presented);
+    }
     OK(neox_window_acquire_target(w,dev,&td));
     if(kind==NEOX_BACKEND_GPU)CHECK(neox_window_read_pixels(w,pixels)==NEOX_ERROR_UNSUPPORTED);
     free(pixels);

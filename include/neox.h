@@ -109,7 +109,7 @@ typedef enum neox_filter {
 typedef struct neox_context_desc {
     const neox_allocator *allocator;  /* [borrow] NULL = 系统分配器 */
     uint64_t memory_budget;           /* 0 = 不限制；>0 时超预算分配即失败 */
-    uint32_t flags;                   /* 保留，须为 0 */
+    uint32_t flags;                   /* 保留，须为 0；非零 → NEOX_ERROR_INVALID_ARGUMENT */
 } neox_context_desc;
 
 neox_result neox_context_create(const neox_context_desc *desc, /* [borrow] */
@@ -139,7 +139,8 @@ typedef struct neox_gpu_memory_stats {
 } neox_gpu_memory_stats;
 neox_result neox_device_get_memory_stats(neox_device *dev, neox_gpu_memory_stats *out);
 uint32_t    neox_version(void);                                /* 0xMMmmpp */
-/* 最近一次错误的静态描述串（英文 ASCII，进程内常量）；无错误返回 NULL */
+/* 最近一次错误的静态描述串（英文 ASCII，进程内常量）；无错误返回 NULL。
+ * ctx 为 NULL 时返回"创建 context 前"的失败详情（例如 desc.flags 非零）。 */
 const char *neox_get_error_detail(neox_context *ctx);
 
 /* ------------------------------------------------------------------ 设备 */

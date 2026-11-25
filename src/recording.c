@@ -77,15 +77,19 @@ void nx_commands_free(neox_context *ctx, nx_cmd *cmds, uint32_t n)
     }
 }
 
-/* PUSH：owns_layer 的判定与帧期/执行期必须一致（组不透明度或裁剪 → 隔离层，§7） */
-static int push_needs_layer(float opacity, int32_t clip_idx)
+/* PUSH：owns_layer 与执行期一致（§7 与 §7.1，P1-8）。
+ * 立即模式 push_state 的 blend 是「子绘制混合」（§7.1），只在 opacity<1 或
+ * 有裁剪时建隔离层；场景组（force_isolate）始终隔离，组 blend 仅在 POP
+ * 组合成，组内子绘制 SRC_OVER（nx_exec_isolated_blend）。 */
+static int push_needs_layer(float opacity, int32_t clip_idx, int force_isolate)
 {
-    return opacity < 1.0f || clip_idx >= 0;
+    return force_isolate || opacity < 1.0f || clip_idx >= 0;
 }
 
 neox_result nx_emit_push(neox_frame *fr, neox_affine ctm, float opacity,
                              neox_blend blend, uint32_t flags,
-                             int32_t clip_idx, uint64_t clip_id)
+                             int32_t clip_idx, uint64_t clip_id,
+                             int force_isolate)
 {
     neox_device *dev = fr->dev;
     neox_context *ctx = dev->ctx;
@@ -94,6 +98,12 @@ neox_result nx_emit_push(neox_frame *fr, neox_affine ctm, float opacity,
      * Reject before allocating masks, publishing commands or touching CAP. */
     if (!nx_affine_is_finite(ctm))
         NX_ERR(ctx, "composed transform exceeds numeric range", NEOX_ERROR_INVALID_ARGUMENT);
+    /* P1-9 / P2-4：每个前端最终都经过这里，未定义 flags 或负 blend 在此统一
+     * 拒绝（CAP 回放同样经此；与 capture.c 的预校验一致）。 */
+    if (flags & ~NEOX_ALLOW_APPROXIMATE)
+        NX_ERR(ctx, "undefined state flags", NEOX_ERROR_INVALID_ARGUMENT);
+    if ((unsigned)blend > (unsigned)NEOX_BLEND_PLUS)
+        NX_ERR(ctx, "invalid blend mode", NEOX_ERROR_INVALID_ARGUMENT);
     /* The mean is bounded by twice the largest coefficient. Keep ordinary
      * recording free of the distance-field square root. */
     if ((fabsf(ctm.a) > FLT_MAX*0.5f || fabsf(ctm.b) > FLT_MAX*0.5f ||
@@ -108,7 +118,7 @@ neox_result nx_emit_push(neox_frame *fr, neox_affine ctm, float opacity,
     c.flags = flags;
     c.clip_idx = clip_idx;
     c.clip_id = clip_id;
-    c.owns_layer = push_needs_layer(opacity, clip_idx);
+    c.owns_layer = push_needs_layer(opacity, clip_idx, force_isolate);
     neox_result r = frame_append_cmd(fr, &c);
     if (r != NEOX_OK) nx_commands_free(ctx,&c,1);
     return r;
@@ -275,8 +285,14 @@ neox_result neox_push_state(neox_frame *frame, const neox_state *state)
         NX_ERR(ctx, "state is NULL", NEOX_ERROR_INVALID_ARGUMENT);
     if (nx_float_bad(state->opacity) || state->opacity < 0.0f || state->opacity > 1.0f)
         NX_ERR(ctx, "opacity out of range or NaN", NEOX_ERROR_INVALID_ARGUMENT);
-    if (state->blend > NEOX_BLEND_PLUS)
+    /* 负的枚举值（以 int 传入负数的 neox_blend）必须同样被拒绝：与有符号 0
+     * 比较会让 -1 通过（P2-4）。 */
+    if ((unsigned)state->blend > (unsigned)NEOX_BLEND_PLUS)
         NX_ERR(ctx, "invalid blend mode", NEOX_ERROR_INVALID_ARGUMENT);
+    /* 立即模式与 CAP 回放使用同一 flags 契约（P1-9）：只接受已定义的位，
+     * 未定义位一律 INVALID_ARGUMENT，而不是录制下来后回放时被拒。 */
+    if (state->flags & ~NEOX_ALLOW_APPROXIMATE)
+        NX_ERR(ctx, "undefined state flags", NEOX_ERROR_INVALID_ARGUMENT);
     {
         const float *m = &state->transform.a;
         uint32_t i;
@@ -303,7 +319,7 @@ neox_result neox_push_state(neox_frame *frame, const neox_state *state)
         frame->ctm_stack[frame->ctm_count++] = ctm;
     }
     r = nx_emit_push(frame, ctm, state->opacity, state->blend, state->flags,
-                  clip_idx, clip_id);
+                  clip_idx, clip_id, 0);
     if (r != NEOX_OK) {
         frame->ctm_count--; /* 不留半完成状态（§10.1） */
         return r;

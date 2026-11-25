@@ -20,6 +20,7 @@ typedef struct nx_cocoa {
     NXView *view;
     NXWindowDelegate *delegate;
     CGImageRef image;
+    CFDataRef readback;
     uint32_t image_w, image_h;
     uint32_t geometry_w, geometry_h;
     float geometry_scale;
@@ -147,6 +148,7 @@ static void cocoa_close(neox_window *w)
         [p->window orderOut:nil];[p->window close];
         [p->window release];[p->delegate release];[p->view release];
         if(p->image)CGImageRelease(p->image);
+        if(p->readback)CFRelease(p->readback);
 #if NEOX_ENABLE_METAL
         [p->metal_layer release];free(p->snapshot);
 #endif
@@ -183,15 +185,31 @@ static neox_result cocoa_soft(neox_window *w)
     if(w->dev->active_frame || w->dev->pending_count)return NEOX_ERROR_INVALID_ARGUMENT;
     nx_cocoa *p=(nx_cocoa *)w->plat;
     @autoreleasepool {
-        CFDataRef data=CFDataCreate(kCFAllocatorDefault,w->soft_px,(CFIndex)((size_t)w->px_w*w->px_h*4));
-        if(!data)return NEOX_ERROR_OUT_OF_MEMORY;
-        CGDataProviderRef provider=CGDataProviderCreateWithCFData(data);CFRelease(data);
+        size_t bytes=(size_t)w->px_w*w->px_h*4;
+        CFDataRef original=CFDataCreate(kCFAllocatorDefault,w->soft_px,(CFIndex)bytes);
+        if(!original)return NEOX_ERROR_OUT_OF_MEMORY;
+        CFMutableDataRef presented=CFDataCreateMutableCopy(kCFAllocatorDefault,(CFIndex)bytes,original);
+        if(!presented){CFRelease(original);return NEOX_ERROR_OUT_OF_MEMORY;}
+        uint8_t *pixels=CFDataGetMutableBytePtr(presented);
+        for(size_t i=0;i<bytes;i+=4){
+            unsigned a=pixels[i+3];
+            pixels[i]=(uint8_t)(pixels[i]*a/255u);
+            pixels[i+1]=(uint8_t)(pixels[i+1]*a/255u);
+            pixels[i+2]=(uint8_t)(pixels[i+2]*a/255u);
+            pixels[i+3]=255;
+        }
+        CGDataProviderRef provider=CGDataProviderCreateWithCFData(presented);CFRelease(presented);
+        if(!provider){CFRelease(original);return NEOX_ERROR_OUT_OF_MEMORY;}
         CGColorSpaceRef color=CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        if(!color){CGDataProviderRelease(provider);CFRelease(original);return NEOX_ERROR_OUT_OF_MEMORY;}
         CGImageRef image=CGImageCreate(w->px_w,w->px_h,8,32,(size_t)w->px_w*4,color,
             kCGImageAlphaNoneSkipLast|kCGBitmapByteOrder32Big,provider,NULL,false,kCGRenderingIntentDefault);
         CGColorSpaceRelease(color);CGDataProviderRelease(provider);
-        if(!image)return NEOX_ERROR_OUT_OF_MEMORY;
-        if(p->image)CGImageRelease(p->image);p->image=image;p->image_w=w->px_w;p->image_h=w->px_h;
+        if(!image){CFRelease(original);return NEOX_ERROR_OUT_OF_MEMORY;}
+        if(p->image)CGImageRelease(p->image);
+        if(p->readback)CFRelease(p->readback);
+        p->image=image;p->readback=original;p->image_w=w->px_w;p->image_h=w->px_h;
+        p->view.layer.opaque=YES;
         p->view.layer.contents=(id)image;p->view.layer.contentsGravity=kCAGravityResize;
         [CATransaction flush];return NEOX_OK;
     }
@@ -199,10 +217,9 @@ static neox_result cocoa_soft(neox_window *w)
 static int cocoa_read(neox_window *w,uint8_t *out)
 {
     nx_cocoa *p=(nx_cocoa *)w->plat;
-    if(!p->image || p->image_w!=w->px_w || p->image_h!=w->px_h)return -1;
-    CFDataRef data=CGDataProviderCopyData(CGImageGetDataProvider(p->image));
-    if(!data)return -1;
-    memcpy(out,CFDataGetBytePtr(data),(size_t)w->px_w*w->px_h*4);CFRelease(data);return 0;
+    if(!p->readback || p->image_w!=w->px_w || p->image_h!=w->px_h)return -1;
+    memcpy(out,CFDataGetBytePtr(p->readback),(size_t)w->px_w*w->px_h*4);
+    return 0;
 }
 #if NEOX_ENABLE_METAL
 static int current(neox_window *w)
@@ -264,9 +281,13 @@ static neox_result cocoa_gpu_read(neox_window *w,uint8_t *out)
 }
 static void cocoa_gpu_detach(neox_window *w)
 {
-    nx_cocoa *p=(nx_cocoa *)w->plat;p->surface=NULL;p->width=p->height=0;p->target_valid=p->capture=p->captured=0;
+    /* Soft detach 保留 image/图层：present.c 只在 is_gpu 时调用本函数，
+     * 这里再防御一次（P2-3）。 */
+    nx_cocoa *p=(nx_cocoa *)w->plat;if(!w->is_gpu || !p)return;
+    p->surface=NULL;p->width=p->height=0;p->target_valid=p->capture=p->captured=0;
     @autoreleasepool {p->view.layer=[CALayer layer];[p->metal_layer release];p->metal_layer=nil;}
     if(p->image){CGImageRelease(p->image);p->image=NULL;}
+    if(p->readback){CFRelease(p->readback);p->readback=NULL;}
 }
 static const nx_win_gpu_vt gpu={cocoa_gpu_create,cocoa_gpu_acquire,cocoa_gpu_present,cocoa_gpu_request,cocoa_gpu_read,cocoa_gpu_detach};
 #else

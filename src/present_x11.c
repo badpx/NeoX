@@ -118,14 +118,73 @@ static struct {
 
 static int g_handlers;
 
+/* 加载状态：未尝试 / 成功 / 失败。校验失败时 dlclose 并清空整张函数表，
+ * 绝不让第二次调用把第一次的失败当成成功。 */
+enum { NX_X_LOAD_UNTRIED = 0, NX_X_LOAD_OK = 1, NX_X_LOAD_FAILED = 2 };
+static int g_x_state = NX_X_LOAD_UNTRIED;
+
+#ifndef NX_TEST_HOOK_DLOPEN
+#define NX_TEST_HOOK_DLOPEN 0
+#endif
+#if NX_TEST_HOOK_DLOPEN
+extern void *nx_test_x11_dlopen(const char *name, int flags);
+extern void *nx_test_x11_dlsym(void *handle, const char *symbol);
+#define nx_x_dlopen(n, f) nx_test_x11_dlopen((n), (f))
+#define nx_x_dlsym(h, s) nx_test_x11_dlsym((h), (s))
+#else
+#define nx_x_dlopen(n, f) dlopen((n), (f))
+#define nx_x_dlsym(h, s) dlsym((h), (s))
+#endif
+#if NX_TEST_HOOK_DLOPEN
+extern int nx_test_x11_dlclose(void *handle);
+#define nx_x_dlclose(h) nx_test_x11_dlclose((h))
+#else
+#define nx_x_dlclose(h) ((h) ? dlclose((h)) : 0)
+#endif
+
+/* Xlib 的请求错误处理器是进程级全局状态：任何一次 X 请求失败都会到这里。
+ * 协议错误不能被吞掉（P1-3）：记下"自上次 XSync 之后发生过错误"以及失败的
+ * 请求序号，呈现/读回路径在 XSync 之后比较并返回 NEOX_ERROR_BACKEND。 */
+static uint32_t g_x_errors;
+static uint32_t g_x_last_error;
+static uint32_t g_x_last_code;
+
 static int on_xerr(void *dpy, void *ev)
 {
     const unsigned char *e = (const unsigned char *)ev;
     unsigned char code = e ? e[32] : 0;
     unsigned char req = e ? e[33] : 0;
     (void)dpy;
-    fprintf(stderr, "X error code=%u request=%u\n", code, req);
+    g_x_errors++;
+    g_x_last_error = req;
+    g_x_last_code = code;
+    /* 错误详情经 x11_take_error 进入窗口错误串（nx_win_set_error），不再
+     * 无条件写 stderr：多窗口/并行测试下会刷屏，也无法被调用方处理。 */
+    (void)code;
     return 0;
+}
+
+/* XSync 之前取一次代数；之后比较：有变化即说明本次请求序列里出现过
+ * 协议错误。错误处理器返回 0 表示已处理，Xlib 不会终止进程。 */
+static uint32_t x11_error_mark(void) { return g_x_errors; }
+
+static int x11_take_error(uint32_t mark, const char *what)
+{
+    if (g_x_errors == mark) return 0;
+    {
+        char buf[128];
+        snprintf(buf, sizeof buf,
+                 "X11: %s failed (X protocol error %u, request %u)",
+                 what, (unsigned)g_x_last_code, (unsigned)g_x_last_error);
+        nx_win_set_error(buf);
+    }
+    return 1;
+}
+
+static neox_result x11_sync_or_fail(void *dpy, uint32_t mark, const char *what)
+{
+    g_x.sync(dpy, 0);
+    return x11_take_error(mark, what) ? NEOX_ERROR_BACKEND : NEOX_OK;
 }
 
 static int on_xio(void *dpy)
@@ -134,11 +193,19 @@ static int on_xio(void *dpy)
     return 0;
 }
 
+static void unload_x11(void)
+{
+    if (g_x.lib) nx_x_dlclose(g_x.lib);
+    memset(&g_x, 0, sizeof g_x);
+    g_x_state = NX_X_LOAD_FAILED;
+}
+
 static int load_x11(void)
 {
-    if (g_x.lib) return 1;
-    g_x.lib = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
-    if (!g_x.lib) g_x.lib = dlopen("libX11.so", RTLD_NOW | RTLD_LOCAL);
+    if (g_x_state == NX_X_LOAD_OK && g_x.lib) return 1;
+    g_x_state = NX_X_LOAD_FAILED;
+    g_x.lib = nx_x_dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+    if (!g_x.lib) g_x.lib = nx_x_dlopen("libX11.so", RTLD_NOW | RTLD_LOCAL);
     if (!g_x.lib) {
         const char *de = dlerror();
         char buf[256];
@@ -149,7 +216,7 @@ static int load_x11(void)
     }
 #define NX_DLSYM(field, type, sym) do { \
         union { void *vp; type fp; } u_; \
-        u_.vp = dlsym(g_x.lib, sym); \
+        u_.vp = nx_x_dlsym(g_x.lib, sym); \
         g_x.field = u_.fp; \
     } while (0)
     NX_DLSYM(open, PFN_open, "XOpenDisplay");
@@ -197,6 +264,7 @@ static int load_x11(void)
         !g_x.keysym || !g_x.visual || !g_x.depth || !g_x.black || !g_x.destroy ||
         !g_x.cwin || !g_x.cmap || !g_x.vinfo || !g_x.xfree ||
         !g_x.getattr || !g_x.hints) {
+        unload_x11();
         nx_win_set_error("X11: libX11 is missing a required entry point");
         return 0;
     }
@@ -205,6 +273,7 @@ static int load_x11(void)
         g_x.setio(on_xio);
         g_handlers = 1;
     }
+    g_x_state = NX_X_LOAD_OK;
     return 1;
 }
 
@@ -415,10 +484,14 @@ static neox_result decorate(nx_x11 *p, neox_window *w)
     p->wm_delete = g_x.atom(p->dpy, "WM_DELETE_WINDOW", 0);
     g_x.proto(p->dpy, p->win, &p->wm_delete, 1);
     g_x.name(p->dpy, p->win, w->title);
-    g_x.select(p->dpy, p->win, mask);
-    apply_size_hints(p, w);
-    g_x.map(p->dpy, p->win);
-    g_x.sync(p->dpy, 0);
+    {
+        uint32_t mark = x11_error_mark();
+        g_x.select(p->dpy, p->win, mask);
+        apply_size_hints(p, w);
+        g_x.map(p->dpy, p->win);
+        if (x11_sync_or_fail(p->dpy, mark, "mapping the window") != NEOX_OK)
+            return NEOX_ERROR_BACKEND;
+    }
     return x11_wait_ready(w);
 }
 
@@ -661,8 +734,11 @@ static neox_result x11_resize(neox_window *w, uint32_t pt_w, uint32_t pt_h)
         return NEOX_ERROR_INVALID_ARGUMENT;
     }
     apply_size_hints(p, w);
-    g_x.resize(p->dpy, p->win, w->px_w, w->px_h);
-    g_x.sync(p->dpy, 0);
+    {
+        uint32_t mark = x11_error_mark();
+        g_x.resize(p->dpy, p->win, w->px_w, w->px_h);
+        if (x11_sync_or_fail(p->dpy, mark, "XResizeWindow") != NEOX_OK) return NEOX_ERROR_BACKEND;
+    }
     return x11_wait_ready(w);
 }
 
@@ -713,20 +789,21 @@ static neox_result x11_present_soft(neox_window *w)
     for (y = 0; y < w->px_h; y++) {
         for (x = 0; x < w->px_w; x++) {
             const uint8_t *s = w->soft_px + ((size_t)y * w->px_w + x) * 4u;
-            unsigned r = s[0], g = s[1], b = s[2], a = s[3];
+            /* 统一的不透明窗口策略（P1-5）：RGB *= a，alpha 丢弃（窗口恒不透明）。 */
+            unsigned a = s[3];
+            unsigned r = s[0] * a / 255u;
+            unsigned g = s[1] * a / 255u;
+            unsigned b = s[2] * a / 255u;
             unsigned long pix;
-            if (a < 255u) {
-                r = r * a / 255u;
-                g = g * a / 255u;
-                b = b * a / 255u;
-            }
             pix = pack_chan(red, r) | pack_chan(green, g) | pack_chan(blue, b);
             g_x.putpx(p->image, (int)x, (int)y, pix);
         }
     }
-    g_x.put(p->dpy, p->win, p->gc, p->image, 0, 0, 0, 0, w->px_w, w->px_h);
-    g_x.sync(p->dpy, 0);
-    return NEOX_OK;
+    {
+        uint32_t mark = x11_error_mark();
+        g_x.put(p->dpy, p->win, p->gc, p->image, 0, 0, 0, 0, w->px_w, w->px_h);
+        return x11_sync_or_fail(p->dpy, mark, "XPutImage");
+    }
 }
 
 static int x11_read_screen(neox_window *w, uint8_t *out)
@@ -737,9 +814,19 @@ static int x11_read_screen(neox_window *w, uint8_t *out)
     uint32_t x, y;
     if (!p) return -1;
     if (x11_wait_ready(w) != NEOX_OK) return -1;
-    g_x.sync(p->dpy, 0);
-    img = g_x.get(p->dpy, p->win, 0, 0, w->px_w, w->px_h, ~(unsigned long)0, 2);
-    if (!img) return -1;
+    {
+        uint32_t mark = x11_error_mark();
+        g_x.sync(p->dpy, 0);
+        if (x11_take_error(mark, "XSync before readback")) return -1;
+        img = g_x.get(p->dpy, p->win, 0, 0, w->px_w, w->px_h, ~(unsigned long)0, 2);
+        /* XGetImage 失败（如 BadMatch）经错误处理器报告，不返回 NULL。 */
+        g_x.sync(p->dpy, 0);
+        if (x11_take_error(mark, "XGetImage")) {
+            if (img) g_x.freeimg(img);
+            return -1;
+        }
+        if (!img) return -1;
+    }
     red = img_ul(img, NX_XIMAGE_RED);
     green = img_ul(img, NX_XIMAGE_GREEN);
     blue = img_ul(img, NX_XIMAGE_BLUE);
